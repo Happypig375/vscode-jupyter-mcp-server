@@ -1,0 +1,98 @@
+{
+  "name": "vscode-jupyter-mcp-server",
+  "displayName": "VS Code Jupyter MCP Server",
+  "description": "A notebook-specific MCP server: run, edit, create, and manage Jupyter notebooks in VS Code headlessly from any MCP client (Command Code CLI/desktop, Claude, etc.).",
+  "version": "0.2.0",
+  "publisher": "Happypig375",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "Notebooks",
+    "Data Science",
+    "Other"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "jupyter",
+    "notebook",
+    "ipynb",
+    "kernel",
+    "data-science"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionDependencies": [
+    "ms-toolsai.jupyter"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Jupyter MCP Server",
+      "properties": {
+        "jupyterMcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the MCP server."
+        },
+        "jupyterMcp.transport": {
+          "type": "string",
+          "enum": [
+            "http",
+            "stdio"
+          ],
+          "default": "http",
+          "description": "MCP transport. 'http' starts a Streamable HTTP server on 127.0.0.1; 'stdio' speaks MCP over stdin/stdout (for clients that spawn a process)."
+        },
+        "jupyterMcp.port": {
+          "type": "number",
+          "default": 51303,
+          "scope": "machine",
+          "description": "Fixed TCP port for the HTTP MCP transport on 127.0.0.1. Multiple VS Code windows sharing this port merge into one server. Changing it restarts the server."
+        },
+        "jupyterMcp.saveBeforeExecute": {
+          "type": "boolean",
+          "default": true,
+          "description": "Save dirty notebooks before running/editing so tools operate on current contents."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "jupyterMcp.refreshTools",
+        "title": "Jupyter MCP: Refresh Tool List",
+        "category": "Jupyter MCP"
+      },
+      {
+        "command": "jupyterMcp.showStatus",
+        "title": "Jupyter MCP: Show Server Status",
+        "category": "Jupyter MCP"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "esbuild src/extension.ts --bundle --external:vscode --format=cjs --platform=node --target=node20 --sourcemap --outfile=dist/extension.js",
+    "watch": "esbuild src/extension.ts --bundle --external:vscode --format=cjs --platform=node --target=node20 --sourcemap --outfile=dist/extension.js --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run compile && node src/test/runTest.js",
+    "coverage": "npm run compile && node src/test/checkCoverage.js",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.106.0",
+    "c8": "^12.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  }
+}

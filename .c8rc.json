@@ -1,0 +1,13 @@
+{
+  "exclude": [
+    "src/test/**",
+    "test/**",
+    "node_modules/**",
+    "**/node_modules/**"
+  ],
+  "reporter": [
+    "text",
+    "lcov"
+  ],
+  "excludeAfterRemap": true
+}
