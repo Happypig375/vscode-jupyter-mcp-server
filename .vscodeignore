@@ -1,7 +1,11 @@
 node_modules
-dist
 *.vsix
 .vscode-test
 src
+scripts
+test
 tsconfig.json
 .gitignore
+.commandcode
+coverage
+*.map

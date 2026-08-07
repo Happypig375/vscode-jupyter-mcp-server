@@ -5,6 +5,11 @@
   "version": "0.2.0",
   "publisher": "Happypig375",
   "license": "MIT",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Happypig375/vscode-jupyter-mcp-server"
+  },
   "engines": {
     "vscode": "^1.106.0"
   },
@@ -87,8 +92,10 @@
   "devDependencies": {
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.106.0",
+    "@vscode/vsce": "^3.9.2",
     "c8": "^12.0.0",
     "esbuild": "^0.24.0",
+    "sharp": "^0.35.3",
     "typescript": "^5.5.0"
   },
   "dependencies": {
