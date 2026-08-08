@@ -166,7 +166,7 @@ export async function createNotebook(query: string): Promise<string> {
         const uri = vscode.Uri.joinPath(folder.uri, base);
         await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(nbJson, null, 1), 'utf8'));
         await vscode.commands.executeCommand('vscode.openWith', uri, 'jupyter-notebook');
-        return `Created ${uri.toString()} and opened it in VS Code.`;
+        return `Created ${uri.toString()} and opened it in the editor.`;
     }
 
     // Empty window (no workspace): create an untitled notebook document.
@@ -178,7 +178,7 @@ export async function createNotebook(query: string): Promise<string> {
     data.metadata = metadata as unknown as { [key: string]: unknown };
     const doc = await vscode.workspace.openNotebookDocument('jupyter-notebook', data);
     await vscode.window.showNotebookDocument(doc);
-    return `Created untitled notebook ${doc.uri.toString()} and opened it in VS Code (no workspace folder open).`;
+    return `Created untitled notebook ${doc.uri.toString()} and opened it in the editor (no workspace folder open).`;
 }
 
 /** Stable cell identifier: the cell's metadata.id if present, else "index:N". */
@@ -336,6 +336,97 @@ export async function restartKernel(filePath: string): Promise<string> {
     }
     await vscode.commands.executeCommand('notebook.restartKernel', nb.uri);
     return `Restarted kernel for ${nb.uri.toString()}.`;
+}
+
+/**
+ * Interrupt the kernel(s) of one or more open notebooks (stops running execution).
+ * Uses the notebook's interrupt command; requires the Jupyter extension.
+ */
+export async function interruptKernels(filePaths: string[]): Promise<string> {
+    const lines: string[] = [];
+    for (const fp of filePaths) {
+        const nb = findNotebook(fp);
+        if (!nb) {
+            throw new Error(`No open notebook matches '${fp}'. Use get_notebooks to list them.`);
+        }
+        await vscode.commands.executeCommand('notebook.interruptKernel', nb.uri);
+        lines.push(`Interrupted kernel for ${nb.uri.toString()}.`);
+    }
+    return lines.join('\n');
+}
+
+/**
+ * Best-effort kernel info for a notebook: resolves the active kernel label via the
+ * Jupyter extension's kernel API if available; falls back to 'unknown' so the tool
+ * stays deterministic when the Jupyter extension is absent.
+ */
+export async function getKernelInfo(filePath: string): Promise<string> {
+    const nb = findNotebook(filePath);
+    if (!nb) {
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+    }
+    let label = 'unknown';
+    try {
+        const api = await vscode.extensions.getExtension<{ getKernel?: (u: unknown) => { label?: string } }>('ms-toolsai.jupyter')?.activate();
+        const kernel = api?.getKernel?.(nb.uri);
+        if (kernel?.label) label = kernel.label;
+    } catch {
+        // best-effort
+    }
+    return `Notebook: ${nb.uri.toString()}\nKernel: ${label}`;
+}
+
+/** Clear saved outputs (and execution state) from one or more cells of a notebook. */
+export async function clearOutputs(filePath: string, cellIds: Array<string | number>): Promise<string> {
+    if (cellIds.length === 0) {
+        throw new Error('cellIds must not be empty.');
+    }
+    const nb = findNotebook(filePath);
+    if (!nb) {
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+    }
+    const idxs = cellIds.map((c) => resolveCellIndex(nb, c));
+    // Clear in reverse order so index-based edits stay valid.
+    const sorted = [...idxs].sort((a, b) => b - a);
+    for (const idx of sorted) {
+        await vscode.commands.executeCommand('notebook.clearOutputs', nb.uri, [nb.cellAt(idx).document.uri]);
+    }
+    return `Cleared outputs of ${idxs.length} cell(s) in ${nb.uri.toString()}.`;
+}
+
+/** Search a notebook's cells (source + output text) for a query, returning per-cell matches. */
+export function searchCells(filePath: string, query: string, caseSensitive = false, cellIds?: Array<string | number>): string {
+    const nb = findNotebook(filePath);
+    if (!nb) {
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+    }
+    if (!query) {
+        throw new Error('query must be a non-empty string.');
+    }
+    const hay = (s: string) => (caseSensitive ? s : s.toLowerCase());
+    const q = hay(query);
+    const idxs = cellIds && cellIds.length ? cellIds.map((c) => resolveCellIndex(nb, c)) : nb.getCells().map((_, i) => i);
+    const matches: string[] = [];
+    for (const idx of idxs) {
+        const cell = nb.cellAt(idx);
+        const source = cell.document.getText();
+        const srcLines = source.split('\n');
+        const srcHits = srcLines.map((l, i) => (hay(l).includes(q) ? i : -1)).filter((i) => i >= 0);
+        const outputHits: string[] = [];
+        cell.outputs.forEach((o, oi) => {
+            for (const item of o.items) {
+                const text = new TextDecoder().decode(item.data);
+                if (hay(text).includes(q)) outputHits.push(`output ${oi} (${item.mime})`);
+            }
+        });
+        if (srcHits.length || outputHits.length) {
+            matches.push(
+                `[cell ${idx}]${srcHits.length ? ` source lines: ${srcHits.join(', ')}` : ''}` +
+                (outputHits.length ? ` | ${outputHits.join(', ')}` : '')
+            );
+        }
+    }
+    return matches.length ? matches.join('\n') : `No matches for '${query}' in ${nb.uri.toString()}.`;
 }
 
 /**

@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { jsonSchemaToZod } from './schema';
-import { createNotebook, listOpenNotebooks, getCells, getCellsOutput, getNotebooksSummary, editNotebookCells, runNotebookCells, restartKernel, saveNotebooks, moveCells, openNotebooks, readNotebook, exportNotebook } from './notebookOps';
+import { createNotebook, listOpenNotebooks, getCells, getCellsOutput, getNotebooksSummary, editNotebookCells, runNotebookCells, restartKernel, saveNotebooks, moveCells, openNotebooks, readNotebook, exportNotebook, interruptKernels, getKernelInfo, clearOutputs, searchCells } from './notebookOps';
 import { listWindows, windowLabel } from './registry';
 
 /** Register the notebook MCP server's tools on a given McpServer. */
@@ -19,7 +19,7 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         'create_notebook',
         {
             description:
-                'Create a new Jupyter notebook in the current workspace and open it in VS Code. ' +
+                'Create a new Jupyter notebook in the current workspace and open it in the editor. ' +
                 'Provide a natural-language query used as the notebook title and a placeholder code cell.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
@@ -39,7 +39,7 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         'get_notebooks',
         {
             description:
-                'List the Jupyter notebooks currently open across ALL VS Code windows registered with this server. ' +
+                'List the Jupyter notebooks currently open across ALL editor windows registered with this server. ' +
                 'Returns an array of { uri, windowId, windowLabel }. Pass windowId back to disambiguate when the same ' +
                 'file is open in multiple windows.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {} })
@@ -106,6 +106,54 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         }
     );
 
+    // ---- Clear outputs ----
+    server.registerTool(
+        'clear_outputs',
+        {
+            description:
+                'Clear the saved OUTPUT of one or more cells in a notebook (removes outputs and execution state). ' +
+                'Provide the notebook URI and an array of 0-based cell indices (or cell ids).',
+            inputSchema: jsonSchemaToZod({
+                type: 'object',
+                properties: {
+                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or ids) to clear outputs from.' }
+                },
+                required: ['filePath', 'cellIds']
+            })
+        },
+        async (args) => {
+            const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number> };
+            if (!a.filePath) throw new Error('filePath is required');
+            if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
+            const text = await clearOutputs(a.filePath, a.cellIds);
+            return { content: [{ type: 'text' as const, text }] };
+        }
+    );
+
+    // ---- Get kernel info ----
+    server.registerTool(
+        'get_kernel_info',
+        {
+            description:
+                'Get the active kernel label for a notebook (best-effort via the Jupyter extension; "unknown" if unavailable). ' +
+                'Useful for picking a `kernel` argument for run_cells.',
+            inputSchema: jsonSchemaToZod({
+                type: 'object',
+                properties: {
+                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' }
+                },
+                required: ['filePath']
+            })
+        },
+        async (args) => {
+            const a = (args ?? {}) as { filePath?: string };
+            if (!a.filePath) throw new Error('filePath is required');
+            const text = await getKernelInfo(a.filePath);
+            return { content: [{ type: 'text' as const, text }] };
+        }
+    );
+
     // ---- Get cells output ----
     server.registerTool(
         'get_cells_output',
@@ -127,6 +175,32 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
             if (!a.filePath) throw new Error('filePath is required');
             if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
             const text = await getCellsOutput(a.filePath, a.cellIds);
+            return { content: [{ type: 'text' as const, text }] };
+        }
+    );
+
+    // ---- Search cells ----
+    server.registerTool(
+        'search_cells',
+        {
+            description:
+                'Search a notebook\'s cells (source and output text) for a query. Returns per-cell matches with ' +
+                'source line numbers and/or output locations. Case-insensitive by default.',
+            inputSchema: jsonSchemaToZod({
+                type: 'object',
+                properties: {
+                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    query: { type: 'string', description: 'Text to search for (source or output).' },
+                    caseSensitive: { type: 'boolean', description: 'Match case (default false).' },
+                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Restrict search to these cell indices/ids (default: all).' }
+                },
+                required: ['filePath', 'query']
+            })
+        },
+        async (args) => {
+            const a = (args ?? {}) as { filePath?: string; query?: string; caseSensitive?: boolean; cellIds?: Array<string | number> };
+            if (!a.filePath) throw new Error('filePath is required');
+            const text = searchCells(a.filePath, a.query ?? '', a.caseSensitive === true, a.cellIds);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -285,6 +359,27 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         );
     }
 
+    // ---- Interrupt notebooks (kernel) (requires Jupyter) ----
+    if (hasJupyter) {
+        server.registerTool(
+            'interrupt_kernels',
+            {
+                description: 'Interrupt (stop) the running execution of one or more open notebooks. Provide an array of notebook URIs. Requires the Jupyter extension.',
+                inputSchema: jsonSchemaToZod({
+                    type: 'object',
+                    properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs from get_notebooks.' } },
+                    required: ['filePaths']
+                })
+            },
+            async (args) => {
+                const a = (args ?? {}) as { filePaths?: string[] };
+                if (!Array.isArray(a.filePaths) || a.filePaths.length === 0) throw new Error('filePaths must be a non-empty array');
+                const text = await interruptKernels(a.filePaths);
+                return { content: [{ type: 'text' as const, text }] };
+            }
+        );
+    }
+
     // ---- Move cells ----
     server.registerTool(
         'move_cells',
@@ -318,7 +413,7 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         'open_notebooks',
         {
             description:
-                'Open one or more existing notebooks from disk in VS Code. Provide file: URIs of notebooks on disk. ' +
+                'Open one or more existing notebooks from disk in the editor. Provide file: URIs of notebooks on disk. ' +
                 'After opening, they appear in get_notebooks and can be read/edited/run.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',

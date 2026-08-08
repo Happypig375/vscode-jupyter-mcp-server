@@ -77,7 +77,7 @@ async function startServer(): Promise<void> {
 
     if (transport === 'stdio') {
         const stdio = new StdioServerTransport();
-        const server = new McpServer({ name: 'jupyter-mcp-server', version: '0.2.0' });
+        const server = new McpServer({ name: 'jupyter-mcp-server', version: '0.1.1' });
         registerNotebookTools(server, port, instanceId, hasJupyter());
         await server.connect(stdio);
         output.appendLine('[jupyter-mcp] stdio transport active');
@@ -100,7 +100,7 @@ function tryListen(port: number): Promise<boolean> {
             void (async () => {
                 try {
                     // Fresh McpServer per connection (SDK single-transport constraint).
-                    const sessionServer = new McpServer({ name: 'jupyter-mcp-server', version: '0.2.0' });
+                    const sessionServer = new McpServer({ name: 'jupyter-mcp-server', version: '0.1.1' });
                     registerNotebookTools(sessionServer, port, instanceId, hasJupyter());
                     const chunks: Buffer[] = [];
                     for await (const chunk of req) {

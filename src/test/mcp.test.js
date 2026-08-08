@@ -14,6 +14,7 @@ const lines = [];
 const statusBar = { text: '', tooltip: '', command: '', show() {}, dispose() {} };
 const disposables = [];
 const executed = [];
+const interrupted = [];
 let untitledCounter = 0;
 const openNotebooks = []; // simulates open notebook documents
 
@@ -90,7 +91,23 @@ const vscodeShim = {
     extensions: { getExtension: () => undefined, onDidChange: () => ({ dispose() {} }) },
     commands: {
         registerCommand: () => ({ dispose() {} }),
-        executeCommand: async (cmd, ...args) => { if (cmd === 'notebook.execute') executed.push(args); }
+        executeCommand: async (cmd, ...args) => {
+            if (cmd === 'notebook.execute') executed.push(args);
+            if (cmd === 'notebook.clearOutputs') {
+                const [uri, cellUris] = args;
+                const doc = openNotebooks.find((d) => d.uri.toString() === uri);
+                if (doc) {
+                    for (const cu of cellUris) {
+                        const frag = cu.fragment || '';
+                        const idx = Number(frag.replace('c', ''));
+                        const cell = doc._cells[idx];
+                        cell.outputs = [];
+                        cell.executionSummary = undefined;
+                    }
+                }
+            }
+            if (cmd === 'notebook.interruptKernel') interrupted.push(args[0]);
+        }
     },
     env: { clipboard: { writeText: async () => {} } },
     StatusBarAlignment: { Right: 1 },
@@ -151,11 +168,12 @@ async function main() {
 
     // 1. No Jupyter -> kernel tools absent, document tools present.
     await check('tool set (no Jupyter)', async () => {
-        for (const required of ['create_notebook', 'get_notebooks', 'get_cells', 'get_cells_source', 'get_cells_output', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks']) {
+        for (const required of ['create_notebook', 'get_notebooks', 'get_cells', 'get_cells_source', 'get_cells_output', 'search_cells', 'clear_outputs', 'get_kernel_info', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks']) {
             assert.ok(names.includes(required), `missing ${required}`);
         }
         assert.ok(!names.includes('run_cells'), 'run_cells should be absent without Jupyter');
         assert.ok(!names.includes('restart_notebooks'), 'restart_notebooks should be absent without Jupyter');
+        assert.ok(!names.includes('interrupt_kernels'), 'interrupt_kernels should be absent without Jupyter');
     });
 
     // 2. create_notebook in an empty window -> untitled.
@@ -268,6 +286,50 @@ async function main() {
         const res = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri, cellIds: [0, 1] } });
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(res.content[0].text, /cell 0/);
+    });
+
+    // --- search_cells ---
+    await check('search_cells finds source matches', async () => {
+        const res = await client.callTool({ name: 'search_cells', arguments: { filePath: createdUri, query: 'x=1' } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /cell 0/);
+    });
+    await check('search_cells is case-insensitive by default', async () => {
+        const res = await client.callTool({ name: 'search_cells', arguments: { filePath: createdUri, query: 'X=1' } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /cell 0/);
+    });
+    await check('search_cells honors caseSensitive', async () => {
+        const res = await client.callTool({ name: 'search_cells', arguments: { filePath: createdUri, query: 'X=1', caseSensitive: true } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /No matches/);
+    });
+    await check('search_cells no-match message', async () => {
+        const res = await client.callTool({ name: 'search_cells', arguments: { filePath: createdUri, query: 'zzz_nonexistent' } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /No matches/);
+    });
+    await check('search_cells rejects missing query', async () => {
+        const res = await client.callTool({ name: 'search_cells', arguments: { filePath: createdUri } });
+        assert.ok(res.isError);
+    });
+
+    // --- clear_outputs ---
+    await check('clear_outputs runs without error', async () => {
+        const res = await client.callTool({ name: 'clear_outputs', arguments: { filePath: createdUri, cellIds: [0, 1] } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /Cleared outputs of 2 cell/);
+    });
+    await check('clear_outputs rejects empty cellIds', async () => {
+        const res = await client.callTool({ name: 'clear_outputs', arguments: { filePath: createdUri, cellIds: [] } });
+        assert.ok(res.isError);
+    });
+
+    // --- get_kernel_info (no Jupyter) ---
+    await check('get_kernel_info reports unknown without Jupyter', async () => {
+        const res = await client.callTool({ name: 'get_kernel_info', arguments: { filePath: createdUri } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /Kernel: unknown/);
     });
 
     await client.close();

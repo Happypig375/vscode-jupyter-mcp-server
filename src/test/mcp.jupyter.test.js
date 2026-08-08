@@ -14,6 +14,7 @@ const PORT = 51305;
 const lines = [];
 const statusBar = { text: '', tooltip: '', command: '', show() {}, dispose() {} };
 const disposables = [];
+const interrupted = [];
 const openNotebooks = [];
 
 function makeDoc(uri) {
@@ -70,7 +71,7 @@ const vscodeShim = {
         createOutputChannel: () => ({ appendLine: (l) => { lines.push(l); console.log('[OUT]', l); }, dispose() {} }),
         createStatusBarItem: () => statusBar
     },
-    extensions: { getExtension: () => ({ id: 'ms-toolsai.jupyter', isActive: true }), onDidChange: () => ({ dispose() {} }) },
+    extensions: { getExtension: () => ({ id: 'ms-toolsai.jupyter', isActive: true, activate: async () => ({ getKernel: () => ({ label: 'Python 3.12.2' }) }) }), onDidChange: () => ({ dispose() {} }) },
     commands: {
         registerCommand: () => ({ dispose() {} }),
         executeCommand: async (cmd, uri, cellUris) => {
@@ -85,6 +86,17 @@ const vscodeShim = {
                     cell.outputs = [{ items: [{ mime: 'text/plain', data: Buffer.from('hello\n') }] }];
                 }
             }
+            if (cmd === 'notebook.clearOutputs' && cellUris) {
+                for (const cu of cellUris) {
+                    const frag = cu.fragment || '';
+                    const idx = Number(frag.replace('c', ''));
+                    const nb = openNotebooks[0];
+                    const cell = nb._cells[idx];
+                    cell.outputs = [];
+                    cell.executionSummary = undefined;
+                }
+            }
+            if (cmd === 'notebook.interruptKernel') interrupted.push(uri);
         }
     },
     env: { clipboard: { writeText: async () => {} } },
@@ -142,11 +154,12 @@ async function main() {
     const names = tools.map((t) => t.name);
     console.log(`Tools exposed (${names.length}): ${names.join(', ')}`);
 
-    // 1. With Jupyter present, run_cells + restart_notebooks ARE exposed.
+    // 1. With Jupyter present, kernel tools ARE exposed.
     await check('kernel tools exposed when Jupyter present', async () => {
         assert.ok(names.includes('run_cells'), 'run_cells missing');
         assert.ok(names.includes('restart_notebooks'), 'restart_notebooks missing');
-        for (const required of ['read_notebook', 'export_notebook', 'get_notebooks', 'get_cells', 'get_cells_source', 'get_cells_output', 'edit_cells', 'move_cells', 'create_notebook', 'open_notebooks', 'save_notebooks']) {
+        assert.ok(names.includes('interrupt_kernels'), 'interrupt_kernels missing');
+        for (const required of ['read_notebook', 'export_notebook', 'get_notebooks', 'get_cells', 'get_cells_source', 'get_cells_output', 'search_cells', 'clear_outputs', 'get_kernel_info', 'edit_cells', 'move_cells', 'create_notebook', 'open_notebooks', 'save_notebooks']) {
             assert.ok(names.includes(required), `missing ${required}`);
         }
     });
@@ -194,6 +207,29 @@ async function main() {
     await check('export_notebook rejects bad format', async () => {
         const res = await client.callTool({ name: 'export_notebook', arguments: { filePath: 'file:///C:/nb.ipynb', format: 'bogus' } });
         assert.ok(res.isError);
+    });
+
+    // 8. get_kernel_info returns the active kernel label via the Jupyter API.
+    await check('get_kernel_info returns active kernel', async () => {
+        const res = await client.callTool({ name: 'get_kernel_info', arguments: { filePath: 'file:///C:/nb.ipynb' } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /Kernel: Python 3\.12\.2/);
+    });
+
+    // 9. clear_outputs after a run removes outputs + execution state.
+    await check('clear_outputs clears after run', async () => {
+        const res = await client.callTool({ name: 'clear_outputs', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: [0] } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        const out = await client.callTool({ name: 'get_cells_output', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: [0] } });
+        assert.match(out.content[0].text, /no saved output/);
+    });
+
+    // 10. interrupt_kernels stops running execution.
+    await check('interrupt_kernels works', async () => {
+        const res = await client.callTool({ name: 'interrupt_kernels', arguments: { filePaths: ['file:///C:/nb.ipynb'] } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /Interrupted kernel/);
+        assert.strictEqual(interrupted.length, 1);
     });
 
     await client.close();
