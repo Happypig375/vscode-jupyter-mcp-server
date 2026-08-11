@@ -460,6 +460,22 @@ export async function listKernels(filePath: string): Promise<string> {
 }
 
 /**
+ * Run Jupyter's provider-neutral notebook configuration workflow. This lets installed
+ * providers register/select a server before list_kernels resolves concrete controllers.
+ */
+export async function configureKernel(filePath: string): Promise<string> {
+    const nb = findNotebook(filePath);
+    if (!nb) {
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
+    }
+    const startup = await invokeJupyterConfigureTool(nb);
+    if (startup.pending) {
+        return `Kernel configuration was requested for ${nb.uri.toString()} and is still pending.\n${startup.detail}`;
+    }
+    return `Configured kernel for ${nb.uri.toString()}.${startup.detail ? `\n${startup.detail}` : ''}`;
+}
+
+/**
  * Select an exact controller id returned by list_kernels and optionally ask the Jupyter
  * extension to start it. Controller discovery is owned by VS Code, so providers added by
  * other extensions (including Colab) participate without provider-specific integration.
@@ -494,11 +510,22 @@ export async function selectKernel(filePath: string, kernelId: string, start = f
         return `Selected kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}.`;
     }
 
+    const startup = await invokeJupyterConfigureTool(nb);
+    if (startup.pending) {
+        return `Selected kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}. Startup was requested and is still pending.${startup.detail ? `\n${startup.detail}` : ''}`;
+    }
+    return `Selected and started kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}.${startup.detail ? `\n${startup.detail}` : ''}`;
+}
+
+async function invokeJupyterConfigureTool(nb: vscode.NotebookDocument): Promise<{ detail: string; pending: boolean }> {
+    const extension = vscode.extensions.getExtension('ms-toolsai.jupyter');
+    if (extension && !extension.isActive) await extension.activate();
+
     const configureTool = vscode.lm.tools.find((tool) => tool.name === 'configure_notebook');
     if (!configureTool) {
         throw new Error(
-            `Selected kernel '${kernel.id}', but it could not be started because the Jupyter ` +
-            '`configure_notebook` tool is unavailable. Update/enable the Jupyter extension, or run a cell to start the selected kernel.'
+            'The Jupyter `configure_notebook` tool is unavailable. Update or enable the Jupyter extension, ' +
+            'or run a cell to start the currently selected kernel.'
         );
     }
     const result = await vscode.lm.invokeTool(
@@ -510,12 +537,12 @@ export async function selectKernel(filePath: string, kernelId: string, start = f
         .filter(Boolean)
         .join('\n');
     if (/did not select|failed|error/i.test(detail)) {
-        throw new Error(`Jupyter could not start kernel '${kernel.id}': ${detail}`);
+        throw new Error(`Jupyter could not configure a kernel for ${nb.uri.toString()}: ${detail}`);
     }
-    if (/taking longer|still starting|in the background|timed out|timeout/i.test(detail)) {
-        return `Selected kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}. Startup was requested and is still pending.${detail ? `\n${detail}` : ''}`;
-    }
-    return `Selected and started kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}.${detail ? `\n${detail}` : ''}`;
+    return {
+        detail,
+        pending: /taking longer|still starting|in the background|timed out|timeout/i.test(detail)
+    };
 }
 
 async function resolveNotebookKernels(nb: vscode.NotebookDocument): Promise<NotebookKernelInfo[]> {

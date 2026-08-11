@@ -149,8 +149,31 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         }
     );
 
-    // ---- List/select kernels (requires Jupyter) ----
+    // ---- Configure/list/select kernels (requires Jupyter) ----
     if (hasJupyter) {
+        server.registerTool(
+            'configure_kernel',
+            {
+                description:
+                    'Run Jupyter\'s provider-neutral configuration workflow for an already-open notebook before listing ' +
+                    'or selecting kernels. Installed providers such as Colab may show their normal server picker, ' +
+                    'confirmation, authentication, or runtime-allocation UI. Call list_kernels again after this completes.',
+                inputSchema: jsonSchemaToZod({
+                    type: 'object',
+                    properties: {
+                        filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' }
+                    },
+                    required: ['filePath']
+                })
+            },
+            async (args) => {
+                const a = (args ?? {}) as { filePath?: string };
+                if (!a.filePath) throw new Error('filePath is required');
+                const text = await router.invokeNotebook('configure_kernel', a.filePath, a as Record<string, unknown>);
+                return { content: [{ type: 'text' as const, text }] };
+            }
+        );
+
         server.registerTool(
             'list_kernels',
             {

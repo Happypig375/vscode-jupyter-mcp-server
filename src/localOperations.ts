@@ -1,5 +1,6 @@
 import {
     clearOutputs,
+    configureKernel,
     createNotebook,
     editNotebookCells,
     exportNotebook,
@@ -22,6 +23,7 @@ import {
 
 export type LocalOperation =
     | 'create_notebook'
+    | 'configure_kernel'
     | 'inspect_notebooks'
     | 'read_cells'
     | 'clear_cell_outputs'
@@ -53,6 +55,8 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
     switch (operation) {
         case 'create_notebook':
             return createNotebook(typeof args.query === 'string' ? args.query : 'New notebook');
+        case 'configure_kernel':
+            return configureKernel(filePath(args));
         case 'inspect_notebooks':
             return getNotebooksSummary(args.filePaths as string[]);
         case 'read_cells':
