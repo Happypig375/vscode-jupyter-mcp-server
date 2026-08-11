@@ -8,6 +8,7 @@ const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/client/streamableHttp.js');
 
 const ROOT = path.resolve(__dirname, '..', '..');
+let PORT = Number(process.env.MCP_TEST_PORT || 0);
 
 // ---- Minimal vscode shim: EMPTY WINDOW (no workspace folders, no Jupyter) ----
 const lines = [];
@@ -21,8 +22,8 @@ const openNotebooks = []; // simulates open notebook documents
 // Each entry: { uri, cells: [{ kind, value, languageId }] }
 function makeDoc(type, data) {
     const uri = `untitled:Untitled-${++untitledCounter}.ipynb`;
-    const cells = data.cells.map((c, i) => ({
-        kind: c.kind, value: c.value, languageId: c.languageId
+    const cells = data.cells.map((c) => ({
+        kind: c.kind, value: c.value, languageId: c.languageId, metadata: c.metadata || {}, outputs: [], executionSummary: undefined
     }));
     const doc = {
         notebookType: type,
@@ -32,12 +33,12 @@ function makeDoc(type, data) {
         cellAt: (i) => ({
             kind: cells[i].kind,
             document: { uri: { fragment: `c${i}` }, languageId: cells[i].languageId, getText: () => cells[i].value },
-            outputs: [], executionSummary: undefined, metadata: {}
+            outputs: cells[i].outputs, executionSummary: cells[i].executionSummary, metadata: cells[i].metadata
         }),
         getCells: () => cells.map((c, i) => ({
             kind: c.kind,
             document: { uri: { fragment: `c${i}` }, languageId: c.languageId, getText: () => c.value },
-            outputs: [], executionSummary: undefined, metadata: {}
+            outputs: c.outputs, executionSummary: c.executionSummary, metadata: c.metadata
         })),
         save: async () => true,
         _cells: cells
@@ -50,7 +51,7 @@ const vscodeShim = {
     workspace: {
         getConfiguration: () => ({ get: (k, d) => {
             if (k === 'transport') return 'http';
-            if (k === 'port') return 51303;
+            if (k === 'port') return PORT;
             if (k === 'enabled') return true;
             if (k === 'saveBeforeExecute') return true;
             return d;
@@ -66,15 +67,15 @@ const vscodeShim = {
                 for (const op of edits) {
                     if (op.__kind === 'replace') {
                         // op: { __kind, range: [start,end), cells: [NotebookCellData] }
-                        const newCells = op.cells.map((c) => ({ kind: c.kind, value: c.value, languageId: c.languageId }));
+                        const newCells = op.cells.map((c) => ({ kind: c.kind, value: c.value, languageId: c.languageId, metadata: c.metadata || {}, outputs: [], executionSummary: undefined }));
                         doc._cells.splice(op.range[0], op.range[1] - op.range[0], ...newCells);
                     } else if (op.__kind === 'insert') {
-                        const newCells = op.cells.map((c) => ({ kind: c.kind, value: c.value, languageId: c.languageId }));
+                        const newCells = op.cells.map((c) => ({ kind: c.kind, value: c.value, languageId: c.languageId, metadata: c.metadata || {}, outputs: [], executionSummary: undefined }));
                         doc._cells.splice(op.index, 0, ...newCells);
                     } else if (op.__kind === 'delete') {
                         doc._cells.splice(op.range[0], op.range[1] - op.range[0]);
                     } else if (op.__kind === 'updateMeta') {
-                        // metadata no-op in shim
+                        doc._cells[op.idx].metadata = op.meta;
                     }
                 }
             }
@@ -143,7 +144,7 @@ async function waitForServer(timeoutMs = 10000) {
     while (Date.now() < deadline) {
         try {
             const client = new Client({ name: 'test', version: '1.0' });
-            const transport = new StreamableHTTPClientTransport(new URL('http://127.0.0.1:51303/mcp'));
+            const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT}/mcp`));
             await client.connect(transport);
             await client.listTools();
             return client;
@@ -157,7 +158,11 @@ async function waitForServer(timeoutMs = 10000) {
 async function main() {
     const context = { subscriptions: { push: (d) => disposables.push(d) } };
     await bundle.activate(context);
+    if (PORT === 0) PORT = Number(String(statusBar.tooltip).match(/127\.0\.0\.1:(\d+)/)[1]);
     const client = await waitForServer();
+
+    assert.strictEqual(statusBar.text, '$(notebook) MCP');
+    assert.match(String(statusBar.tooltip), new RegExp(`http://127\\.0\\.0\\.1:${PORT}/mcp`));
 
     let passed = 0;
     const check = (name, fn) => fn().then(() => { passed++; console.log(`  ✓ ${name}`); }).catch((e) => { console.error(`  ✗ ${name}: ${e.message}`); process.exitCode = 1; });
@@ -259,6 +264,21 @@ async function main() {
         assert.ok(!res.isError, JSON.stringify(res));
         const meta = await client.callTool({ name: 'get_cells', arguments: { filePaths: [createdUri] } });
         assert.match(meta.content[0].text, /Cells: 3/);
+    });
+    await check('edit_cells TOP and BOTTOM insertion positions are exact', async () => {
+        let res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [{ cellId: 'TOP', editType: 'insert', newCode: 'top_marker' }] } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [{ cellId: 'BOTTOM', editType: 'insert', newCode: 'bottom_marker' }] } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        const first = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri, cellIds: [0] } });
+        const last = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri, cellIds: [4] } });
+        assert.match(first.content[0].text, /top_marker/);
+        assert.match(last.content[0].text, /bottom_marker/);
+        res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [
+            { cellId: 'BOTTOM', editType: 'delete' },
+            { cellId: 'TOP', editType: 'delete' }
+        ] } });
+        assert.ok(!res.isError, JSON.stringify(res));
     });
     await check('edit_cells deletes a cell', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [{ cellId: 0, editType: 'delete' }] } });

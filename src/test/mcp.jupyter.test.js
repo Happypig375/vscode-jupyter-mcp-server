@@ -8,7 +8,7 @@ const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/client/streamableHttp.js');
 
 const ROOT = path.resolve(__dirname, '..', '..');
-const PORT = 51305;
+let PORT = Number(process.env.MCP_TEST_PORT || 0);
 
 // ---- vscode shim: Jupyter present, one open file notebook ----
 const lines = [];
@@ -16,6 +16,7 @@ const statusBar = { text: '', tooltip: '', command: '', show() {}, dispose() {} 
 const disposables = [];
 const interrupted = [];
 const openNotebooks = [];
+let executionMode = 'complete';
 
 function makeDoc(uri) {
     const cells = [
@@ -69,13 +70,15 @@ const vscodeShim = {
     },
     window: {
         createOutputChannel: () => ({ appendLine: (l) => { lines.push(l); console.log('[OUT]', l); }, dispose() {} }),
-        createStatusBarItem: () => statusBar
+        createStatusBarItem: () => statusBar,
+        showNotebookDocument: async () => {}
     },
     extensions: { getExtension: () => ({ id: 'ms-toolsai.jupyter', isActive: true, activate: async () => ({ getKernel: () => ({ label: 'Python 3.12.2' }) }) }), onDidChange: () => ({ dispose() {} }) },
     commands: {
         registerCommand: () => ({ dispose() {} }),
         executeCommand: async (cmd, uri, cellUris) => {
             if (cmd === 'notebook.execute' && cellUris) {
+                if (executionMode === 'hang') return;
                 // Simulate execution completing: find the cell by URI fragment, mark success + add output.
                 for (const cu of cellUris) {
                     const frag = cu.fragment || '';
@@ -83,7 +86,13 @@ const vscodeShim = {
                     const nb = openNotebooks[0];
                     const cell = nb._cells[idx];
                     cell.executionSummary = { success: true, executionOrder: 1, timing: { startTime: Date.now() - 50, endTime: Date.now() } };
-                    cell.outputs = [{ items: [{ mime: 'text/plain', data: Buffer.from('hello\n') }] }];
+                    cell.outputs = [{ items: [
+                        { mime: 'text/html', data: Buffer.from(`<div>${'duplicated-rich-output '.repeat(2000)}</div>`) },
+                        { mime: 'text/plain', data: Buffer.from('hello\n') },
+                        { mime: 'image/png', data: Buffer.from([0, 255, 1, 254, 2, 253]) }
+                    ] }, { items: [
+                        { mime: 'application/vnd.code.notebook.stdout', data: Buffer.from('stream-line\n') }
+                    ] }];
                 }
             }
             if (cmd === 'notebook.clearOutputs' && cellUris) {
@@ -145,7 +154,11 @@ async function waitForServer(timeoutMs = 10000) {
 async function main() {
     const context = { subscriptions: { push: (d) => disposables.push(d) } };
     await bundle.activate(context);
+    if (PORT === 0) PORT = Number(String(statusBar.tooltip).match(/127\.0\.0\.1:(\d+)/)[1]);
     const client = await waitForServer();
+
+    assert.strictEqual(statusBar.text, '$(notebook) MCP');
+    assert.match(String(statusBar.tooltip), new RegExp(`http://127\\.0\\.0\\.1:${PORT}/mcp`));
 
     let passed = 0;
     const check = (name, fn) => fn().then(() => { passed++; console.log(`  ✓ ${name}`); }).catch((e) => { console.error(`  ✗ ${name}: ${e.message}`); process.exitCode = 1; });
@@ -170,6 +183,9 @@ async function main() {
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(res.content[0].text, /success/, 'expected success status');
         assert.match(res.content[0].text, /hello/, 'expected captured output text');
+        assert.match(res.content[0].text, /stream-line/, 'expected stdout stream output');
+        assert.doesNotMatch(res.content[0].text, /duplicated-rich-output/, 'should not duplicate rich HTML when plain text exists');
+        assert.match(res.content[0].text, /image\/png \| 6 bytes omitted/, 'expected binary image summary');
     });
 
     // 3. read_notebook returns whole notebook with anchors + source.
@@ -179,6 +195,36 @@ async function main() {
         assert.match(res.content[0].text, /id:cell-abc/, 'expected cell id anchor');
         assert.match(res.content[0].text, /print\("hello"\)/, 'expected source');
         assert.match(res.content[0].text, /hello/, 'expected outputs');
+        assert.match(res.content[0].text, /state:n\/a/, 'markdown cells must not be reported as execution errors');
+    });
+
+    await check('get_cells_output supports bounded summary mode', async () => {
+        const res = await client.callTool({ name: 'get_cells_output', arguments: {
+            filePath: 'file:///C:/nb.ipynb', cellIds: [0], outputMode: 'summary', maxOutputChars: 1000
+        } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /text\/html \d+ bytes/);
+        assert.match(res.content[0].text, /image\/png 6 bytes/);
+        assert.ok(res.content[0].text.length < 1000);
+    });
+
+    await check('run_cells can queue without waiting', async () => {
+        const res = await client.callTool({ name: 'run_cells', arguments: {
+            filePath: 'file:///C:/nb.ipynb', cellIds: [0], wait: false
+        } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /Queued 1 cell/);
+    });
+
+    await check('run_cells timeout reports a live execution without failing', async () => {
+        executionMode = 'hang';
+        const res = await client.callTool({ name: 'run_cells', arguments: {
+            filePath: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 5
+        } });
+        executionMode = 'complete';
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /still running/);
+        assert.match(res.content[0].text, /not interrupted/);
     });
 
     // 4. Cell-id anchors resolve in get_cells_source.

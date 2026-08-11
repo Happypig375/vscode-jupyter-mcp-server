@@ -4,11 +4,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { registerNotebookTools } from './server';
-import { registerWindow, makeInstanceId, windowLabel } from './registry';
 
-const instanceId = makeInstanceId();
+const EXTENSION_VERSION = '0.2.0';
 let httpServer: http.Server | undefined;
-let registryDisposable: vscode.Disposable | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let output: vscode.OutputChannel;
 
@@ -60,7 +58,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 }
             } else {
                 vscode.window.showWarningMessage(
-                    'Jupyter MCP server is not running in this window (another window may own the port).'
+                    'Jupyter MCP server is not running in this window.'
                 );
             }
         })
@@ -72,13 +70,10 @@ async function startServer(): Promise<void> {
     const transport = cfg.get<string>('transport', 'http');
     const port = cfg.get<number>('port', 51303);
 
-    // Register this window in the shared registry (heartbeat) so multi-window merge works.
-    registryDisposable = registerWindow({ id: instanceId, port, label: windowLabel() });
-
     if (transport === 'stdio') {
         const stdio = new StdioServerTransport();
-        const server = new McpServer({ name: 'jupyter-mcp-server', version: '0.1.1' });
-        registerNotebookTools(server, port, instanceId, hasJupyter());
+        const server = new McpServer({ name: 'jupyter-mcp-server', version: EXTENSION_VERSION });
+        registerNotebookTools(server, hasJupyter());
         await server.connect(stdio);
         output.appendLine('[jupyter-mcp] stdio transport active');
         return;
@@ -86,22 +81,22 @@ async function startServer(): Promise<void> {
 
     const mine = await tryListen(port);
     if (!mine) {
-        output.appendLine(`[jupyter-mcp] port ${port} served by another window; merging (no local server).`);
+        output.appendLine(`[jupyter-mcp] port ${port} is already in use; choose a different jupyterMcp.port for this window.`);
         return;
     }
     output.appendLine(`[jupyter-mcp] MCP server listening on ${getUrl()}`);
     updateStatusBar();
 }
 
-/** Try to bind the port. Returns true if this window got it (merges otherwise). */
+/** Try to bind the configured loopback port. */
 function tryListen(port: number): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
         const srv = http.createServer((req, res) => {
             void (async () => {
                 try {
                     // Fresh McpServer per connection (SDK single-transport constraint).
-                    const sessionServer = new McpServer({ name: 'jupyter-mcp-server', version: '0.1.1' });
-                    registerNotebookTools(sessionServer, port, instanceId, hasJupyter());
+                    const sessionServer = new McpServer({ name: 'jupyter-mcp-server', version: EXTENSION_VERSION });
+                    registerNotebookTools(sessionServer, hasJupyter());
                     const chunks: Buffer[] = [];
                     for await (const chunk of req) {
                         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -132,7 +127,7 @@ function tryListen(port: number): Promise<boolean> {
         });
         srv.once('error', (err: NodeJS.ErrnoException) => {
             if (err.code === 'EADDRINUSE') {
-                output.appendLine(`[jupyter-mcp] port ${port} in use; merging into existing server.`);
+                output.appendLine(`[jupyter-mcp] port ${port} is already in use.`);
                 resolve(false);
             } else {
                 output.appendLine(`[jupyter-mcp] listen error: ${err.message}`);
@@ -160,8 +155,8 @@ function updateStatusBar(): void {
         return;
     }
     const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    status.text = `$(notebook) Jupyter MCP ${url}`;
-    status.tooltip = 'Jupyter MCP Server — click to copy URL';
+    status.text = '$(notebook) MCP';
+    status.tooltip = `Jupyter MCP Server\n${url}\nClick to copy URL`;
     status.command = 'jupyterMcp.showStatus';
     status.show();
     statusBarItem = status;
@@ -170,8 +165,6 @@ function updateStatusBar(): void {
 async function stopServer(): Promise<void> {
     statusBarItem?.dispose();
     statusBarItem = undefined;
-    registryDisposable?.dispose();
-    registryDisposable = undefined;
     if (httpServer) {
         await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
         httpServer = undefined;

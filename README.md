@@ -26,7 +26,7 @@ That objective drives every design choice:
 | [Agentic Jupyter (MCP)](https://marketplace.visualstudio.com/items?itemName=koyo922.agentic-jupyter-mcp) ([repo](https://github.com/koyo922/agentic-jupyter-mcp)) | In-extension MCP server, stdio transport, active-tab based | IDE-sidebar agents (Cursor/Windsurf/Antigravity) | 4 tools (list/edit/insert/delete/run cell); stdio-only; targets the IDE's built-in agent sidebar rather than external harnesses |
 | [mcp-jupyter-complete](https://github.com/tofunori/mcp-jupyter-complete) | File-based `.ipynb` editing + VS Code reload | File editing only | **Cannot execute** |
 | [Jupyter MCP Server](https://github.com/datalayer/jupyter-mcp-server) | Standalone Jupyter Server API | Remote JupyterLab/JupyterHub | Separate server; second source of truth |
-| **Jupyter MCP Server (this extension)** | In-extension MCP server + multi-window registry | **External agentic harness driving the user's live notebook** | Jupyter-optional; empty-window create; deterministic coverage-gated CI; 17 tools incl. output-capturing run, whole-notebook read, search, kernel info, cell anchors, export |
+| **Jupyter MCP Server (this extension)** | In-extension MCP server scoped to one VS Code window | **External agentic harness driving the user's live notebook** | Jupyter-optional; empty-window create; deterministic coverage-gated CI; 17 tools incl. bounded output-capturing run, whole-notebook read, search, kernel info, cell anchors, export |
 
 We have deliberately **adopted the best ideas** from the closest projects — [output-capturing execution](https://github.com/olavocarvalho/vscode-runtime-notebook-mcp), [whole-notebook reads and stable `cell_id` anchors](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) — while keeping our distinct objective: serving an **external** harness against the **user's live notebook**, with **no Copilot/Cursor dependency** and **Jupyter-optional** operation.
 
@@ -39,17 +39,17 @@ All tools are **multi-capable** (they take arrays; a single operation is a 1-ele
 | Tool | Category | Description |
 |---|---|---|
 | `create_notebook` | Create | Create a new notebook (file in a workspace, or **untitled in an empty window**) and open it |
-| `get_notebooks` | Read | List open notebooks **across all VS Code windows** (`windowId`/`windowLabel` for disambiguation) |
+| `get_notebooks` | Read | List notebooks open in the VS Code window hosting this MCP server |
 | `read_notebook` | Read | **Whole-notebook read** in one call: cell index, stable `cell_id` anchor, kind, language, source, execution state, optional outputs |
 | `get_cells` | Read | **Metadata** for one or more notebooks (cell kind, language, lines, execution state, output mime types) — no content |
 | `get_cells_source` | Read | Read the **source** of cells (by index or `cell_id` anchor, or all) |
-| `get_cells_output` | Read | Read saved **outputs** of cells (all items, decoded) |
+| `get_cells_output` | Read | Read saved outputs in bounded `summary`, preferred-`text`, or all-text `full` mode; binary images are summarized, never decoded |
 | `search_cells` | Read | **Search** a notebook's cells (source + output text) for a query, with per-cell match locations; case-insensitive by default |
 | `get_kernel_info` | Read | Get the active **kernel label** for a notebook (best-effort via the Jupyter extension) |
-| `edit_cells` | Write | Insert/edit/delete cells in order; optional per-edit metadata; optional re-run |
+| `edit_cells` | Write | Insert/edit/delete cells in order; preserves existing metadata; optional explicit re-run (off by default) |
 | `move_cells` | Write | Move one or more cells to a new position (preserves content/outputs/metadata) |
 | `clear_outputs` | Write | Clear saved **outputs** (and execution state) from one or more cells |
-| `run_cells` | Execute | Run one or more cells **headlessly**, in order, **waiting for completion and returning parsed outputs** (text/error/image); optional `kernel` to select before running |
+| `run_cells` | Execute | Run cells headlessly; wait for bounded text results or set `wait=false` to queue immediately; a wait timeout does not interrupt execution |
 | `restart_notebooks` | Manage | Restart the kernel of one or more notebooks |
 | `interrupt_kernels` | Manage | **Interrupt** (stop) running execution in one or more notebooks |
 | `open_notebooks` | Manage | Open existing notebooks from disk (file: URIs) |
@@ -82,21 +82,16 @@ The VS Code notebook API covers all the functionality natively — cell executio
 
 The native implementation is fully headless, self-contained, and works even if Copilot Chat's tools change.
 
-## Multi-window merge
+## Window and port scope
 
-Multiple VS Code windows running this extension with the same `port` setting **merge into one MCP server**:
-
-- The first window binds the port and serves; later windows detect `EADDRINUSE` and **merge** (register in a shared registry, serve nothing locally).
-- `get_notebooks` returns notebooks from the owning window **plus** all registered windows (with `windowId`/`windowLabel`).
-- **When the same file is open in multiple windows**, the model should disambiguate (e.g. ask which window) before targeting operations; cell operations run in the window that owns the notebook.
-- When the owning window closes, the registry heartbeat lets another window take over on its next attempt.
+Each HTTP server belongs to one VS Code extension host and therefore one window's open notebook documents. If several VS Code windows need to be controlled concurrently, configure a distinct `jupyterMcp.port` in each window and connect each URL as a separate MCP server. If a port is already occupied, the extension reports the collision instead of advertising notebooks it cannot route operations to.
 
 ## Install & run
 
 1. **Install** the extension:
    - **Marketplace:** search for **Jupyter MCP Server** (publisher `Happypig375`) in the Extensions view, or [open the marketplace page](https://marketplace.visualstudio.com/items?itemName=Happypig375.vscode-jupyter-mcp-server), or run `code --install-extension Happypig375.vscode-jupyter-mcp-server`. (Note: `datalayer` publishes a [similarly-named standalone Jupyter Server MCP](https://github.com/datalayer/jupyter-mcp-server) — this is the *VS Code in-extension* one.)
    - **Local build:** press **F5** in this repo for an Extension Development Host (works alongside the Jupyter extension `ms-toolsai.jupyter`).
-2. **Check the output channel** `Jupyter MCP Server` for the URL, e.g. `MCP server listening on http://127.0.0.1:51303/mcp`.
+2. **Check the `$(notebook) MCP` status item** (hover to see the URL; click to copy it) or the `Jupyter MCP Server` output channel, e.g. `MCP server listening on http://127.0.0.1:51303/mcp`.
 3. **Add to Command Code**:
    ```bash
    cmdc mcp add --transport http jupyter http://127.0.0.1:51303/mcp
@@ -109,12 +104,12 @@ Multiple VS Code windows running this extension with the same `port` setting **m
 |---|---|---|
 | `jupyterMcp.enabled` | `true` | Enable the MCP server |
 | `jupyterMcp.transport` | `http` | `http` (Streamable HTTP on 127.0.0.1) or `stdio` |
-| `jupyterMcp.port` | `51303` | Fixed port; multiple windows sharing it merge into one server |
+| `jupyterMcp.port` | `51303` | Loopback HTTP port; use a distinct port for each concurrently served VS Code window |
 | `jupyterMcp.saveBeforeExecute` | `true` | Save dirty notebooks before run/edit |
 
 ## Testing
 
-`npm test` runs **two deterministic MCP integration suites** (`src/test/mcp.test.js` + `src/test/mcp.jupyter.test.js`): they load the compiled extension bundle with a `vscode` shim and exercise every tool over a **real MCP HTTP connection** (connect → `tools/list` → `tools/call`). The first suite models an **empty window** (no workspace, no Jupyter) and asserts the tool set (kernel tools absent) plus every document operation; the second models **Jupyter present** and covers `run_cells` (output capture), `read_notebook`, `export_notebook`, `search_cells`, `clear_outputs`, `get_kernel_info`, `interrupt_kernels`, and `cell_id` anchors.
+`npm test` runs **two deterministic MCP integration suites** (`src/test/mcp.test.js` + `src/test/mcp.jupyter.test.js`) on isolated ephemeral ports: they load the compiled extension bundle with a `vscode` shim and exercise every tool over a **real MCP HTTP connection** (connect → `tools/list` → `tools/call`). The first suite models an **empty window** (no workspace, no Jupyter) and asserts the tool set (kernel tools absent) plus every document operation; the second models **Jupyter present** and covers bounded rich outputs, blocking/nonblocking execution, nonfatal timeouts, `read_notebook`, export, search, kernel management, and cell anchors.
 
 `npm run coverage` additionally measures coverage with **c8** (sourcemap-remapped to `src/**`, merged across both suites) and enforces thresholds (statements/lines ≥75%, branches ≥55%, functions ≥85%) via `src/test/checkCoverage.js`. Both are wired into **GitHub Actions CI** (`.github/workflows/ci.yml`, matrix: ubuntu/windows/macos).
 

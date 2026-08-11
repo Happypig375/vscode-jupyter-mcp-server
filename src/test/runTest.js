@@ -4,16 +4,30 @@
 // connection. No GUI / no VS Code download needed — identical on all platforms and CI.
 'use strict';
 const { spawnSync } = require('child_process');
+const net = require('net');
 const path = require('path');
 
-function main() {
+function getFreePort() {
+    return new Promise((resolve, reject) => {
+        const server = net.createServer();
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => {
+            const address = server.address();
+            server.close(() => resolve(address.port));
+        });
+    });
+}
+
+async function main() {
     const root = path.resolve(__dirname, '..', '..');
-    const compile = spawnSync('npm', ['run', 'compile'], { cwd: root, stdio: 'inherit', shell: true });
-    if (compile.status !== 0) {
-        process.exit(compile.status || 1);
-    }
     for (const file of ['mcp.test.js', 'mcp.jupyter.test.js']) {
-        const r = spawnSync('node', [path.join(__dirname, file)], { cwd: root, stdio: 'inherit', timeout: 60000 });
+        const port = await getFreePort();
+        const r = spawnSync('node', [path.join(__dirname, file)], {
+            cwd: root,
+            stdio: 'inherit',
+            timeout: 60000,
+            env: { ...process.env, MCP_TEST_PORT: String(port) }
+        });
         if (r.status !== 0) {
             process.exit(r.status || 1);
         }
@@ -21,4 +35,4 @@ function main() {
     process.exit(0);
 }
 
-main();
+main().catch((error) => { console.error(error); process.exit(1); });

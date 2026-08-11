@@ -1,6 +1,8 @@
 node_modules
 *.vsix
 .vscode-test
+.vscode
+.c8rc.json
 src
 scripts
 test

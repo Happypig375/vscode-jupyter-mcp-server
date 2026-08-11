@@ -1,10 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { jsonSchemaToZod } from './schema';
-import { createNotebook, listOpenNotebooks, getCells, getCellsOutput, getNotebooksSummary, editNotebookCells, runNotebookCells, restartKernel, saveNotebooks, moveCells, openNotebooks, readNotebook, exportNotebook, interruptKernels, getKernelInfo, clearOutputs, searchCells } from './notebookOps';
-import { listWindows, windowLabel } from './registry';
+import { createNotebook, listOpenNotebooks, getCells, getCellsOutput, getNotebooksSummary, editNotebookCells, runNotebookCells, restartKernel, saveNotebooks, moveCells, openNotebooks, readNotebook, exportNotebook, interruptKernels, getKernelInfo, clearOutputs, searchCells, OutputMode } from './notebookOps';
 
 /** Register the notebook MCP server's tools on a given McpServer. */
-export function registerNotebookTools(server: McpServer, port: number, instanceId: string, hasJupyter: boolean): void {
+export function registerNotebookTools(server: McpServer, hasJupyter: boolean): void {
     // All tools are multi-capable (arrays); single-use is a 1-element array.
     // All are implemented natively via the VS Code notebook API — no invokeTool,
     // no approval dialogs, headless.
@@ -39,24 +38,11 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         'get_notebooks',
         {
             description:
-                'List the Jupyter notebooks currently open across ALL editor windows registered with this server. ' +
-                'Returns an array of { uri, windowId, windowLabel }. Pass windowId back to disambiguate when the same ' +
-                'file is open in multiple windows.',
+                'List the Jupyter notebooks open in the VS Code window hosting this MCP server. Returns notebook URIs.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {} })
         },
         async () => {
-            const windows = listWindows(port);
-            const out: Array<{ uri: string; windowId: string; windowLabel: string }> = [];
-            for (const uri of listOpenNotebooks()) {
-                out.push({ uri, windowId: instanceId, windowLabel: windowLabel() });
-            }
-            // Other windows: surface the topology so the model can route/ask.
-            for (const w of windows) {
-                if (w.id !== instanceId) {
-                    out.push({ uri: '', windowId: w.id, windowLabel: w.label });
-                }
-            }
-            return { content: [{ type: 'text' as const, text: JSON.stringify(out) }] };
+            return { content: [{ type: 'text' as const, text: JSON.stringify(listOpenNotebooks().map((uri) => ({ uri }))) }] };
         }
     );
 
@@ -66,7 +52,7 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         {
             description:
                 'Get METADATA for one or more notebooks: per cell, the index, kind, language, line count, ' +
-                'execution state, and output mime types. Does not include cell source or output content — ' +
+                'best available cell anchor, execution state, and output mime types. Does not include cell source or output content — ' +
                 'use get_cells_source for source and get_cells_output for outputs.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
@@ -160,21 +146,24 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         {
             description:
                 'Read the saved OUTPUT of cells in a notebook. Provide the notebook URI and an array of ' +
-                '0-based cell indices. Returns all output items (decoded) per cell.',
+                'cell indices/ids. Text mode returns one preferred text representation, never decodes binary images, ' +
+                'and bounds each cell response. Use summary for MIME types/sizes or full for all textual representations.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
                     filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
-                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices to read output from.' }
+                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Cell indices/ids to read output from.' },
+                    outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail: summary, preferred text (default), or all text representations.' },
+                    maxOutputChars: { type: 'number', description: 'Maximum output characters per cell (default 12000; clamped to 1000..100000).' }
                 },
                 required: ['filePath', 'cellIds']
             })
         },
         async (args) => {
-            const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number> };
+            const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number>; outputMode?: OutputMode; maxOutputChars?: number };
             if (!a.filePath) throw new Error('filePath is required');
             if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
-            const text = await getCellsOutput(a.filePath, a.cellIds);
+            const text = await getCellsOutput(a.filePath, a.cellIds, { mode: a.outputMode, maxChars: a.maxOutputChars });
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -218,15 +207,17 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
                 properties: {
                     filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Optional cell indices/ids to read (default: all).' },
-                    includeOutputs: { type: 'boolean', description: 'Include cell outputs (default false).' }
+                    includeOutputs: { type: 'boolean', description: 'Include compact cell outputs (default false).' },
+                    outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail when included: summary, preferred text (default), or all text representations.' },
+                    maxOutputChars: { type: 'number', description: 'Maximum output characters per cell (default 12000; clamped to 1000..100000).' }
                 },
                 required: ['filePath']
             })
         },
         async (args) => {
-            const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number>; includeOutputs?: boolean };
+            const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number>; includeOutputs?: boolean; outputMode?: OutputMode; maxOutputChars?: number };
             if (!a.filePath) throw new Error('filePath is required');
-            const text = await readNotebook(a.filePath, { includeOutputs: a.includeOutputs === true, cellIds: a.cellIds });
+            const text = await readNotebook(a.filePath, { includeOutputs: a.includeOutputs === true, cellIds: a.cellIds, outputMode: a.outputMode, maxOutputChars: a.maxOutputChars });
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -264,7 +255,7 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
             description:
                 'Apply one or more edits to a notebook in order: insert, edit, or delete cells. ' +
                 'Provide the notebook URI and an array of { cellId, editType, newCode?, language?, run? } edits. ' +
-                'run (default true) re-executes edited code cells after applying.',
+                'run (default false) explicitly re-executes an edited code cell after applying.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
@@ -279,7 +270,7 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
                                 newCode: { type: 'string', description: 'New cell content (required for insert/edit).' },
                                 language: { type: 'string', description: 'Cell language, e.g. python or markdown.' },
                                 metadata: { type: 'object', description: 'Optional cell metadata to set (e.g. { "tags": ["parameters"] }).' },
-                                run: { type: 'boolean', description: 'Re-run the edited cell (default true).' }
+                                run: { type: 'boolean', description: 'Re-run the edited cell (default false).' }
                             },
                             required: ['cellId', 'editType']
                         }
@@ -309,8 +300,8 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
             'run_cells',
             {
                 description:
-                    'Run one or more cells in a notebook headlessly (no approval dialog), in order, and WAIT for ' +
-                    'completion, returning each cell\'s status and parsed outputs (text/error/image). ' +
+                    'Run one or more cells headlessly. By default, run in order and wait for completion, returning bounded text outputs; ' +
+                    'a timeout reports that execution is still running and does not interrupt the kernel. Set wait=false to queue all selected cells and return immediately. ' +
                     'Provide the notebook URI and an array of 0-based cell indices. Optionally provide a kernel name/id ' +
                     'to select before running (e.g. "Python 3.12.2"; best-effort, falls back to the current kernel if not found). ' +
                     'Requires the Jupyter extension.',
@@ -320,16 +311,27 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
                         filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
                         cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or cell ids) to run.' },
                         kernel: { type: 'string', description: 'Optional kernel name/id to select before running.' },
-                        timeoutMs: { type: 'number', description: 'Max ms to wait per cell (default 60000).' }
+                        timeoutMs: { type: 'number', description: 'Max ms to wait per cell (default 60000); does not interrupt on timeout.' },
+                        wait: { type: 'boolean', description: 'Wait for each result (default true). False queues all selected cells and returns immediately.' },
+                        includeOutputs: { type: 'boolean', description: 'Include compact saved outputs for completed cells (default true).' },
+                        outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail: summary, preferred text (default), or all text representations.' },
+                        maxOutputChars: { type: 'number', description: 'Maximum output characters per cell (default 12000; clamped to 1000..100000).' }
                     },
                     required: ['filePath', 'cellIds']
                 })
             },
             async (args) => {
-                const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number>; kernel?: string; timeoutMs?: number };
+                const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number>; kernel?: string; timeoutMs?: number; wait?: boolean; includeOutputs?: boolean; outputMode?: OutputMode; maxOutputChars?: number };
                 if (!a.filePath) throw new Error('filePath is required');
                 if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
-                const text = await runNotebookCells(a.filePath, a.cellIds, a.kernel, a.timeoutMs ?? 60000);
+                const text = await runNotebookCells(a.filePath, a.cellIds, {
+                    kernel: a.kernel,
+                    timeoutMs: a.timeoutMs,
+                    wait: a.wait,
+                    includeOutputs: a.includeOutputs,
+                    mode: a.outputMode,
+                    maxChars: a.maxOutputChars
+                });
                 return { content: [{ type: 'text' as const, text }] };
             }
         );
@@ -448,4 +450,3 @@ export function registerNotebookTools(server: McpServer, port: number, instanceI
         }
     );
 }
-

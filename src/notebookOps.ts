@@ -2,8 +2,7 @@ import * as vscode from 'vscode';
 
 /**
  * Notebook operations for the Jupyter MCP server.
- * Everything here acts on the OPEN notebook documents in THIS window's extension host.
- * (Multi-window aggregation + routing lives in server.ts via the registry.)
+ * Everything here acts on the open notebook documents in this extension host.
  */
 
 export interface EditNotebookArgs {
@@ -16,8 +15,26 @@ export interface EditNotebookArgs {
     language?: string;
     /** Optional cell metadata to set (e.g. { tags: ["parameters"] }) — applied via NotebookEdit.updateCellMetadata. */
     metadata?: Record<string, unknown>;
-    /** Whether to re-run the edited cell after applying (default true). */
+    /** Whether to re-run the edited cell after applying (default false). */
     run?: boolean;
+}
+
+export type OutputMode = 'summary' | 'text' | 'full';
+
+export interface OutputOptions {
+    /** summary=mime/size only; text=one preferred textual representation; full=all text representations. */
+    mode?: OutputMode;
+    /** Maximum returned output characters per cell. Clamped to 1,000..100,000. */
+    maxChars?: number;
+}
+
+export interface RunCellsOptions extends OutputOptions {
+    kernel?: string;
+    timeoutMs?: number;
+    /** Return immediately after queueing all selected cells. */
+    wait?: boolean;
+    /** Include compact saved outputs in completed-cell results (default true). */
+    includeOutputs?: boolean;
 }
 
 /** Resolve a notebook by path/URI among open jupyter notebooks in this window. */
@@ -56,38 +73,18 @@ export async function saveDirtyNotebook(filePath: string): Promise<void> {
 export async function editNotebook(args: EditNotebookArgs): Promise<string> {
     const nb = findNotebook(args.filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${args.filePath}' in this window. Use get_open_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${args.filePath}' in this window. Use get_notebooks to list them.`);
     }
     await saveDirtyNotebook(args.filePath);
 
     const edit = new vscode.WorkspaceEdit();
-    const cellCount = nb.cellCount;
-
-    const resolveIndex = (ref: string | number | undefined): number => {
-        if (ref === undefined) return 0;
-        if (typeof ref === 'number') {
-            if (ref < 0 || ref >= cellCount) throw new Error(`Cell index ${ref} out of range (${cellCount} cells).`);
-            return ref;
-        }
-        const s = String(ref).toUpperCase();
-        if (s === 'TOP') return 0;
-        if (s === 'BOTTOM') return cellCount;
-        if (/^\d+$/.test(s)) {
-            const n = Number(s);
-            if (n < 0 || n >= cellCount) throw new Error(`Cell index ${n} out of range (${cellCount} cells).`);
-            return n;
-        }
-        const idx = nb.getCells().findIndex((c) => String(c.document.uri) === ref || c.document.uri.fragment === ref.replace(/^#/, ''));
-        if (idx === -1) {
-            throw new Error(`Cell id '${ref}' not found. Use a 0-based cell index (cellId) instead, or list cells via get_notebook_summary.`);
-        }
-        return idx;
-    };
+    let affectedIndex: number | undefined;
 
     switch (args.editType) {
         case 'insert': {
             if (args.newCode === undefined) throw new Error('newCode is required for insert');
-            const at = args.cellId === undefined ? cellCount : resolveIndex(args.cellId) + 1;
+            const at = resolveInsertionIndex(nb, args.cellId);
+            affectedIndex = at;
             const cell = new vscode.NotebookCellData(
                 (args.language ?? 'python').toLowerCase() === 'markdown'
                     ? vscode.NotebookCellKind.Markup
@@ -103,22 +100,20 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
         }
         case 'edit': {
             if (args.newCode === undefined) throw new Error('newCode is required for edit');
-            const idx = resolveIndex(args.cellId);
+            const idx = resolveCellIndex(nb, args.cellId);
+            affectedIndex = idx;
             const existing = nb.cellAt(idx);
             const cell = new vscode.NotebookCellData(
                 existing.kind,
                 args.newCode,
                 args.language ?? existing.document.languageId
             );
-            const edits: vscode.NotebookEdit[] = [vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(idx, idx + 1), [cell])];
-            if (args.metadata) {
-                edits.push(vscode.NotebookEdit.updateCellMetadata(idx, args.metadata));
-            }
-            edit.set(nb.uri, edits);
+            cell.metadata = { ...(existing.metadata ?? {}), ...(args.metadata ?? {}) };
+            edit.set(nb.uri, [vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(idx, idx + 1), [cell])]);
             break;
         }
         case 'delete': {
-            const idx = resolveIndex(args.cellId);
+            const idx = resolveCellIndex(nb, args.cellId);
             edit.set(nb.uri, [vscode.NotebookEdit.deleteCells(new vscode.NotebookRange(idx, idx + 1))]);
             break;
         }
@@ -131,10 +126,9 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
         throw new Error('Failed to apply notebook edit (applyEdit returned false).');
     }
 
-    // Optional re-run of the edited/inserted cell (awaited, so the client knows it ran).
-    if (args.run !== false && args.editType !== 'delete') {
-        const target = args.editType === 'insert' ? resolveIndex(args.cellId) + 1 : resolveIndex(args.cellId);
-        const cell = nb.cellAt(Math.min(target, nb.cellCount - 1));
+    // Re-run only when explicitly requested. Editing should not unexpectedly start a long kernel job.
+    if (args.run === true && args.editType !== 'delete' && affectedIndex !== undefined) {
+        const cell = nb.cellAt(Math.min(affectedIndex, nb.cellCount - 1));
         if (cell.kind === vscode.NotebookCellKind.Code) {
             try {
                 await vscode.commands.executeCommand('notebook.execute', nb.uri, [cell.document.uri]);
@@ -144,7 +138,7 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
         }
     }
 
-    return `Applied ${args.editType} on ${nb.uri.toString()}.`;
+    return `Applied ${args.editType} on ${nb.uri.toString()}. Cells now: ${nb.cellCount}.`;
 }
 
 /** Create a new notebook. With a workspace folder, writes a .ipynb file; without one (empty window), creates an untitled notebook. */
@@ -181,24 +175,12 @@ export async function createNotebook(query: string): Promise<string> {
     return `Created untitled notebook ${doc.uri.toString()} and opened it in the editor (no workspace folder open).`;
 }
 
-/** Stable cell identifier: the cell's metadata.id if present, else "index:N". */
+/** Best available cell anchor without mutating the notebook. */
 export function cellIdentifier(cell: vscode.NotebookCell, index: number): string {
     const id = (cell.metadata as Record<string, unknown> | undefined)?.id;
-    return typeof id === 'string' && id.length > 0 ? id : `index:${index}`;
-}
-
-/** Ensure a cell has a metadata.id (stable anchor), returning it. Writes if missing. */
-export async function ensureCellId(nb: vscode.NotebookDocument, index: number): Promise<string> {
-    const cell = nb.cellAt(index);
-    const existing = (cell.metadata as Record<string, unknown> | undefined)?.id;
-    if (typeof existing === 'string' && existing.length > 0) {
-        return existing;
-    }
-    const id = `cell-${Date.now().toString(36)}-${index}`;
-    const edit = new vscode.WorkspaceEdit();
-    edit.set(nb.uri, [vscode.NotebookEdit.updateCellMetadata(index, { ...(cell.metadata ?? {}), id })]);
-    await vscode.workspace.applyEdit(edit);
-    return id;
+    if (typeof id === 'string' && id.length > 0) return id;
+    const fragment = cell.document.uri.fragment;
+    return fragment ? `#${fragment}` : `index:${index}`;
 }
 
 /** Resolve a cell index within a notebook from a cellId/index/TOP/BOTTOM ref. */
@@ -230,60 +212,122 @@ export function resolveCellIndex(nb: vscode.NotebookDocument, cellId: string | n
     return idx;
 }
 
+/** Resolve the insertion point: TOP=0, BOTTOM/undefined=end, any other ref=after that cell. */
+export function resolveInsertionIndex(nb: vscode.NotebookDocument, cellId: string | number | undefined): number {
+    if (cellId === undefined || String(cellId).toUpperCase() === 'BOTTOM') return nb.cellCount;
+    if (String(cellId).toUpperCase() === 'TOP') return 0;
+    return resolveCellIndex(nb, cellId) + 1;
+}
+
+function executionState(cell: vscode.NotebookCell): string {
+    if (cell.kind !== vscode.NotebookCellKind.Code) return 'n/a';
+    const success = cell.executionSummary?.success;
+    if (success === true) return 'success';
+    if (success === false) return 'error';
+    return 'not-run';
+}
+
 /** Native summary: cells, types, languages, line counts, execution state, output mime types. */
 export async function getNotebookSummary(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_open_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
     }
     const lines: string[] = [`Notebook: ${nb.uri.toString()}`, `Cells: ${nb.cellCount}`];
     nb.getCells().forEach((c, i) => {
         const text = c.document.getText();
-        const exec = c.executionSummary;
         const mimes = c.outputs.flatMap((o) => o.items.map((it) => it.mime)).filter(Boolean);
         lines.push(
-            `${i}. ${c.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown'} | lang=${c.document.languageId} | ` +
-            `lines=${text.split('\n').length} | executed=${exec ? (exec.success ? 'yes' : 'error') : 'no'} | ` +
+            `${i}. id=${cellIdentifier(c, i)} | ${c.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown'} | lang=${c.document.languageId} | ` +
+            `lines=${text.split('\n').length} | state=${executionState(c)} | ` +
             `outputs=[${mimes.join(', ')}]`
         );
     });
     return lines.join('\n');
 }
 
-/** Native cell output: all output items (text decoded from UTF-8). */
-export async function readCellOutput(filePath: string, cellId: string | number | undefined): Promise<string> {
+const PREFERRED_TEXT_MIMES = [
+    'text/markdown',
+    'text/plain',
+    'application/vnd.code.notebook.stdout',
+    'application/vnd.code.notebook.stderr',
+    'application/json',
+    'text/html'
+];
+
+function clampMaxChars(value: number | undefined): number {
+    if (!Number.isFinite(value)) return 12_000;
+    return Math.max(1_000, Math.min(100_000, Math.trunc(value!)));
+}
+
+function isTextMime(mime: string): boolean {
+    return mime.startsWith('text/') || mime === 'application/json' || mime === 'application/vnd.code.notebook.stdout' || mime === 'application/vnd.code.notebook.stderr';
+}
+
+function decodeError(data: Uint8Array): string {
+    const raw = new TextDecoder().decode(data);
+    try {
+        const error = JSON.parse(raw) as { name?: string; message?: string };
+        return `Error: ${error.name ?? 'Error'}: ${error.message ?? raw}`;
+    } catch {
+        return `Error: ${raw}`;
+    }
+}
+
+/** Format outputs without decoding binary images or duplicating rich display representations. */
+export function formatCellOutputs(cell: vscode.NotebookCell, options: OutputOptions = {}): string {
+    const mode = options.mode ?? 'text';
+    const maxChars = clampMaxChars(options.maxChars);
+    const decoder = new TextDecoder();
+    const parts: string[] = [];
+    for (let oi = 0; oi < cell.outputs.length; oi++) {
+        const items = cell.outputs[oi].items;
+        if (mode === 'summary') {
+            parts.push(`[output ${oi}: ${items.map((item) => `${item.mime} ${item.data.byteLength} bytes`).join(', ')}]`);
+            continue;
+        }
+        const errors = items.filter((item) => item.mime === 'application/vnd.code.notebook.error');
+        for (const item of errors) parts.push(`[output ${oi} | ${item.mime}]\n${decodeError(item.data)}`);
+        const textItems = items.filter((item) => isTextMime(item.mime));
+        const selected = mode === 'full'
+            ? textItems
+            : PREFERRED_TEXT_MIMES.map((mime) => textItems.find((item) => item.mime === mime)).filter((item): item is vscode.NotebookCellOutputItem => Boolean(item)).slice(0, 1);
+        for (const item of selected) parts.push(`[output ${oi} | ${item.mime}]\n${decoder.decode(item.data)}`);
+        for (const item of items.filter((item) => item.mime.startsWith('image/'))) {
+            parts.push(`[output ${oi} | ${item.mime} | ${item.data.byteLength} bytes omitted]`);
+        }
+        if (!errors.length && !selected.length && !items.some((item) => item.mime.startsWith('image/'))) {
+            parts.push(`[output ${oi}: ${items.map((item) => `${item.mime} ${item.data.byteLength} bytes`).join(', ')}]`);
+        }
+    }
+    if (parts.length === 0) return '(no saved output)';
+    const joined = parts.join('\n\n');
+    return joined.length <= maxChars ? joined : `${joined.slice(0, maxChars)}\n… [truncated at ${maxChars} characters]`;
+}
+
+/** Native cell output with compact, bounded formatting. */
+export async function readCellOutput(filePath: string, cellId: string | number | undefined, options: OutputOptions = {}): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_open_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
     }
     const idx = resolveCellIndex(nb, cellId);
     const cell = nb.cellAt(idx);
-    const decoder = new TextDecoder();
-    const parts: string[] = [];
-    cell.outputs.forEach((o, oi) => {
-        for (const item of o.items) {
-            const text = decoder.decode(item.data);
-            parts.push(`[output ${oi} | ${item.mime}]\n${text}`);
-        }
-    });
-    if (parts.length === 0) {
-        return `Cell ${idx} has no saved output.`;
-    }
-    return parts.join('\n\n');
+    return cell.outputs.length ? formatCellOutputs(cell, options) : `Cell ${idx} has no saved output.`;
 }
 
 /** Native cell source: return each requested cell's source text with index/kind/language. */
 export async function getCells(filePath: string, cellIds?: Array<string | number>): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_open_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
     }
     const idxs = cellIds && cellIds.length ? cellIds.map((c) => resolveCellIndex(nb, c)) : Array.from({ length: nb.cellCount }, (_, i) => i);
     const blocks: string[] = [];
     for (const idx of idxs) {
         const cell = nb.cellAt(idx);
         blocks.push(
-            `[cell ${idx} | ${cell.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown'} | ${cell.document.languageId}]\n` +
+            `[cell ${idx} | id:${cellIdentifier(cell, idx)} | ${cell.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown'} | ${cell.document.languageId}]\n` +
             cell.document.getText()
         );
     }
@@ -291,18 +335,18 @@ export async function getCells(filePath: string, cellIds?: Array<string | number
 }
 
 /** Native multi-cell output: outputs for several cells in a notebook. */
-export async function getCellsOutput(filePath: string, cellIds: Array<string | number>): Promise<string> {
+export async function getCellsOutput(filePath: string, cellIds: Array<string | number>, options: OutputOptions = {}): Promise<string> {
     if (cellIds.length === 0) {
         throw new Error('cellIds must not be empty.');
     }
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_open_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
     }
     const blocks: string[] = [];
     for (const c of cellIds) {
         const idx = resolveCellIndex(nb, c);
-        blocks.push(`[cell ${idx} output]\n${await readCellOutput(filePath, idx)}`);
+        blocks.push(`[cell ${idx} output]\n${await readCellOutput(filePath, idx, options)}`);
     }
     return blocks.join('\n\n');
 }
@@ -332,7 +376,7 @@ export async function saveNotebooks(filePaths: string[]): Promise<string> {
 export async function restartKernel(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_open_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
     }
     await vscode.commands.executeCommand('notebook.restartKernel', nb.uri);
     return `Restarted kernel for ${nb.uri.toString()}.`;
@@ -415,8 +459,10 @@ export function searchCells(filePath: string, query: string, caseSensitive = fal
         const outputHits: string[] = [];
         cell.outputs.forEach((o, oi) => {
             for (const item of o.items) {
-                const text = new TextDecoder().decode(item.data);
-                if (hay(text).includes(q)) outputHits.push(`output ${oi} (${item.mime})`);
+                if (item.mime === 'application/vnd.code.notebook.error' || isTextMime(item.mime)) {
+                    const text = new TextDecoder().decode(item.data);
+                    if (hay(text).includes(q)) outputHits.push(`output ${oi} (${item.mime})`);
+                }
             }
         });
         if (srcHits.length || outputHits.length) {
@@ -514,7 +560,8 @@ export async function openNotebooks(filePaths: string[]): Promise<string> {
             throw new Error(`'${fp}' is not a file: URI. open_notebooks accepts file: URIs of notebooks on disk.`);
         }
         const uri = vscode.Uri.parse(fp);
-        await vscode.workspace.openNotebookDocument(uri);
+        const notebook = await vscode.workspace.openNotebookDocument(uri);
+        await vscode.window.showNotebookDocument(notebook, { preview: false });
         opened.push(uri.toString());
     }
     return `Opened: ${opened.join(', ')}.`;
@@ -532,30 +579,6 @@ export async function getNotebooksSummary(filePaths: string[]): Promise<string> 
         blocks.push(await getNotebookSummary(fp));
     }
     return blocks.join('\n\n');
-}
-
-/** Parse a cell's outputs into a compact JSON-friendly structure (text/error/image). */
-export function parseCellOutputs(cell: vscode.NotebookCell): Array<{ type: string; mime?: string; text?: string; name?: string; message?: string; data?: string }> {
-    const decoder = new TextDecoder();
-    const out: Array<{ type: string; mime?: string; text?: string; name?: string; message?: string; data?: string }> = [];
-    for (const output of cell.outputs) {
-        for (const item of output.items) {
-            const mime = item.mime;
-            if (mime === 'application/vnd.code.notebook.error') {
-                try {
-                    const e = JSON.parse(decoder.decode(item.data));
-                    out.push({ type: 'error', name: e.name ?? 'Error', message: e.message ?? String(e) });
-                } catch {
-                    out.push({ type: 'error', name: 'Error', message: decoder.decode(item.data) });
-                }
-            } else if (mime.startsWith('image/')) {
-                out.push({ type: 'image', mime, data: Buffer.from(item.data).toString('base64') });
-            } else {
-                out.push({ type: 'text', mime, text: decoder.decode(item.data) });
-            }
-        }
-    }
-    return out;
 }
 
 /** Signature of a cell's outputs (used to detect a fresh execution result). */
@@ -590,8 +613,8 @@ function isFreshExecution(cell: vscode.NotebookCell, baseline: { order?: number;
     return outputSignature(cell) !== baseline.signature;
 }
 
-/** Wait until a cell's execution completes (or timeout). Returns the updated cell. */
-async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, baseline: { order?: number; signature: string; hadSummary: boolean }, requestedAt: number, timeoutMs: number): Promise<vscode.NotebookCell> {
+/** Wait until a cell completes. A timeout is a non-error because the kernel may still be running. */
+async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, baseline: { order?: number; signature: string; hadSummary: boolean }, requestedAt: number, timeoutMs: number): Promise<vscode.NotebookCell | undefined> {
     const deadline = Date.now() + (timeoutMs > 0 ? timeoutMs : 24 * 60 * 60 * 1000);
     while (Date.now() < deadline) {
         const cell = notebook.cellAt(index);
@@ -600,7 +623,7 @@ async function waitForCellExecution(notebook: vscode.NotebookDocument, index: nu
         }
         await new Promise((r) => setTimeout(r, 100));
     }
-    throw new Error(`Cell ${index} execution timed out.`);
+    return undefined;
 }
 
 /**
@@ -609,7 +632,7 @@ async function waitForCellExecution(notebook: vscode.NotebookDocument, index: nu
  * vscode-runtime-notebook-mcp: poll executionSummary until the run produces a fresh result.
  * @param kernel optional kernel name/id to select before running (best-effort via notebook.selectKernel).
  */
-export async function runNotebookCells(filePath: string, cellIds: Array<string | number>, kernel?: string, timeoutMs = 60000): Promise<string> {
+export async function runNotebookCells(filePath: string, cellIds: Array<string | number>, options: RunCellsOptions = {}): Promise<string> {
     if (cellIds.length === 0) {
         throw new Error('cellIds must not be empty.');
     }
@@ -620,9 +643,9 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     await saveDirtyNotebook(filePath);
 
     // Optional kernel selection (best-effort; non-fatal if it fails or isn't found).
-    if (kernel) {
+    if (options.kernel) {
         try {
-            await vscode.commands.executeCommand('notebook.selectKernel', { notebookEditor: nb.uri, kernelInfo: { label: kernel } });
+            await vscode.commands.executeCommand('notebook.selectKernel', { notebookEditor: nb.uri, kernelInfo: { label: options.kernel } });
         } catch {
             // Non-fatal: execution proceeds with the current kernel.
         }
@@ -635,19 +658,26 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
         }
     }
 
+    if (options.wait === false) {
+        await vscode.commands.executeCommand('notebook.execute', nb.uri, indices.map((idx) => nb.cellAt(idx).document.uri));
+        return `Queued ${indices.length} cell(s) in ${nb.uri.toString()}: ${indices.join(', ')}. Use get_cells or get_cells_output to inspect progress.`;
+    }
+
     const results: string[] = [];
     for (const idx of indices) {
-        // Ensure the cell has a stable id anchor so references survive reordering.
-        await ensureCellId(nb, idx);
         const baseline = executionBaseline(nb.cellAt(idx));
         const requestedAt = Date.now();
         await vscode.commands.executeCommand('notebook.execute', nb.uri, [nb.cellAt(idx).document.uri]);
-        const cell = await waitForCellExecution(nb, idx, baseline, requestedAt, timeoutMs);
-        const outputs = parseCellOutputs(cell);
-        const status = cell.executionSummary?.success ? 'success' : 'error';
+        const cell = await waitForCellExecution(nb, idx, baseline, requestedAt, options.timeoutMs ?? 60_000);
+        if (!cell) {
+            results.push(`[cell ${idx}] still running after ${options.timeoutMs ?? 60_000} ms. Execution was not interrupted.`);
+            break;
+        }
+        const status = cell.executionSummary?.success === true ? 'success' : 'error';
+        const output = options.includeOutputs === false ? '' : `\n${formatCellOutputs(cell, options)}`;
         results.push(
             `[cell ${idx}] ${status}${cell.executionSummary?.executionOrder !== undefined ? ` (execution #${cell.executionSummary.executionOrder})` : ''}\n` +
-            (outputs.length ? outputs.map((o) => o.type === 'text' ? o.text : o.type === 'error' ? `Error: ${o.name}: ${o.message}` : `[image ${o.mime} ${(o.data ?? '').length} bytes]`).join('') : '(no output)')
+            output.trimStart()
         );
     }
     return results.join('\n');
@@ -660,9 +690,8 @@ export async function editNotebookCells(filePath: string, edits: Array<Omit<Edit
     }
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_open_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
     }
-    await saveDirtyNotebook(filePath);
     const lines: string[] = [];
     for (const e of edits) {
         lines.push(await editNotebook({ ...e, filePath }));
@@ -672,10 +701,10 @@ export async function editNotebookCells(filePath: string, edits: Array<Omit<Edit
 
 /**
  * Read a whole notebook in one call: per cell, index, stable cell_id anchor, kind,
- * language, source, line count, execution state, and outputs (text/error/image).
+ * language, source, line count, execution state, and compact outputs.
  * Adapted from the whole-notebook read in vscode-inmemory-notebook-mcp.
  */
-export async function readNotebook(filePath: string, opts: { includeOutputs?: boolean; cellIds?: Array<string | number> } = {}): Promise<string> {
+export async function readNotebook(filePath: string, opts: { includeOutputs?: boolean; cellIds?: Array<string | number>; outputMode?: OutputMode; maxOutputChars?: number } = {}): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
@@ -691,14 +720,13 @@ export async function readNotebook(filePath: string, opts: { includeOutputs?: bo
         const id = cellIdentifier(cell, idx);
         blocks.push(
             `[cell ${idx} | id:${id} | ${cell.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown'} | ${cell.document.languageId} | ` +
-            `executed:${exec ? (exec.success ? 'yes' : 'error') : 'no'}${exec?.executionOrder !== undefined ? ` (#${exec.executionOrder})` : ''}]`
+            `state:${executionState(cell)}${exec?.executionOrder !== undefined ? ` (#${exec.executionOrder})` : ''}]`
         );
         blocks.push(cell.document.getText());
         if (opts.includeOutputs) {
-            const outputs = parseCellOutputs(cell);
-            if (outputs.length) {
+            if (cell.outputs.length) {
                 blocks.push('[output]');
-                blocks.push(outputs.map((o) => o.type === 'text' ? o.text : o.type === 'error' ? `Error: ${o.name}: ${o.message}` : `[image ${o.mime} ${(o.data ?? '').length} bytes]`).join(''));
+                blocks.push(formatCellOutputs(cell, { mode: opts.outputMode, maxChars: opts.maxOutputChars }));
             }
         }
         blocks.push('');
