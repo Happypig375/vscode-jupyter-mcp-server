@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4
+
+- Added optional `list_kernels({ filePath, configure: true })` provider bootstrap, returning configuration status with the refreshed exact controller list. The default remains read-only.
+
+### Breaking changes
+
+- Removed the standalone `configure_kernel` tool. Migrate `configure_kernel({ filePath })` to `list_kernels({ filePath, configure: true })`.
+
 ## 0.2.3
 
 - Added provider-neutral `configure_kernel` to run Jupyter's configuration workflow before enumeration when a remote provider has not registered a concrete controller yet.

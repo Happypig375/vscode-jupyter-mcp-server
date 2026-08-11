@@ -449,30 +449,24 @@ export async function getKernelInfo(filePath: string): Promise<string> {
     return `Notebook: ${nb.uri.toString()}\nKernel: ${label}`;
 }
 
-/** Enumerate the notebook controllers currently registered for an open notebook. */
-export async function listKernels(filePath: string): Promise<string> {
+/** Enumerate registered notebook controllers, optionally configuring providers first. */
+export async function listKernels(filePath: string, configure = false): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
+    const startup = configure ? await invokeJupyterConfigureTool(nb) : undefined;
     const kernels = await resolveNotebookKernels(nb);
-    return JSON.stringify({ notebook: nb.uri.toString(), kernels }, null, 2);
-}
-
-/**
- * Run Jupyter's provider-neutral notebook configuration workflow. This lets installed
- * providers register/select a server before list_kernels resolves concrete controllers.
- */
-export async function configureKernel(filePath: string): Promise<string> {
-    const nb = findNotebook(filePath);
-    if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
-    }
-    const startup = await invokeJupyterConfigureTool(nb);
-    if (startup.pending) {
-        return `Kernel configuration was requested for ${nb.uri.toString()} and is still pending.\n${startup.detail}`;
-    }
-    return `Configured kernel for ${nb.uri.toString()}.${startup.detail ? `\n${startup.detail}` : ''}`;
+    return JSON.stringify({
+        notebook: nb.uri.toString(),
+        ...(startup ? {
+            configuration: {
+                status: startup.pending ? 'pending' : 'configured',
+                detail: startup.detail
+            }
+        } : {}),
+        kernels
+    }, null, 2);
 }
 
 /**

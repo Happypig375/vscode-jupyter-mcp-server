@@ -134,7 +134,9 @@ const vscodeShim = {
         get tools() { return configureAvailable ? [{ name: 'configure_notebook' }] : []; },
         invokeTool: async (name, options) => {
             startedKernels.push({ name, filePath: options.input.filePath });
-            if (!availableKernels.some((kernel) => kernel.id === providerKernel.id)) availableKernels.push(providerKernel);
+            if (!/failed|error/i.test(startupDetail) && !availableKernels.some((kernel) => kernel.id === providerKernel.id)) {
+                availableKernels.push(providerKernel);
+            }
             return { content: [{ value: startupDetail }] };
         }
     },
@@ -199,7 +201,7 @@ async function main() {
 
     // 1. With Jupyter present, kernel tools ARE exposed.
     await check('kernel tools exposed when Jupyter present', async () => {
-        const expected = ['create_notebook', 'list_notebooks', 'inspect_notebooks', 'read_cells', 'read_cell_outputs', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'configure_kernel', 'list_kernels', 'select_kernel', 'read_notebook', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks'];
+        const expected = ['create_notebook', 'list_notebooks', 'inspect_notebooks', 'read_cells', 'read_cell_outputs', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'read_notebook', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
     });
 
@@ -289,22 +291,58 @@ async function main() {
     });
 
     await check('list_kernels initially returns only registered controllers', async () => {
+        const configureCallsBefore = startedKernels.length;
         const res = await client.callTool({ name: 'list_kernels', arguments: { filePath: 'file:///C:/nb.ipynb' } });
         assert.ok(!res.isError, JSON.stringify(res));
         const listed = JSON.parse(res.content[0].text);
         assert.deepStrictEqual(listed.kernels.map((kernel) => kernel.id), ['ms-toolsai.jupyter/python-312']);
+        assert.strictEqual(listed.configuration, undefined);
+        assert.strictEqual(startedKernels.length, configureCallsBefore, 'default enumeration must not configure providers');
         assert.doesNotMatch(res.content[0].text, /Colab Runtime/);
     });
 
-    await check('configure_kernel bootstraps provider registration before enumeration', async () => {
-        const configured = await client.callTool({ name: 'configure_kernel', arguments: { filePath: 'file:///C:/nb.ipynb' } });
+    await check('list_kernels configure=true reports a missing Jupyter configure tool', async () => {
+        configureAvailable = false;
+        const res = await client.callTool({ name: 'list_kernels', arguments: {
+            filePath: 'file:///C:/nb.ipynb', configure: true
+        } });
+        configureAvailable = true;
+        assert.ok(res.isError);
+        assert.match(res.content[0].text, /configure_notebook.*unavailable/i);
+    });
+
+    await check('list_kernels configure=true propagates configuration failure', async () => {
+        startupDetail = 'Failed to configure the selected provider.';
+        const res = await client.callTool({ name: 'list_kernels', arguments: {
+            filePath: 'file:///C:/nb.ipynb', configure: true
+        } });
+        startupDetail = 'Kernel is idle and ready.';
+        assert.ok(res.isError);
+        assert.match(res.content[0].text, /could not configure a kernel/i);
+    });
+
+    await check('list_kernels configure=true bootstraps and returns refreshed provider controllers', async () => {
+        const configured = await client.callTool({ name: 'list_kernels', arguments: {
+            filePath: 'file:///C:/nb.ipynb', configure: true
+        } });
         assert.ok(!configured.isError, JSON.stringify(configured));
         assert.strictEqual(startedKernels.at(-1).name, 'configure_notebook');
-        assert.match(configured.content[0].text, /Configured kernel/);
+        const listed = JSON.parse(configured.content[0].text);
+        assert.strictEqual(listed.configuration.status, 'configured');
+        assert.ok(listed.kernels.some((kernel) => kernel.id === providerKernel.id));
+    });
 
-        const listed = await client.callTool({ name: 'list_kernels', arguments: { filePath: 'file:///C:/nb.ipynb' } });
-        assert.ok(!listed.isError, JSON.stringify(listed));
-        assert.match(listed.content[0].text, /Colab Runtime/);
+    await check('list_kernels configure=true returns pending status with refreshed controllers', async () => {
+        startupDetail = 'The kernel is taking longer than expected to start and is still starting in the background.';
+        const res = await client.callTool({ name: 'list_kernels', arguments: {
+            filePath: 'file:///C:/nb.ipynb', configure: true
+        } });
+        startupDetail = 'Kernel is idle and ready.';
+        assert.ok(!res.isError, JSON.stringify(res));
+        const listed = JSON.parse(res.content[0].text);
+        assert.strictEqual(listed.configuration.status, 'pending');
+        assert.match(listed.configuration.detail, /still starting in the background/);
+        assert.ok(listed.kernels.some((kernel) => kernel.id === providerKernel.id));
     });
 
     await check('select_kernel selects exact id and can start it', async () => {

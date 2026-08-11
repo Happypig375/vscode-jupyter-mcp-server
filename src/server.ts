@@ -149,47 +149,27 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         }
     );
 
-    // ---- Configure/list/select kernels (requires Jupyter) ----
+    // ---- List/select kernels (requires Jupyter) ----
     if (hasJupyter) {
-        server.registerTool(
-            'configure_kernel',
-            {
-                description:
-                    'Run Jupyter\'s provider-neutral configuration workflow for an already-open notebook before listing ' +
-                    'or selecting kernels. Installed providers such as Colab may show their normal server picker, ' +
-                    'confirmation, authentication, or runtime-allocation UI. Call list_kernels again after this completes.',
-                inputSchema: jsonSchemaToZod({
-                    type: 'object',
-                    properties: {
-                        filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' }
-                    },
-                    required: ['filePath']
-                })
-            },
-            async (args) => {
-                const a = (args ?? {}) as { filePath?: string };
-                if (!a.filePath) throw new Error('filePath is required');
-                const text = await router.invokeNotebook('configure_kernel', a.filePath, a as Record<string, unknown>);
-                return { content: [{ type: 'text' as const, text }] };
-            }
-        );
-
         server.registerTool(
             'list_kernels',
             {
                 description:
-                    'List the exact kernel/controller ids currently available to a notebook. Includes providers registered ' +
-                    'through installed extensions such as Colab. Pass one returned id to select_kernel.',
+                    'List the exact kernel/controller ids currently available to a notebook. By default this is read-only. ' +
+                    'Set configure=true to first run Jupyter\'s provider-neutral configuration workflow, then return the ' +
+                    'configuration status and refreshed controllers. Providers such as Colab may show normal UI. ' +
+                    'Pass one returned id to select_kernel.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: {
-                        filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' }
+                        filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                        configure: { type: 'boolean', description: 'Configure providers before enumeration (default false/read-only).' }
                     },
                     required: ['filePath']
                 })
             },
             async (args) => {
-                const a = (args ?? {}) as { filePath?: string };
+                const a = (args ?? {}) as { filePath?: string; configure?: boolean };
                 if (!a.filePath) throw new Error('filePath is required');
                 const text = await router.invokeNotebook('list_kernels', a.filePath, a as Record<string, unknown>);
                 return { content: [{ type: 'text' as const, text }] };
