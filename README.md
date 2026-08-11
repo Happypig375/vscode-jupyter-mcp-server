@@ -12,9 +12,9 @@ This extension is built for one specific workflow: **an outside agent drives the
 
 That objective drives every design choice:
 
-- **External, harness-agnostic** — any MCP client works; nothing is tied to VS Code's Copilot Chat or Cursor agents. The tools use the VS Code notebook API directly — **no `vscode.lm.invokeTool`**, no Copilot-tool contributions, no approval dialogs, no chat-stream requirements ([microsoft/vscode#319094](https://github.com/microsoft/vscode/issues/319094) is why).
+- **External, harness-agnostic** — any MCP client works; nothing is tied to VS Code's Copilot Chat or Cursor agents. Document editing and cell execution use the VS Code notebook API directly. Only the explicit `select_kernel(start=true)` path invokes Jupyter's contributed configuration tool so a selected provider can start its runtime.
 - **User-editing notebook as the source of truth** — tools target open `NotebookDocument`s, not `.ipynb` files on disk, so kernel state and unsaved edits are never out of sync.
-- **Jupyter-optional** — kernel tools (`run_cells`, `restart_kernels`, `interrupt_kernels`) are only exposed when the Jupyter extension is installed; all document tools work with VS Code's native notebook support alone.
+- **Jupyter-optional** — kernel tools (`list_kernels`, `select_kernel`, `run_cells`, `restart_kernels`, `interrupt_kernels`) are only exposed when the Jupyter extension is installed; all document tools work with VS Code's native notebook support alone.
 - **Deterministic, CI-friendly testing** — a shim-based MCP test suite with enforced coverage thresholds runs identically on every platform (no GUI, no VS Code download).
 
 ### How this compares to similar projects
@@ -45,11 +45,13 @@ Batch-oriented tools accept arrays and are grouped by owning window; cell-orient
 | `read_cells` | Read | Read cell source by index or cell anchor, or read all cells |
 | `read_cell_outputs` | Read | Read bounded `summary`, preferred-`text`, or all-text `full` output; binary images are summarized, never decoded |
 | `search_cells` | Read | **Search** a notebook's cells (source + output text) for a query, with per-cell match locations; case-insensitive by default |
-| `get_kernel_info` | Read | Get the active **kernel label** for a notebook (best-effort via the Jupyter extension) |
+| `get_kernel_info` | Read | Get active kernel label or language/status (best-effort via the Jupyter extension) |
+| `list_kernels` | Read | List exact available kernel/controller ids, including providers such as Colab |
 | `edit_cells` | Write | Insert/edit/delete cells in order; preserves existing metadata; optional explicit re-run (off by default) |
 | `move_cells` | Write | Move one or more cells to a new position (preserves content/outputs/metadata) |
 | `clear_cell_outputs` | Write | Clear saved outputs and execution state from one or more cells |
 | `run_cells` | Execute | Run cells headlessly; wait for bounded text results or set `wait=false` to queue immediately; a wait timeout does not interrupt execution |
+| `select_kernel` | Manage | Select an exact id from `list_kernels`; optionally start it with `start=true` |
 | `restart_kernels` | Manage | Restart the kernel of one or more notebooks |
 | `interrupt_kernels` | Manage | **Interrupt** (stop) running execution in one or more notebooks |
 | `open_notebooks` | Manage | Open existing notebooks from disk (file: URIs) |
@@ -58,16 +60,17 @@ Batch-oriented tools accept arrays and are grouped by owning window; cell-orient
 
 ### Jupyter-extension guard
 
-Tools that require a **kernel** — `run_cells`, `restart_kernels`, and `interrupt_kernels` — are only exposed when the **Jupyter extension** (`ms-toolsai.jupyter`) is installed. The remaining tools work with VS Code's native notebook support alone.
+Tools that require a **kernel** — `list_kernels`, `select_kernel`, `run_cells`, `restart_kernels`, and `interrupt_kernels` — are only exposed when the **Jupyter extension** (`ms-toolsai.jupyter`) is installed. The remaining tools work with VS Code's native notebook support alone.
 
 ## Recommended flow
 
 1. `list_notebooks` → pick the notebook URI; use `notebookId` if that URI appears in multiple windows
 2. `read_notebook` (or `inspect_notebooks`) → see the notebook's structure/state
 3. `edit_cells` → write/change cells
-4. `run_cells` → execute cells **headlessly** and get outputs back
-5. `read_cell_outputs` (or `read_notebook` with outputs) → read results
-6. `save_notebooks` → persist; `export_notebook` → share
+4. `list_kernels` / `select_kernel` → optionally choose a specific local or extension-provided kernel
+5. `run_cells` → execute cells **headlessly** and get outputs back
+6. `read_cell_outputs` (or `read_notebook` with outputs) → read results
+7. `save_notebooks` → persist; `export_notebook` → share
 
 ## Why a VS Code extension?
 
@@ -75,7 +78,7 @@ Notebook execution, kernels, and the Jupyter extension's tools exist only inside
 
 ## Why native tools instead of forwarding Copilot's?
 
-The VS Code notebook API covers all the functionality natively — cell execution (`notebook.execute`), reading cells/outputs (`cell.outputs`, `executionSummary`), kernel restart (`notebook.restartKernel`) — so the server implements everything itself. This avoids the problems with forwarding Copilot's tools via `vscode.lm.invokeTool`:
+The VS Code notebook API covers cell execution (`notebook.execute`), reading cells/outputs (`cell.outputs`, `executionSummary`), and kernel restart (`notebook.restartKernel`), so those paths remain native. Starting a selected provider has no equivalent public notebook command, so the explicit `select_kernel(start=true)` path delegates only that startup step to Jupyter's contributed `configure_notebook` tool. Keeping all other operations native avoids the problems with broadly forwarding Copilot tools:
 - **Tool-approval dialogs** for execution tools invoked outside a live chat session (`chat.tools.autoApprove` doesn't suppress these — [microsoft/vscode#319094](https://github.com/microsoft/vscode/issues/319094))
 - **Stream requirements** for interactive tools (edit/create need a chat stream)
 - **Coupling** to Copilot Chat's tool contributions and their schemas
@@ -121,6 +124,8 @@ If the same notebook URI is open in two windows, `list_notebooks` returns two en
 
 - Notebooks must be open in VS Code to be listed/read/edited (`list_notebooks` lists open ones).
 - Requires the **Jupyter extension** (`ms-toolsai.jupyter`) for kernel-backed execution; `run_cells` uses the notebook's current kernel.
+- `select_kernel.kernelId` requires an exact id returned by `list_kernels` and never falls back. The older `run_cells.kernel` field remains a best-effort label/id hint for compatibility; use `select_kernel` first and omit `run_cells.kernel` when exact selection matters.
+- `select_kernel` is headless by default. `start=true` uses Jupyter's contributed notebook configuration tool and may show the provider's normal confirmation or sign-in UI (for example, Colab authentication).
 - Cell references use 0-based indices (`cellIds`) — after an edit, call `inspect_notebooks` for fresh indices.
 - The HTTP transport supports multi-window routing; stdio remains scoped to the extension host that owns its process.
 - Workspace-trust / tool-approval dialogs do **not** apply to these native tools (they use the VS Code notebook API, not `invokeTool`).

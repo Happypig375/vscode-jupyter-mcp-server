@@ -29,12 +29,29 @@ export interface OutputOptions {
 }
 
 export interface RunCellsOptions extends OutputOptions {
+    /** Legacy best-effort kernel label/id hint. Use select_kernel for exact selection. */
     kernel?: string;
     timeoutMs?: number;
     /** Return immediately after queueing all selected cells. */
     wait?: boolean;
     /** Include compact saved outputs in completed-cell results (default true). */
     includeOutputs?: boolean;
+}
+
+export interface NotebookKernelInfo {
+    /** Stable controller id, including the contributing extension prefix. */
+    id: string;
+    label: string;
+    description?: string;
+    detail?: string;
+    extension: string;
+}
+
+interface ResolvedNotebookKernel {
+    id?: string;
+    label: string;
+    description?: string;
+    detail?: string;
 }
 
 /** Resolve a notebook by path/URI among open jupyter notebooks in this window. */
@@ -411,13 +428,120 @@ export async function getKernelInfo(filePath: string): Promise<string> {
     }
     let label = 'unknown';
     try {
-        const api = await vscode.extensions.getExtension<{ getKernel?: (u: unknown) => { label?: string } }>('ms-toolsai.jupyter')?.activate();
-        const kernel = api?.getKernel?.(nb.uri);
-        if (kernel?.label) label = kernel.label;
+        type ActiveKernel = { label?: string; language?: string; status?: string };
+        type JupyterApi = {
+            /** Compatibility with older Jupyter extension exports. */
+            getKernel?: (u: vscode.Uri) => ActiveKernel | undefined;
+            kernels?: { getKernel(u: vscode.Uri): Thenable<ActiveKernel | undefined> };
+        };
+        const api = await vscode.extensions.getExtension<JupyterApi>('ms-toolsai.jupyter')?.activate();
+        const kernel = api?.kernels
+            ? await api.kernels.getKernel(nb.uri)
+            : api?.getKernel?.(nb.uri);
+        if (kernel?.label) {
+            label = kernel.label;
+        } else if (kernel?.language) {
+            label = `${kernel.language}${kernel.status ? ` (${kernel.status})` : ''}`;
+        }
     } catch {
         // best-effort
     }
     return `Notebook: ${nb.uri.toString()}\nKernel: ${label}`;
+}
+
+/** Enumerate the notebook controllers currently registered for an open notebook. */
+export async function listKernels(filePath: string): Promise<string> {
+    const nb = findNotebook(filePath);
+    if (!nb) {
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
+    }
+    const kernels = await resolveNotebookKernels(nb);
+    return JSON.stringify({ notebook: nb.uri.toString(), kernels }, null, 2);
+}
+
+/**
+ * Select an exact controller id returned by list_kernels and optionally ask the Jupyter
+ * extension to start it. Controller discovery is owned by VS Code, so providers added by
+ * other extensions (including Colab) participate without provider-specific integration.
+ */
+export async function selectKernel(filePath: string, kernelId: string, start = false): Promise<string> {
+    const nb = findNotebook(filePath);
+    if (!nb) {
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
+    }
+    if (!kernelId) throw new Error('kernelId is required');
+
+    const kernels = await resolveNotebookKernels(nb);
+    const kernel = kernels.find((candidate) => candidate.id === kernelId);
+    if (!kernel) {
+        const available = kernels.map((candidate) => candidate.id).join(', ') || '(none)';
+        throw new Error(`Kernel '${kernelId}' is not available for ${nb.uri.toString()}. Available kernel ids: ${available}`);
+    }
+
+    // Kernel selection is scoped to the active notebook editor. Bring the requested
+    // document forward, then use the exact extension/controller pair resolved by VS Code.
+    await vscode.window.showNotebookDocument(nb, { preview: false, preserveFocus: false });
+    const slash = kernel.id.indexOf('/');
+    const selected = await vscode.commands.executeCommand<boolean>('_notebook.selectKernel', {
+        id: kernel.id.slice(slash + 1),
+        extension: kernel.extension
+    });
+    if (selected !== true) {
+        throw new Error(`VS Code did not select kernel '${kernel.id}' for ${nb.uri.toString()}.`);
+    }
+
+    if (!start) {
+        return `Selected kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}.`;
+    }
+
+    const configureTool = vscode.lm.tools.find((tool) => tool.name === 'configure_notebook');
+    if (!configureTool) {
+        throw new Error(
+            `Selected kernel '${kernel.id}', but it could not be started because the Jupyter ` +
+            '`configure_notebook` tool is unavailable. Update/enable the Jupyter extension, or run a cell to start the selected kernel.'
+        );
+    }
+    const result = await vscode.lm.invokeTool(
+        configureTool.name,
+        { input: { filePath: nb.uri.fsPath }, toolInvocationToken: undefined }
+    );
+    const detail = result.content
+        .map((part) => typeof (part as { value?: unknown }).value === 'string' ? (part as { value: string }).value : '')
+        .filter(Boolean)
+        .join('\n');
+    if (/did not select|failed|error/i.test(detail)) {
+        throw new Error(`Jupyter could not start kernel '${kernel.id}': ${detail}`);
+    }
+    if (/taking longer|still starting|in the background|timed out|timeout/i.test(detail)) {
+        return `Selected kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}. Startup was requested and is still pending.${detail ? `\n${detail}` : ''}`;
+    }
+    return `Selected and started kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}.${detail ? `\n${detail}` : ''}`;
+}
+
+async function resolveNotebookKernels(nb: vscode.NotebookDocument): Promise<NotebookKernelInfo[]> {
+    const extension = vscode.extensions.getExtension('ms-toolsai.jupyter');
+    if (extension && !extension.isActive) await extension.activate();
+
+    let resolved: ResolvedNotebookKernel[];
+    try {
+        resolved = await vscode.commands.executeCommand<ResolvedNotebookKernel[]>('_resolveNotebookKernels', {
+            viewType: nb.notebookType,
+            uri: nb.uri
+        }) ?? [];
+    } catch (error) {
+        throw new Error(`VS Code could not enumerate kernels for ${nb.uri.toString()}: ${String(error)}`);
+    }
+
+    return resolved.flatMap((kernel) => {
+        if (!kernel.id || !kernel.id.includes('/')) return [];
+        return [{
+            id: kernel.id,
+            label: kernel.label,
+            description: kernel.description,
+            detail: kernel.detail,
+            extension: kernel.id.slice(0, kernel.id.indexOf('/'))
+        }];
+    });
 }
 
 /** Clear saved outputs (and execution state) from one or more cells of a notebook. */
@@ -630,7 +754,8 @@ async function waitForCellExecution(notebook: vscode.NotebookDocument, index: nu
  * Run several cells in a notebook, in order, waiting for each to complete and returning
  * its outputs (success/error + parsed output items). Adopted from the pattern used by
  * vscode-runtime-notebook-mcp: poll executionSummary until the run produces a fresh result.
- * @param kernel optional kernel name/id to select before running (best-effort via notebook.selectKernel).
+ * @param kernel legacy optional label/id hint, selected best-effort for compatibility.
+ * Use select_kernel before run_cells for exact, fail-closed selection.
  */
 export async function runNotebookCells(filePath: string, cellIds: Array<string | number>, options: RunCellsOptions = {}): Promise<string> {
     if (cellIds.length === 0) {
@@ -642,12 +767,16 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     }
     await saveDirtyNotebook(filePath);
 
-    // Optional kernel selection (best-effort; non-fatal if it fails or isn't found).
+    // Preserve the pre-v0.2.2 best-effort kernel hint. Exact fail-closed selection is
+    // available through select_kernel and must be performed as a separate call.
     if (options.kernel) {
         try {
-            await vscode.commands.executeCommand('notebook.selectKernel', { notebookEditor: nb.uri, kernelInfo: { label: options.kernel } });
+            await vscode.commands.executeCommand('notebook.selectKernel', {
+                notebookEditor: nb.uri,
+                kernelInfo: { label: options.kernel }
+            });
         } catch {
-            // Non-fatal: execution proceeds with the current kernel.
+            // Compatibility behavior: execution proceeds with the current kernel.
         }
     }
 

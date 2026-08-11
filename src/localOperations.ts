@@ -8,12 +8,14 @@ import {
     getKernelInfo,
     getNotebooksSummary,
     interruptKernels,
+    listKernels,
     moveCells,
     openNotebooks,
     OutputMode,
     readNotebook,
     restartKernel,
     runNotebookCells,
+    selectKernel,
     saveNotebooks,
     searchCells
 } from './notebookOps';
@@ -24,6 +26,8 @@ export type LocalOperation =
     | 'read_cells'
     | 'clear_cell_outputs'
     | 'get_kernel_info'
+    | 'list_kernels'
+    | 'select_kernel'
     | 'read_cell_outputs'
     | 'search_cells'
     | 'read_notebook'
@@ -57,6 +61,10 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
             return clearOutputs(filePath(args), ids ?? []);
         case 'get_kernel_info':
             return getKernelInfo(filePath(args));
+        case 'list_kernels':
+            return listKernels(filePath(args));
+        case 'select_kernel':
+            return selectKernel(filePath(args), args.kernelId as string, args.start === true);
         case 'read_cell_outputs':
             return getCellsOutput(filePath(args), ids ?? [], {
                 mode: args.outputMode as OutputMode | undefined,

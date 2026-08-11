@@ -11,8 +11,7 @@ async function invokeMany(router: NotebookRouter, operation: LocalOperation, fil
 /** Register the notebook MCP server's tools on a given McpServer. */
 export function registerNotebookTools(server: McpServer, router: NotebookRouter, hasJupyter: boolean): void {
     // All tools are multi-capable (arrays); single-use is a 1-element array.
-    // All are implemented natively via the VS Code notebook API — no invokeTool,
-    // no approval dialogs, headless.
+    // Document and execution operations use the native VS Code notebook API.
     //
     // Tools that require a kernel (run, restart) are only registered when the
     // Jupyter extension (ms-toolsai.jupyter) is installed; the rest work with
@@ -132,8 +131,8 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         'get_kernel_info',
         {
             description:
-                'Get the active kernel label for a notebook (best-effort via the Jupyter extension; "unknown" if unavailable). ' +
-                'Useful for picking a `kernel` argument for run_cells.',
+                'Get active kernel information for a notebook (best-effort via the Jupyter extension; "unknown" if unavailable). ' +
+                'Use list_kernels for exact ids accepted by select_kernel; run_cells.kernel remains a legacy best-effort hint.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
@@ -149,6 +148,57 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             return { content: [{ type: 'text' as const, text }] };
         }
     );
+
+    // ---- List/select kernels (requires Jupyter) ----
+    if (hasJupyter) {
+        server.registerTool(
+            'list_kernels',
+            {
+                description:
+                    'List the exact kernel/controller ids currently available to a notebook. Includes providers registered ' +
+                    'through installed extensions such as Colab. Pass one returned id to select_kernel.',
+                inputSchema: jsonSchemaToZod({
+                    type: 'object',
+                    properties: {
+                        filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' }
+                    },
+                    required: ['filePath']
+                })
+            },
+            async (args) => {
+                const a = (args ?? {}) as { filePath?: string };
+                if (!a.filePath) throw new Error('filePath is required');
+                const text = await router.invokeNotebook('list_kernels', a.filePath, a as Record<string, unknown>);
+                return { content: [{ type: 'text' as const, text }] };
+            }
+        );
+
+        server.registerTool(
+            'select_kernel',
+            {
+                description:
+                    'Select an exact kernel id returned by list_kernels for a notebook. Set start=true to ask the Jupyter ' +
+                    'extension to start that selected kernel; remote providers may require their normal sign-in/confirmation UI. ' +
+                    'Fails instead of falling back when the id is unavailable or selection is rejected.',
+                inputSchema: jsonSchemaToZod({
+                    type: 'object',
+                    properties: {
+                        filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                        kernelId: { type: 'string', description: 'Exact id returned by list_kernels.' },
+                        start: { type: 'boolean', description: 'Start the selected kernel via Jupyter (default false).' }
+                    },
+                    required: ['filePath', 'kernelId']
+                })
+            },
+            async (args) => {
+                const a = (args ?? {}) as { filePath?: string; kernelId?: string; start?: boolean };
+                if (!a.filePath) throw new Error('filePath is required');
+                if (!a.kernelId) throw new Error('kernelId is required');
+                const text = await router.invokeNotebook('select_kernel', a.filePath, a as Record<string, unknown>);
+                return { content: [{ type: 'text' as const, text }] };
+            }
+        );
+    }
 
     // ---- Get cells output ----
     server.registerTool(
@@ -312,15 +362,16 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
                 description:
                     'Run one or more cells headlessly. By default, run in order and wait for completion, returning bounded text outputs; ' +
                     'a timeout reports that execution is still running and does not interrupt the kernel. Set wait=false to queue all selected cells and return immediately. ' +
-                    'Provide the notebook URI and an array of 0-based cell indices. Optionally provide a kernel name/id ' +
-                    'to select before running (e.g. "Python 3.12.2"; best-effort, falls back to the current kernel if not found). ' +
+                    'Provide the notebook URI and an array of 0-based cell indices. The optional kernel label/id hint uses ' +
+                    'legacy best-effort selection and falls back to the current kernel. For exact fail-closed selection, call ' +
+                    'select_kernel first and then call run_cells without kernel. ' +
                     'Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: {
                         filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                         cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or cell ids) to run.' },
-                        kernel: { type: 'string', description: 'Optional kernel name/id to select before running.' },
+                        kernel: { type: 'string', description: 'Legacy optional kernel label/id hint selected best-effort before running.' },
                         timeoutMs: { type: 'number', description: 'Max ms to wait per cell (default 60000); does not interrupt on timeout.' },
                         wait: { type: 'boolean', description: 'Wait for each result (default true). False queues all selected cells and returns immediately.' },
                         includeOutputs: { type: 'boolean', description: 'Include compact saved outputs for completed cells (default true).' },
