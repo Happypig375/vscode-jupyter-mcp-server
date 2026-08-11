@@ -1,9 +1,16 @@
 # Changelog
 
+## 0.2.3
+
+- Added provider-neutral `configure_kernel` to run Jupyter's configuration workflow before enumeration when a remote provider has not registered a concrete controller yet.
+
+### Breaking changes
+
+- None.
+
 ## 0.2.2
 
 - Added `list_kernels` to enumerate exact VS Code notebook-controller ids, including kernels supplied through installed providers such as Colab.
-- Added provider-neutral `configure_kernel` to run Jupyter's configuration workflow before enumeration when a remote provider has not registered a concrete controller yet.
 - Added fail-closed `select_kernel` with explicit opt-in startup through Jupyter's notebook configuration tool.
 - Preserved the legacy best-effort `run_cells.kernel` hint; callers that need exact fail-closed selection can call `select_kernel` first, then `run_cells` without a kernel hint.
 
