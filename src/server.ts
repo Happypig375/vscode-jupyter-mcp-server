@@ -1,9 +1,15 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { jsonSchemaToZod } from './schema';
-import { createNotebook, listOpenNotebooks, getCells, getCellsOutput, getNotebooksSummary, editNotebookCells, runNotebookCells, restartKernel, saveNotebooks, moveCells, openNotebooks, readNotebook, exportNotebook, interruptKernels, getKernelInfo, clearOutputs, searchCells, OutputMode } from './notebookOps';
+import { NotebookRouter } from './broker';
+import { OutputMode } from './notebookOps';
+import { LocalOperation } from './localOperations';
+
+async function invokeMany(router: NotebookRouter, operation: LocalOperation, filePaths: string[]): Promise<string> {
+    return router.invokeNotebooks(operation, filePaths);
+}
 
 /** Register the notebook MCP server's tools on a given McpServer. */
-export function registerNotebookTools(server: McpServer, hasJupyter: boolean): void {
+export function registerNotebookTools(server: McpServer, router: NotebookRouter, hasJupyter: boolean): void {
     // All tools are multi-capable (arrays); single-use is a 1-element array.
     // All are implemented natively via the VS Code notebook API — no invokeTool,
     // no approval dialogs, headless.
@@ -18,59 +24,63 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
         'create_notebook',
         {
             description:
-                'Create a new Jupyter notebook in the current workspace and open it in the editor. ' +
-                'Provide a natural-language query used as the notebook title and a placeholder code cell.',
+                'Create a new Jupyter notebook and open it in a connected VS Code window. ' +
+                'By default the broker window is used; pass a windowId from list_notebooks to choose another window.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
-                properties: { query: { type: 'string', description: 'What the notebook should contain (used as title).' } },
+                properties: {
+                    query: { type: 'string', description: 'What the notebook should contain (used as title).' },
+                    windowId: { type: 'string', description: 'Optional destination windowId from list_notebooks.' }
+                },
                 required: ['query']
             })
         },
         async (args) => {
-            const a = (args ?? {}) as { query?: string };
-            const msg = await createNotebook(a.query ?? 'New notebook');
+            const a = (args ?? {}) as { query?: string; windowId?: string };
+            const msg = await router.invokeWindow('create_notebook', { query: a.query ?? 'New notebook' }, a.windowId);
             return { content: [{ type: 'text' as const, text: msg }] };
         }
     );
 
     // ---- Get notebooks ----
     server.registerTool(
-        'get_notebooks',
+        'list_notebooks',
         {
             description:
-                'List the Jupyter notebooks open in the VS Code window hosting this MCP server. Returns notebook URIs.',
+                'List notebooks across all connected VS Code windows. Returns uri, windowId, windowLabel, and notebookId. ' +
+                'Use notebookId as filePath when the same URI is open in more than one window.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {} })
         },
         async () => {
-            return { content: [{ type: 'text' as const, text: JSON.stringify(listOpenNotebooks().map((uri) => ({ uri }))) }] };
+            return { content: [{ type: 'text' as const, text: JSON.stringify(await router.listNotebooks()) }] };
         }
     );
 
     // ---- Get cells (metadata) ----
     server.registerTool(
-        'get_cells',
+        'inspect_notebooks',
         {
             description:
                 'Get METADATA for one or more notebooks: per cell, the index, kind, language, line count, ' +
                 'best available cell anchor, execution state, and output mime types. Does not include cell source or output content — ' +
-                'use get_cells_source for source and get_cells_output for outputs.',
+                'use read_cells for source and read_cell_outputs for outputs.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
-                properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs from get_notebooks.' } },
+                properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },
                 required: ['filePaths']
             })
         },
         async (args) => {
             const a = (args ?? {}) as { filePaths?: string[] };
             if (!Array.isArray(a.filePaths) || a.filePaths.length === 0) throw new Error('filePaths must be a non-empty array');
-            const text = await getNotebooksSummary(a.filePaths);
+            const text = await invokeMany(router, 'inspect_notebooks', a.filePaths);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
 
     // ---- Get cells source ----
     server.registerTool(
-        'get_cells_source',
+        'read_cells',
         {
             description:
                 'Read the SOURCE of cells in a notebook. Provide the notebook URI and optionally an array of ' +
@@ -78,7 +88,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices to read (omit for all).' }
                 },
                 required: ['filePath']
@@ -87,14 +97,14 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
         async (args) => {
             const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number> };
             if (!a.filePath) throw new Error('filePath is required');
-            const text = await getCells(a.filePath, a.cellIds);
+            const text = await router.invokeNotebook('read_cells', a.filePath, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
 
     // ---- Clear outputs ----
     server.registerTool(
-        'clear_outputs',
+        'clear_cell_outputs',
         {
             description:
                 'Clear the saved OUTPUT of one or more cells in a notebook (removes outputs and execution state). ' +
@@ -102,7 +112,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or ids) to clear outputs from.' }
                 },
                 required: ['filePath', 'cellIds']
@@ -112,7 +122,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number> };
             if (!a.filePath) throw new Error('filePath is required');
             if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
-            const text = await clearOutputs(a.filePath, a.cellIds);
+            const text = await router.invokeNotebook('clear_cell_outputs', a.filePath, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -127,7 +137,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' }
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' }
                 },
                 required: ['filePath']
             })
@@ -135,14 +145,14 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
         async (args) => {
             const a = (args ?? {}) as { filePath?: string };
             if (!a.filePath) throw new Error('filePath is required');
-            const text = await getKernelInfo(a.filePath);
+            const text = await router.invokeNotebook('get_kernel_info', a.filePath, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
 
     // ---- Get cells output ----
     server.registerTool(
-        'get_cells_output',
+        'read_cell_outputs',
         {
             description:
                 'Read the saved OUTPUT of cells in a notebook. Provide the notebook URI and an array of ' +
@@ -151,7 +161,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Cell indices/ids to read output from.' },
                     outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail: summary, preferred text (default), or all text representations.' },
                     maxOutputChars: { type: 'number', description: 'Maximum output characters per cell (default 12000; clamped to 1000..100000).' }
@@ -163,7 +173,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number>; outputMode?: OutputMode; maxOutputChars?: number };
             if (!a.filePath) throw new Error('filePath is required');
             if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
-            const text = await getCellsOutput(a.filePath, a.cellIds, { mode: a.outputMode, maxChars: a.maxOutputChars });
+            const text = await router.invokeNotebook('read_cell_outputs', a.filePath, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -178,7 +188,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                     query: { type: 'string', description: 'Text to search for (source or output).' },
                     caseSensitive: { type: 'boolean', description: 'Match case (default false).' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Restrict search to these cell indices/ids (default: all).' }
@@ -189,7 +199,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
         async (args) => {
             const a = (args ?? {}) as { filePath?: string; query?: string; caseSensitive?: boolean; cellIds?: Array<string | number> };
             if (!a.filePath) throw new Error('filePath is required');
-            const text = searchCells(a.filePath, a.query ?? '', a.caseSensitive === true, a.cellIds);
+            const text = await router.invokeNotebook('search_cells', a.filePath, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -205,7 +215,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Optional cell indices/ids to read (default: all).' },
                     includeOutputs: { type: 'boolean', description: 'Include compact cell outputs (default false).' },
                     outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail when included: summary, preferred text (default), or all text representations.' },
@@ -217,7 +227,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
         async (args) => {
             const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number>; includeOutputs?: boolean; outputMode?: OutputMode; maxOutputChars?: number };
             if (!a.filePath) throw new Error('filePath is required');
-            const text = await readNotebook(a.filePath, { includeOutputs: a.includeOutputs === true, cellIds: a.cellIds, outputMode: a.outputMode, maxOutputChars: a.maxOutputChars });
+            const text = await router.invokeNotebook('read_notebook', a.filePath, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -231,7 +241,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                     format: { type: 'string', enum: ['markdown', 'python', 'html'], description: 'Export format.' }
                 },
                 required: ['filePath', 'format']
@@ -243,7 +253,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             if (!a.format || !['markdown', 'python', 'html'].includes(a.format)) {
                 throw new Error('format must be one of: markdown, python, html');
             }
-            const text = await exportNotebook(a.filePath, a.format as 'markdown' | 'python' | 'html');
+            const text = await router.invokeNotebook('export_notebook', a.filePath, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -259,7 +269,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                     edits: {
                         type: 'array',
                         items: {
@@ -289,7 +299,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
                 }
                 return { cellId: e.cellId, editType: e.editType as 'insert' | 'edit' | 'delete', newCode: e.newCode, language: e.language, metadata: e.metadata, run: e.run };
             });
-            const text = await editNotebookCells(a.filePath, mapped);
+            const text = await router.invokeNotebook('edit_cells', a.filePath, { filePath: a.filePath, edits: mapped });
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -308,7 +318,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: {
-                        filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                        filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                         cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or cell ids) to run.' },
                         kernel: { type: 'string', description: 'Optional kernel name/id to select before running.' },
                         timeoutMs: { type: 'number', description: 'Max ms to wait per cell (default 60000); does not interrupt on timeout.' },
@@ -324,14 +334,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
                 const a = (args ?? {}) as { filePath?: string; cellIds?: Array<string | number>; kernel?: string; timeoutMs?: number; wait?: boolean; includeOutputs?: boolean; outputMode?: OutputMode; maxOutputChars?: number };
                 if (!a.filePath) throw new Error('filePath is required');
                 if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
-                const text = await runNotebookCells(a.filePath, a.cellIds, {
-                    kernel: a.kernel,
-                    timeoutMs: a.timeoutMs,
-                    wait: a.wait,
-                    includeOutputs: a.includeOutputs,
-                    mode: a.outputMode,
-                    maxChars: a.maxOutputChars
-                });
+                const text = await router.invokeNotebook('run_cells', a.filePath, a as Record<string, unknown>);
                 return { content: [{ type: 'text' as const, text }] };
             }
         );
@@ -340,23 +343,19 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
     // ---- Restart notebooks (kernel) (requires Jupyter) ----
     if (hasJupyter) {
         server.registerTool(
-            'restart_notebooks',
+            'restart_kernels',
             {
                 description: 'Restart the kernel of one or more open notebooks. Provide an array of notebook URIs. Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
-                    properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs from get_notebooks.' } },
+                    properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },
                     required: ['filePaths']
                 })
             },
             async (args) => {
                 const a = (args ?? {}) as { filePaths?: string[] };
                 if (!Array.isArray(a.filePaths) || a.filePaths.length === 0) throw new Error('filePaths must be a non-empty array');
-                const lines: string[] = [];
-                for (const fp of a.filePaths) {
-                    lines.push(await restartKernel(fp));
-                }
-                return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+                return { content: [{ type: 'text' as const, text: await invokeMany(router, 'restart_kernels', a.filePaths) }] };
             }
         );
     }
@@ -369,14 +368,14 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
                 description: 'Interrupt (stop) the running execution of one or more open notebooks. Provide an array of notebook URIs. Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
-                    properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs from get_notebooks.' } },
+                    properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },
                     required: ['filePaths']
                 })
             },
             async (args) => {
                 const a = (args ?? {}) as { filePaths?: string[] };
                 if (!Array.isArray(a.filePaths) || a.filePaths.length === 0) throw new Error('filePaths must be a non-empty array');
-                const text = await interruptKernels(a.filePaths);
+                const text = await invokeMany(router, 'interrupt_kernels', a.filePaths);
                 return { content: [{ type: 'text' as const, text }] };
             }
         );
@@ -393,7 +392,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    filePath: { type: 'string', description: 'Notebook URI from get_notebooks.' },
+                    filePath: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices to move.' },
                     toIndex: { type: 'number', description: 'Index where the first moved cell should land.' }
                 },
@@ -405,7 +404,7 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
             if (!a.filePath) throw new Error('filePath is required');
             if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
             if (typeof a.toIndex !== 'number') throw new Error('toIndex must be a number');
-            const text = await moveCells(a.filePath, a.cellIds, a.toIndex);
+            const text = await router.invokeNotebook('move_cells', a.filePath, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -415,18 +414,21 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
         'open_notebooks',
         {
             description:
-                'Open one or more existing notebooks from disk in the editor. Provide file: URIs of notebooks on disk. ' +
-                'After opening, they appear in get_notebooks and can be read/edited/run.',
+                'Open existing notebooks from disk in a connected VS Code window. Provide file: URIs and optionally ' +
+                'a destination windowId from list_notebooks; otherwise the broker window is used.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
-                properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'file: URIs of notebooks to open.' } },
+                properties: {
+                    filePaths: { type: 'array', items: { type: 'string' }, description: 'file: URIs of notebooks to open.' },
+                    windowId: { type: 'string', description: 'Optional destination windowId from list_notebooks.' }
+                },
                 required: ['filePaths']
             })
         },
         async (args) => {
-            const a = (args ?? {}) as { filePaths?: string[] };
+            const a = (args ?? {}) as { filePaths?: string[]; windowId?: string };
             if (!Array.isArray(a.filePaths) || a.filePaths.length === 0) throw new Error('filePaths must be a non-empty array');
-            const text = await openNotebooks(a.filePaths);
+            const text = await router.invokeWindow('open_notebooks', { filePaths: a.filePaths }, a.windowId);
             return { content: [{ type: 'text' as const, text }] };
         }
     );
@@ -435,17 +437,17 @@ export function registerNotebookTools(server: McpServer, hasJupyter: boolean): v
     server.registerTool(
         'save_notebooks',
         {
-            description: 'Save one or more open notebooks (persist dirty changes to disk). Provide an array of notebook URIs.',
+            description: 'Save one or more open notebooks. Provide notebook URIs or notebookIds from list_notebooks.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
-                properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs from get_notebooks.' } },
+                properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },
                 required: ['filePaths']
             })
         },
         async (args) => {
             const a = (args ?? {}) as { filePaths?: string[] };
             if (!Array.isArray(a.filePaths) || a.filePaths.length === 0) throw new Error('filePaths must be a non-empty array');
-            const text = await saveNotebooks(a.filePaths);
+            const text = await invokeMany(router, 'save_notebooks', a.filePaths);
             return { content: [{ type: 'text' as const, text }] };
         }
     );

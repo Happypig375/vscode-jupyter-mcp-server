@@ -32,6 +32,12 @@ async function main() {
             process.exit(r.status || 1);
         }
     }
+    const broker = spawnSync('node', [path.join(root, '.vscode-test', 'broker.test.cjs')], {
+        cwd: root,
+        stdio: 'inherit',
+        timeout: 60000
+    });
+    if (broker.status !== 0) process.exit(broker.status || 1);
     process.exit(0);
 }
 

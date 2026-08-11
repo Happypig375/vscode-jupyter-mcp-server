@@ -73,7 +73,7 @@ export async function saveDirtyNotebook(filePath: string): Promise<void> {
 export async function editNotebook(args: EditNotebookArgs): Promise<string> {
     const nb = findNotebook(args.filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${args.filePath}' in this window. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${args.filePath}' in this window. Use list_notebooks to list them.`);
     }
     await saveDirtyNotebook(args.filePath);
 
@@ -207,7 +207,7 @@ export function resolveCellIndex(nb: vscode.NotebookDocument, cellId: string | n
         String(c.document.uri) === cellId
     );
     if (idx === -1) {
-        throw new Error(`Cell id '${cellId}' not found. Use a 0-based cell index, or list cells via get_cells.`);
+        throw new Error(`Cell id '${cellId}' not found. Use a 0-based cell index, or inspect the notebook via inspect_notebooks.`);
     }
     return idx;
 }
@@ -231,7 +231,7 @@ function executionState(cell: vscode.NotebookCell): string {
 export async function getNotebookSummary(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     const lines: string[] = [`Notebook: ${nb.uri.toString()}`, `Cells: ${nb.cellCount}`];
     nb.getCells().forEach((c, i) => {
@@ -309,7 +309,7 @@ export function formatCellOutputs(cell: vscode.NotebookCell, options: OutputOpti
 export async function readCellOutput(filePath: string, cellId: string | number | undefined, options: OutputOptions = {}): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     const idx = resolveCellIndex(nb, cellId);
     const cell = nb.cellAt(idx);
@@ -320,7 +320,7 @@ export async function readCellOutput(filePath: string, cellId: string | number |
 export async function getCells(filePath: string, cellIds?: Array<string | number>): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     const idxs = cellIds && cellIds.length ? cellIds.map((c) => resolveCellIndex(nb, c)) : Array.from({ length: nb.cellCount }, (_, i) => i);
     const blocks: string[] = [];
@@ -341,7 +341,7 @@ export async function getCellsOutput(filePath: string, cellIds: Array<string | n
     }
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     const blocks: string[] = [];
     for (const c of cellIds) {
@@ -376,7 +376,7 @@ export async function saveNotebooks(filePaths: string[]): Promise<string> {
 export async function restartKernel(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     await vscode.commands.executeCommand('notebook.restartKernel', nb.uri);
     return `Restarted kernel for ${nb.uri.toString()}.`;
@@ -391,7 +391,7 @@ export async function interruptKernels(filePaths: string[]): Promise<string> {
     for (const fp of filePaths) {
         const nb = findNotebook(fp);
         if (!nb) {
-            throw new Error(`No open notebook matches '${fp}'. Use get_notebooks to list them.`);
+            throw new Error(`No open notebook matches '${fp}'. Use list_notebooks to list them.`);
         }
         await vscode.commands.executeCommand('notebook.interruptKernel', nb.uri);
         lines.push(`Interrupted kernel for ${nb.uri.toString()}.`);
@@ -407,7 +407,7 @@ export async function interruptKernels(filePaths: string[]): Promise<string> {
 export async function getKernelInfo(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     let label = 'unknown';
     try {
@@ -427,7 +427,7 @@ export async function clearOutputs(filePath: string, cellIds: Array<string | num
     }
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     const idxs = cellIds.map((c) => resolveCellIndex(nb, c));
     // Clear in reverse order so index-based edits stay valid.
@@ -442,7 +442,7 @@ export async function clearOutputs(filePath: string, cellIds: Array<string | num
 export function searchCells(filePath: string, query: string, caseSensitive = false, cellIds?: Array<string | number>): string {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     if (!query) {
         throw new Error('query must be a non-empty string.');
@@ -490,7 +490,7 @@ export async function moveCells(filePath: string, cellIds: Array<string | number
     }
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     await saveDirtyNotebook(filePath);
 
@@ -638,7 +638,7 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     }
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     await saveDirtyNotebook(filePath);
 
@@ -660,7 +660,7 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
 
     if (options.wait === false) {
         await vscode.commands.executeCommand('notebook.execute', nb.uri, indices.map((idx) => nb.cellAt(idx).document.uri));
-        return `Queued ${indices.length} cell(s) in ${nb.uri.toString()}: ${indices.join(', ')}. Use get_cells or get_cells_output to inspect progress.`;
+        return `Queued ${indices.length} cell(s) in ${nb.uri.toString()}: ${indices.join(', ')}. Use inspect_notebooks or read_cell_outputs to inspect progress.`;
     }
 
     const results: string[] = [];
@@ -690,7 +690,7 @@ export async function editNotebookCells(filePath: string, edits: Array<Omit<Edit
     }
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     const lines: string[] = [];
     for (const e of edits) {
@@ -707,7 +707,7 @@ export async function editNotebookCells(filePath: string, edits: Array<Omit<Edit
 export async function readNotebook(filePath: string, opts: { includeOutputs?: boolean; cellIds?: Array<string | number>; outputMode?: OutputMode; maxOutputChars?: number } = {}): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     const selected = opts.cellIds && opts.cellIds.length
         ? opts.cellIds.map((c) => resolveCellIndex(nb, c))
@@ -741,7 +741,7 @@ export async function readNotebook(filePath: string, opts: { includeOutputs?: bo
 export async function exportNotebook(filePath: string, format: 'markdown' | 'python' | 'html'): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
-        throw new Error(`No open notebook matches '${filePath}'. Use get_notebooks to list them.`);
+        throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     if (format === 'python') {
         return nb.getCells().map((cell) => {

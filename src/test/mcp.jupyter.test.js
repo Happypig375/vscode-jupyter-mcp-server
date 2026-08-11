@@ -169,12 +169,8 @@ async function main() {
 
     // 1. With Jupyter present, kernel tools ARE exposed.
     await check('kernel tools exposed when Jupyter present', async () => {
-        assert.ok(names.includes('run_cells'), 'run_cells missing');
-        assert.ok(names.includes('restart_notebooks'), 'restart_notebooks missing');
-        assert.ok(names.includes('interrupt_kernels'), 'interrupt_kernels missing');
-        for (const required of ['read_notebook', 'export_notebook', 'get_notebooks', 'get_cells', 'get_cells_source', 'get_cells_output', 'search_cells', 'clear_outputs', 'get_kernel_info', 'edit_cells', 'move_cells', 'create_notebook', 'open_notebooks', 'save_notebooks']) {
-            assert.ok(names.includes(required), `missing ${required}`);
-        }
+        const expected = ['create_notebook', 'list_notebooks', 'inspect_notebooks', 'read_cells', 'read_cell_outputs', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'read_notebook', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks'];
+        assert.deepStrictEqual([...names].sort(), expected.sort());
     });
 
     // 2. run_cells waits and returns outputs.
@@ -198,8 +194,8 @@ async function main() {
         assert.match(res.content[0].text, /state:n\/a/, 'markdown cells must not be reported as execution errors');
     });
 
-    await check('get_cells_output supports bounded summary mode', async () => {
-        const res = await client.callTool({ name: 'get_cells_output', arguments: {
+    await check('read_cell_outputs supports bounded summary mode', async () => {
+        const res = await client.callTool({ name: 'read_cell_outputs', arguments: {
             filePath: 'file:///C:/nb.ipynb', cellIds: [0], outputMode: 'summary', maxOutputChars: 1000
         } });
         assert.ok(!res.isError, JSON.stringify(res));
@@ -227,9 +223,9 @@ async function main() {
         assert.match(res.content[0].text, /not interrupted/);
     });
 
-    // 4. Cell-id anchors resolve in get_cells_source.
-    await check('get_cells_source resolves by cell id anchor', async () => {
-        const res = await client.callTool({ name: 'get_cells_source', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: ['cell-abc'] } });
+    // 4. Cell-id anchors resolve in read_cells.
+    await check('read_cells resolves by cell id anchor', async () => {
+        const res = await client.callTool({ name: 'read_cells', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: ['cell-abc'] } });
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(res.content[0].text, /print\("hello"\)/);
     });
@@ -262,11 +258,11 @@ async function main() {
         assert.match(res.content[0].text, /Kernel: Python 3\.12\.2/);
     });
 
-    // 9. clear_outputs after a run removes outputs + execution state.
-    await check('clear_outputs clears after run', async () => {
-        const res = await client.callTool({ name: 'clear_outputs', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: [0] } });
+    // 9. clear_cell_outputs after a run removes outputs + execution state.
+    await check('clear_cell_outputs clears after run', async () => {
+        const res = await client.callTool({ name: 'clear_cell_outputs', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: [0] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const out = await client.callTool({ name: 'get_cells_output', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: [0] } });
+        const out = await client.callTool({ name: 'read_cell_outputs', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: [0] } });
         assert.match(out.content[0].text, /no saved output/);
     });
 

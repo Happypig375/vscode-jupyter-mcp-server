@@ -173,12 +173,8 @@ async function main() {
 
     // 1. No Jupyter -> kernel tools absent, document tools present.
     await check('tool set (no Jupyter)', async () => {
-        for (const required of ['create_notebook', 'get_notebooks', 'get_cells', 'get_cells_source', 'get_cells_output', 'search_cells', 'clear_outputs', 'get_kernel_info', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks']) {
-            assert.ok(names.includes(required), `missing ${required}`);
-        }
-        assert.ok(!names.includes('run_cells'), 'run_cells should be absent without Jupyter');
-        assert.ok(!names.includes('restart_notebooks'), 'restart_notebooks should be absent without Jupyter');
-        assert.ok(!names.includes('interrupt_kernels'), 'interrupt_kernels should be absent without Jupyter');
+        const expected = ['create_notebook', 'list_notebooks', 'inspect_notebooks', 'read_cells', 'read_cell_outputs', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'read_notebook', 'export_notebook', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks'];
+        assert.deepStrictEqual([...names].sort(), expected.sort());
     });
 
     // 2. create_notebook in an empty window -> untitled.
@@ -190,23 +186,26 @@ async function main() {
     const createdUri = createdText.match(/untitled:[^\s]+/)[0];
     passed++;
 
-    // 3. get_notebooks lists it.
-    await check('get_notebooks lists the created notebook', async () => {
-        const res = await client.callTool({ name: 'get_notebooks', arguments: {} });
+    // 3. list_notebooks lists it.
+    await check('list_notebooks lists the created notebook', async () => {
+        const res = await client.callTool({ name: 'list_notebooks', arguments: {} });
         const parsed = JSON.parse(res.content[0].text);
         assert.ok(parsed.some((n) => n.uri === createdUri), `not listed: ${res.content[0].text}`);
+        const listed = parsed.find((n) => n.uri === createdUri);
+        assert.match(listed.notebookId, new RegExp(`^${listed.windowId}::untitled:`));
+        assert.strictEqual(listed.windowLabel, 'Empty window');
     });
 
-    // 4. get_cells_source.
-    await check('get_cells_source reads cells', async () => {
-        const res = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri, cellIds: [0, 1] } });
+    // 4. read_cells.
+    await check('read_cells reads cells', async () => {
+        const res = await client.callTool({ name: 'read_cells', arguments: { filePath: createdUri, cellIds: [0, 1] } });
         assert.match(res.content[0].text, /Test notebook/);
         assert.match(res.content[0].text, /Add your code here/);
     });
 
-    // 5. get_cells metadata.
-    await check('get_cells returns metadata', async () => {
-        const res = await client.callTool({ name: 'get_cells', arguments: { filePaths: [createdUri] } });
+    // 5. inspect_notebooks metadata.
+    await check('inspect_notebooks returns metadata', async () => {
+        const res = await client.callTool({ name: 'inspect_notebooks', arguments: { filePaths: [createdUri] } });
         assert.match(res.content[0].text, /Cells: 2/);
         assert.match(res.content[0].text, /markdown/);
     });
@@ -215,7 +214,7 @@ async function main() {
     await check('edit_cells edits a cell', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [{ cellId: 1, editType: 'edit', newCode: 'print("edited")' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const src = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri, cellIds: [1] } });
+        const src = await client.callTool({ name: 'read_cells', arguments: { filePath: createdUri, cellIds: [1] } });
         assert.match(src.content[0].text, /edited/);
     });
 
@@ -225,9 +224,9 @@ async function main() {
         assert.ok(!res.isError, JSON.stringify(res));
     });
 
-    // 8. get_cells_output graceful.
-    await check('get_cells_output handles empty output', async () => {
-        const res = await client.callTool({ name: 'get_cells_output', arguments: { filePath: createdUri, cellIds: [0] } });
+    // 8. read_cell_outputs graceful.
+    await check('read_cell_outputs handles empty output', async () => {
+        const res = await client.callTool({ name: 'read_cell_outputs', arguments: { filePath: createdUri, cellIds: [0] } });
         assert.ok(!res.isError, JSON.stringify(res));
     });
 
@@ -251,9 +250,9 @@ async function main() {
     });
     await expectError('edit_cells rejects missing edits', 'edit_cells', { filePath: 'x' });
     await expectError('edit_cells rejects bad editType', 'edit_cells', { filePath: 'x', edits: [{ cellId: 0, editType: 'bogus' }] });
-    await expectError('get_cells_output rejects empty cellIds', 'get_cells_output', { filePath: 'x', cellIds: [] });
-    await expectError('get_cells rejects missing filePath', 'get_cells', {});
-    await expectError('get_cells rejects empty filePaths', 'get_cells', { filePaths: [] });
+    await expectError('read_cell_outputs rejects empty cellIds', 'read_cell_outputs', { filePath: 'x', cellIds: [] });
+    await expectError('inspect_notebooks rejects missing filePath', 'inspect_notebooks', {});
+    await expectError('inspect_notebooks rejects empty filePaths', 'inspect_notebooks', { filePaths: [] });
     await expectError('move_cells rejects empty cellIds', 'move_cells', { filePath: 'x', cellIds: [], toIndex: 0 });
     await expectError('move_cells rejects bad toIndex', 'move_cells', { filePath: 'x', cellIds: [0], toIndex: 'a' });
     await expectError('save_notebooks rejects empty filePaths', 'save_notebooks', { filePaths: [] });
@@ -262,7 +261,7 @@ async function main() {
     await check('edit_cells inserts a cell', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [{ cellId: 0, editType: 'insert', newCode: 'print("inserted")' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const meta = await client.callTool({ name: 'get_cells', arguments: { filePaths: [createdUri] } });
+        const meta = await client.callTool({ name: 'inspect_notebooks', arguments: { filePaths: [createdUri] } });
         assert.match(meta.content[0].text, /Cells: 3/);
     });
     await check('edit_cells TOP and BOTTOM insertion positions are exact', async () => {
@@ -270,8 +269,8 @@ async function main() {
         assert.ok(!res.isError, JSON.stringify(res));
         res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [{ cellId: 'BOTTOM', editType: 'insert', newCode: 'bottom_marker' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const first = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri, cellIds: [0] } });
-        const last = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri, cellIds: [4] } });
+        const first = await client.callTool({ name: 'read_cells', arguments: { filePath: createdUri, cellIds: [0] } });
+        const last = await client.callTool({ name: 'read_cells', arguments: { filePath: createdUri, cellIds: [4] } });
         assert.match(first.content[0].text, /top_marker/);
         assert.match(last.content[0].text, /bottom_marker/);
         res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [
@@ -283,7 +282,7 @@ async function main() {
     await check('edit_cells deletes a cell', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { filePath: createdUri, edits: [{ cellId: 0, editType: 'delete' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const meta = await client.callTool({ name: 'get_cells', arguments: { filePaths: [createdUri] } });
+        const meta = await client.callTool({ name: 'inspect_notebooks', arguments: { filePaths: [createdUri] } });
         assert.match(meta.content[0].text, /Cells: 2/);
     });
     await check('edit_cells with metadata (updateCellMetadata path)', async () => {
@@ -298,12 +297,12 @@ async function main() {
         const res = await client.callTool({ name: 'move_cells', arguments: { filePath: createdUri, cellIds: [0], toIndex: 99 } });
         assert.ok(res.isError);
     });
-    await check('get_cells_source defaults to all cells', async () => {
-        const res = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri } });
+    await check('read_cells defaults to all cells', async () => {
+        const res = await client.callTool({ name: 'read_cells', arguments: { filePath: createdUri } });
         assert.ok(!res.isError, JSON.stringify(res));
     });
-    await check('get_cells_source with explicit indices', async () => {
-        const res = await client.callTool({ name: 'get_cells_source', arguments: { filePath: createdUri, cellIds: [0, 1] } });
+    await check('read_cells with explicit indices', async () => {
+        const res = await client.callTool({ name: 'read_cells', arguments: { filePath: createdUri, cellIds: [0, 1] } });
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(res.content[0].text, /cell 0/);
     });
@@ -334,14 +333,14 @@ async function main() {
         assert.ok(res.isError);
     });
 
-    // --- clear_outputs ---
-    await check('clear_outputs runs without error', async () => {
-        const res = await client.callTool({ name: 'clear_outputs', arguments: { filePath: createdUri, cellIds: [0, 1] } });
+    // --- clear_cell_outputs ---
+    await check('clear_cell_outputs runs without error', async () => {
+        const res = await client.callTool({ name: 'clear_cell_outputs', arguments: { filePath: createdUri, cellIds: [0, 1] } });
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(res.content[0].text, /Cleared outputs of 2 cell/);
     });
-    await check('clear_outputs rejects empty cellIds', async () => {
-        const res = await client.callTool({ name: 'clear_outputs', arguments: { filePath: createdUri, cellIds: [] } });
+    await check('clear_cell_outputs rejects empty cellIds', async () => {
+        const res = await client.callTool({ name: 'clear_cell_outputs', arguments: { filePath: createdUri, cellIds: [] } });
         assert.ok(res.isError);
     });
 
