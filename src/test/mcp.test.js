@@ -18,6 +18,8 @@ const executed = [];
 const interrupted = [];
 let untitledCounter = 0;
 const openNotebooks = []; // simulates open notebook documents
+let openCalls = 0;
+let shownDocuments = 0;
 
 // Each entry: { uri, cells: [{ kind, value, languageId }] }
 function makeDoc(type, data) {
@@ -28,6 +30,7 @@ function makeDoc(type, data) {
     const doc = {
         notebookType: type,
         uri: { fsPath: '', toString: () => uri },
+        metadata: {},
         isDirty: false, isUntitled: true,
         get cellCount() { return cells.length; },
         cellAt: (i) => ({
@@ -81,13 +84,13 @@ const vscodeShim = {
             }
             return true;
         },
-        openNotebookDocument: async (type, data) => makeDoc(type, data),
+        openNotebookDocument: async (type, data) => { openCalls++; return makeDoc(type, data); },
         onDidChangeConfiguration: () => ({ dispose() {} })
     },
     window: {
         createOutputChannel: () => ({ appendLine: (l) => { lines.push(l); console.log('[OUT]', l); }, dispose() {} }),
         createStatusBarItem: () => statusBar,
-        showNotebookDocument: async () => {}
+        showNotebookDocument: async () => { shownDocuments++; }
     },
     extensions: { getExtension: () => undefined, onDidChange: () => ({ dispose() {} }) },
     commands: {
@@ -117,13 +120,17 @@ const vscodeShim = {
         replaceCells(range, cells) { return { __kind: 'replace', range: [range.a, range.b], cells }; },
         insertCells(index, cells) { return { __kind: 'insert', index, cells }; },
         deleteCells(range) { return { __kind: 'delete', range: [range.a, range.b] }; },
-        updateCellMetadata(idx, meta) { return { __kind: 'updateMeta', idx, meta }; }
+        updateCellMetadata(idx, meta) { return { __kind: 'updateMeta', idx, meta }; },
+        updateNotebookMetadata(meta) { return { __kind: 'updateNotebookMeta', meta }; }
     },
     NotebookData: class { constructor(cells) { this.cells = cells; } },
     NotebookCellData: class { constructor(kind, value, lang) { this.kind = kind; this.value = value; this.languageId = lang; } },
     NotebookCellKind: { Markup: 1, Code: 2 },
     NotebookRange: class { constructor(a, b) { this.a = a; this.b = b; } },
-    Uri: { joinPath: (base, name) => ({ toString: () => `file:///C:/repo/${name}`, fsPath: `C:/repo/${name}` }) }
+    Uri: {
+        parse: (value) => ({ toString: () => value, fsPath: value.replace(/^file:\/\/\//, '') }),
+        joinPath: (base, name) => ({ toString: () => `file:///C:/repo/${name}`, fsPath: `C:/repo/${name}` })
+    }
 };
 
 // Install the shim as the 'vscode' module.
@@ -240,6 +247,23 @@ async function main() {
     await check('open_notebooks rejects non-file URI', async () => {
         const res = await client.callTool({ name: 'open_notebooks', arguments: { filePaths: ['C:/x.ipynb'] } });
         assert.ok(res.isError, 'should have errored on non-file URI');
+    });
+
+    await check('open_notebooks preserves an already-open live document', async () => {
+        const existing = {
+            notebookType: 'jupyter-notebook',
+            uri: { fsPath: 'C:/existing.ipynb', toString: () => 'file:///C:/existing.ipynb' },
+            isDirty: false, isUntitled: false,
+            cellCount: 0, cellAt: () => { throw new Error('no cells'); }, getCells: () => [], save: async () => true
+        };
+        openNotebooks.push(existing);
+        const opensBefore = openCalls;
+        const showsBefore = shownDocuments;
+        const res = await client.callTool({ name: 'open_notebooks', arguments: { filePaths: ['file:///C:/existing.ipynb'] } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.strictEqual(openCalls, opensBefore, 'must not reload an already-open URI from disk');
+        assert.strictEqual(shownDocuments, showsBefore + 1);
+        assert.match(res.content[0].text, /preserved live document/);
     });
 
     // --- Validation / error branches ---

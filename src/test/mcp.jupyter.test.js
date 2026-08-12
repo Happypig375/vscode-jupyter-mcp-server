@@ -19,6 +19,7 @@ const selectedKernels = [];
 const startedKernels = [];
 const legacyKernelHints = [];
 const openNotebooks = [];
+let saveCalls = 0;
 let executionMode = 'complete';
 let exactSelectionAccepted = true;
 let rejectLegacyKernelHint = false;
@@ -37,6 +38,7 @@ function makeDoc(uri) {
     const doc = {
         notebookType: 'jupyter-notebook',
         uri: { fsPath: 'C:/nb.ipynb', toString: () => uri },
+        metadata: { kernelspec: { name: 'python3' } },
         isDirty: false, isUntitled: false,
         get cellCount() { return cells.length; },
         cellAt: (i) => {
@@ -56,7 +58,7 @@ function makeDoc(uri) {
             executionSummary: c.executionSummary,
             metadata: c.metadata || {}
         })),
-        save: async () => true,
+        save: async () => { saveCalls++; return true; },
         _cells: cells
     };
     openNotebooks.push(doc);
@@ -147,12 +149,16 @@ const vscodeShim = {
         replaceCells(range, cells) { return { __kind: 'replace', range: [range.a, range.b], cells }; },
         insertCells(index, cells) { return { __kind: 'insert', index, cells }; },
         deleteCells(range) { return { __kind: 'delete', range: [range.a, range.b] }; },
-        updateCellMetadata(idx, meta) { return { __kind: 'updateMeta', idx, meta }; }
+        updateCellMetadata(idx, meta) { return { __kind: 'updateMeta', idx, meta }; },
+        updateNotebookMetadata(meta) { return { __kind: 'updateNotebookMeta', meta }; }
     },
     NotebookCellData: class { constructor(kind, value, lang) { this.kind = kind; this.value = value; this.languageId = lang; } },
     NotebookCellKind: { Markup: 1, Code: 2 },
     NotebookRange: class { constructor(a, b) { this.a = a; this.b = b; } },
-    Uri: { joinPath: (base, name) => ({ toString: () => `file:///C:/repo/${name}`, fsPath: `C:/repo/${name}` }) }
+    Uri: {
+        parse: (value) => ({ toString: () => value, fsPath: value.replace(/^file:\/\/\//, '') }),
+        joinPath: (base, name) => ({ toString: () => `file:///C:/repo/${name}`, fsPath: `C:/repo/${name}` })
+    }
 };
 
 const Module = require('module');
@@ -207,8 +213,10 @@ async function main() {
 
     // 2. run_cells waits and returns outputs.
     await check('run_cells returns captured outputs', async () => {
+        const savesBefore = saveCalls;
         const res = await client.callTool({ name: 'run_cells', arguments: { filePath: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 5000 } });
         assert.ok(!res.isError, JSON.stringify(res));
+        assert.strictEqual(saveCalls, savesBefore + 1, 'completed execution must persist even when isDirty is false');
         assert.match(res.content[0].text, /success/, 'expected success status');
         assert.match(res.content[0].text, /hello/, 'expected captured output text');
         assert.match(res.content[0].text, /stream-line/, 'expected stdout stream output');
@@ -299,6 +307,14 @@ async function main() {
         assert.strictEqual(listed.configuration, undefined);
         assert.strictEqual(startedKernels.length, configureCallsBefore, 'default enumeration must not configure providers');
         assert.doesNotMatch(res.content[0].text, /Colab Runtime/);
+    });
+
+    await check('save_notebooks force-saves a clean file notebook', async () => {
+        const savesBefore = saveCalls;
+        const res = await client.callTool({ name: 'save_notebooks', arguments: { filePaths: ['file:///C:/nb.ipynb'] } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.strictEqual(saveCalls, savesBefore + 1);
+        assert.match(res.content[0].text, /Saved: file:\/\/\/C:\/nb\.ipynb/);
     });
 
     await check('list_kernels configure=true reports a missing Jupyter configure tool', async () => {

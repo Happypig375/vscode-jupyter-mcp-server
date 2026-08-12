@@ -468,8 +468,9 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         'open_notebooks',
         {
             description:
-                'Open existing notebooks from disk in a connected VS Code window. Provide file: URIs and optionally ' +
-                'a destination windowId from list_notebooks; otherwise the broker window is used.',
+                'Open existing notebooks from disk in a connected VS Code window. If a URI is already open, reveal ' +
+                'and preserve that live document instead of reloading it. Provide file: URIs and optionally a destination ' +
+                'windowId from list_notebooks; otherwise the broker window is used.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
@@ -491,7 +492,9 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
     server.registerTool(
         'save_notebooks',
         {
-            description: 'Save one or more open notebooks. Provide notebook URIs or notebookIds from list_notebooks.',
+            description:
+                'Force-save one or more open file-backed notebooks, including remote-kernel outputs and execution state ' +
+                'when VS Code does not mark the notebook dirty. Provide notebook URIs or notebookIds from list_notebooks.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: { filePaths: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },

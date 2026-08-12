@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.5
+
+- Force-save file-backed notebooks on explicit `save_notebooks` calls even when VS Code incorrectly reports a remote-executed notebook as clean.
+- Persist completed `run_cells` outputs and execution summaries before returning.
+- Preserve and reveal an already-open live notebook when `open_notebooks` receives the same URI, instead of risking a disk-backed replacement.
+
+### Breaking changes
+
+- None.
+
 ## 0.2.4
 
 - Added optional `list_kernels({ filePath, configure: true })` provider bootstrap, returning configuration status with the refreshed exact controller list. The default remains read-only.

@@ -368,7 +368,14 @@ export async function getCellsOutput(filePath: string, cellIds: Array<string | n
     return blocks.join('\n\n');
 }
 
-/** Native save: persist dirty notebooks (by path). */
+/**
+ * Native save: persist file-backed notebooks even when VS Code reports them clean.
+ *
+ * Remote-kernel execution can update cell outputs/execution summaries without reliably
+ * toggling NotebookDocument.isDirty. Calling save() unconditionally is therefore
+ * intentional: the serializer, not the dirty bit, is the source of truth for an explicit
+ * save request.
+ */
 export async function saveNotebooks(filePaths: string[]): Promise<string> {
     if (filePaths.length === 0) {
         throw new Error('filePaths must not be empty.');
@@ -379,11 +386,11 @@ export async function saveNotebooks(filePaths: string[]): Promise<string> {
         const nb = findNotebook(fp);
         if (!nb) {
             skipped.push(`${fp} (not open)`);
-        } else if (nb.isDirty && !nb.isUntitled) {
-            await nb.save();
-            saved.push(nb.uri.toString());
+        } else if (nb.isUntitled) {
+            skipped.push(`${nb.uri.toString()} (untitled)`);
         } else {
-            skipped.push(`${nb.uri.toString()} (clean or untitled)`);
+            await forceSaveNotebook(nb);
+            saved.push(nb.uri.toString());
         }
     }
     return `Saved: ${saved.join(', ') || '(none)'}${skipped.length ? `\nSkipped: ${skipped.join(', ')}` : ''}`;
@@ -467,6 +474,33 @@ export async function listKernels(filePath: string, configure = false): Promise<
         } : {}),
         kernels
     }, null, 2);
+}
+
+/** Force serialization when remote output changes did not set isDirty. */
+async function forceSaveNotebook(nb: vscode.NotebookDocument): Promise<void> {
+    if (nb.isUntitled) {
+        throw new Error(`Cannot force-save untitled notebook ${nb.uri.toString()}.`);
+    }
+    if (!nb.isDirty) {
+        const originalMetadata = { ...nb.metadata };
+        const touch = new vscode.WorkspaceEdit();
+        touch.set(nb.uri, [vscode.NotebookEdit.updateNotebookMetadata({
+            ...originalMetadata,
+            __jupyterMcpForceSave: `jupyter-mcp-${Date.now()}-${Math.random().toString(16).slice(2)}`
+        })]);
+        if (!await vscode.workspace.applyEdit(touch)) {
+            throw new Error(`Failed to mark ${nb.uri.toString()} for force-save.`);
+        }
+        const restore = new vscode.WorkspaceEdit();
+        restore.set(nb.uri, [vscode.NotebookEdit.updateNotebookMetadata(originalMetadata)]);
+        if (!await vscode.workspace.applyEdit(restore)) {
+            throw new Error(`Failed to restore notebook metadata before saving ${nb.uri.toString()}.`);
+        }
+    }
+    const didSave = await nb.save();
+    if (!didSave) {
+        throw new Error(`VS Code failed to save ${nb.uri.toString()}.`);
+    }
 }
 
 /**
@@ -700,16 +734,26 @@ export async function openNotebooks(filePaths: string[]): Promise<string> {
         throw new Error('filePaths must not be empty.');
     }
     const opened: string[] = [];
+    const revealed: string[] = [];
     for (const fp of filePaths) {
         if (!fp.startsWith('file:')) {
             throw new Error(`'${fp}' is not a file: URI. open_notebooks accepts file: URIs of notebooks on disk.`);
         }
         const uri = vscode.Uri.parse(fp);
+        const existing = findNotebook(uri.toString());
+        if (existing) {
+            await vscode.window.showNotebookDocument(existing, { preview: false });
+            revealed.push(existing.uri.toString());
+            continue;
+        }
         const notebook = await vscode.workspace.openNotebookDocument(uri);
         await vscode.window.showNotebookDocument(notebook, { preview: false });
-        opened.push(uri.toString());
+        opened.push(notebook.uri.toString());
     }
-    return `Opened: ${opened.join(', ')}.`;
+    const lines: string[] = [];
+    if (opened.length) lines.push(`Opened from disk: ${opened.join(', ')}.`);
+    if (revealed.length) lines.push(`Already open; preserved live document: ${revealed.join(', ')}.`);
+    return lines.join('\n');
 }
 
 // ---- Multi-* (batch) operations ----
@@ -829,6 +873,11 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
             `[cell ${idx}] ${status}${cell.executionSummary?.executionOrder !== undefined ? ` (execution #${cell.executionSummary.executionOrder})` : ''}\n` +
             output.trimStart()
         );
+    }
+    // Do not trust isDirty here. Some remote providers update outputs and execution
+    // summaries in the live notebook model without marking the document dirty.
+    if (!nb.isUntitled) {
+        await forceSaveNotebook(nb);
     }
     return results.join('\n');
 }

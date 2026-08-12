@@ -54,8 +54,8 @@ Batch-oriented tools accept arrays and are grouped by owning window; cell-orient
 | `select_kernel` | Manage | Select an exact id from `list_kernels`; optionally start it with `start=true` |
 | `restart_kernels` | Manage | Restart the kernel of one or more notebooks |
 | `interrupt_kernels` | Manage | **Interrupt** (stop) running execution in one or more notebooks |
-| `open_notebooks` | Manage | Open existing notebooks from disk (file: URIs) |
-| `save_notebooks` | Manage | Persist dirty notebooks to disk |
+| `open_notebooks` | Manage | Open file URIs; reveal and preserve the live model when already open |
+| `save_notebooks` | Manage | Force-persist file-backed notebooks, including remote execution state |
 | `export_notebook` | Manage | Export a notebook to **markdown / python / html** |
 
 ### Jupyter-extension guard
@@ -69,7 +69,7 @@ Tools that require a **kernel** — `list_kernels`, `select_kernel`, `run_cells`
 3. `edit_cells` → write/change cells
 4. `list_kernels` → enumerate read-only by default; use `configure=true` when a remote provider has not registered a controller yet
 5. `select_kernel` → optionally choose a specific local or extension-provided kernel
-6. `run_cells` → execute cells **headlessly** and get outputs back
+6. `run_cells` → execute cells **headlessly**, get outputs back, and persist completed remote execution state
 7. `read_cell_outputs` (or `read_notebook` with outputs) → read results
 8. `save_notebooks` → persist; `export_notebook` → share
 
