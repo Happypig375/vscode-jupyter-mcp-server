@@ -9,7 +9,7 @@ import { executeLocalOperation } from './localOperations';
 import { listOpenNotebooks } from './notebookOps';
 import { registerNotebookTools } from './server';
 
-const EXTENSION_VERSION = '0.2.1';
+const EXTENSION_VERSION = '0.3.0';
 let coordinator: BrokerCoordinator | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let output: vscode.OutputChannel;
@@ -40,11 +40,11 @@ function localRouter(): NotebookRouter {
         },
         async invokeNotebook(operation, notebookRef, args) {
             const uri = notebookRef.startsWith(`${windowId}::`) ? notebookRef.slice(windowId.length + 2) : notebookRef;
-            return executeLocalOperation(operation, { ...args, filePath: uri });
+            return executeLocalOperation(operation, { ...args, notebookRef: uri });
         },
         async invokeNotebooks(operation, notebookRefs, args = {}) {
-            const filePaths = notebookRefs.map((ref) => ref.startsWith(`${windowId}::`) ? ref.slice(windowId.length + 2) : ref);
-            return executeLocalOperation(operation, { ...args, filePaths });
+            const refs = notebookRefs.map((ref) => ref.startsWith(`${windowId}::`) ? ref.slice(windowId.length + 2) : ref);
+            return executeLocalOperation(operation, { ...args, notebookRefs: refs });
         },
         async invokeWindow(operation, args, targetWindowId = windowId) {
             if (targetWindowId !== windowId) throw new Error(`VS Code window '${targetWindowId}' is not available over stdio.`);

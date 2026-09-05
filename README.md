@@ -12,9 +12,9 @@ This extension is built for one specific workflow: **an outside agent drives the
 
 That objective drives every design choice:
 
-- **External, harness-agnostic** — any MCP client works; nothing is tied to VS Code's Copilot Chat or Cursor agents. Document editing and cell execution use the VS Code notebook API directly. Only explicit kernel configuration/startup (`list_kernels(configure=true)` or `select_kernel(start=true)`) invokes Jupyter's contributed configuration tool.
-- **User-editing notebook as the source of truth** — tools target open `NotebookDocument`s, not `.ipynb` files on disk, so kernel state and unsaved edits are never out of sync.
-- **Jupyter-optional** — kernel tools (`list_kernels`, `select_kernel`, `run_cells`, `restart_kernels`, `interrupt_kernels`) are only exposed when the Jupyter extension is installed; all document tools work with VS Code's native notebook support alone.
+- **External, harness-agnostic** — any MCP client works; nothing is tied to VS Code's Copilot Chat or Cursor agents. Document editing and cell execution use the VS Code notebook API directly. Only explicit kernel configuration (`configure_kernel`) invokes Jupyter's contributed configuration tool.
+- **User-editing notebook as the source of truth** — tools target open `NotebookDocument`s, not `.ipynb` files on disk, so tools operate on the live document. Saved outputs may remain stale until execution refreshes them.
+- **Jupyter-backed** — the packaged extension declares `ms-toolsai.jupyter` as an extension dependency. Kernel tools are exposed when its runtime APIs are available; document tools use VS Code's native notebook support.
 - **Deterministic, CI-friendly testing** — a shim-based MCP test suite with enforced coverage thresholds runs identically on every platform (no GUI, no VS Code download).
 
 ### How this compares to similar projects
@@ -34,7 +34,7 @@ The VS Code Marketplace also lists generic "VS Code as an MCP server" extensions
 
 ## Tools
 
-Batch-oriented tools accept arrays and are grouped by owning window; cell-oriented tools target one notebook URI or `notebookId` per call.
+Batch-oriented tools accept arrays and are grouped by owning window. Existing-notebook tools use `notebookRef` or `notebookRefs`, each accepting a URI or a window-qualified `notebookId` from `list_notebooks`. `open_notebooks` takes file URIs in `uris` plus an optional `windowId`; `create_notebook` takes `title`.
 
 | Tool | Category | Description |
 |---|---|---|
@@ -42,36 +42,52 @@ Batch-oriented tools accept arrays and are grouped by owning window; cell-orient
 | `list_notebooks` | Read | List notebooks across connected windows with `uri`, `windowId`, `windowLabel`, and routable `notebookId` |
 | `read_notebook` | Read | **Whole-notebook read** in one call: cell index, stable `cell_id` anchor, kind, language, source, execution state, optional outputs |
 | `inspect_notebooks` | Read | Inspect cell metadata for one or more notebooks without returning source or output content |
-| `read_cells` | Read | Read cell source by index or cell anchor, or read all cells |
+| `read_cells` | Read | Read cell source by index or cell anchor, with optional 1-based inclusive `startLine`/`endLine` and `maxSourceChars` |
 | `read_cell_outputs` | Read | Read bounded `summary`, preferred-`text`, or all-text `full` output; binary images are summarized, never decoded |
 | `search_cells` | Read | **Search** a notebook's cells (source + output text) for a query, with per-cell match locations; case-insensitive by default |
 | `get_kernel_info` | Read | Get active kernel label or language/status (best-effort via the Jupyter extension) |
-| `list_kernels` | Read / Manage | List exact available kernel/controller ids; optional `configure=true` first bootstraps providers such as Colab and returns refreshed controllers |
-| `edit_cells` | Write | Insert/edit/delete cells in order; preserves existing metadata; optional explicit re-run (off by default) |
+| `list_kernels` | Read | List exact available kernel/controller ids; never configures providers |
+| `configure_kernel` | Manage | Explicitly invoke provider configuration, which may require normal UI |
+| `edit_cells` | Write | Insert/edit/delete cells in order, plus unique exact-text `replace`; preserves existing metadata; optional explicit re-run (off by default) |
 | `move_cells` | Write | Move one or more cells to a new position (preserves content/outputs/metadata) |
 | `clear_cell_outputs` | Write | Clear saved outputs and execution state from one or more cells |
-| `run_cells` | Execute | Run cells headlessly; wait for bounded text results or set `wait=false` to queue immediately; a wait timeout does not interrupt execution |
-| `select_kernel` | Manage | Select an exact id from `list_kernels`; optionally start it with `start=true` |
+| `run_cells` | Execute | Run cells headlessly; wait for bounded text results or set `wait=false` to dispatch immediately; dispatch does not guarantee queue admission; a wait timeout does not interrupt execution |
+| `select_kernel` | Manage | Select only an exact id from `list_kernels` |
 | `restart_kernels` | Manage | Restart the kernel of one or more notebooks |
 | `interrupt_kernels` | Manage | **Interrupt** (stop) running execution in one or more notebooks |
 | `open_notebooks` | Manage | Open file URIs; reveal and preserve the live model when already open |
 | `save_notebooks` | Manage | Force-persist file-backed notebooks, including remote execution state |
+| `upload_file` / `download_file` | Kernel transfer | Chunked, hashed transfer between the VS Code host and the current active idle Python kernel filesystem |
 | `export_notebook` | Manage | Export a notebook to **markdown / python / html** |
 
 ### Jupyter-extension guard
 
-Tools that require a **kernel** — `list_kernels`, `select_kernel`, `run_cells`, `restart_kernels`, and `interrupt_kernels` — are only exposed when the **Jupyter extension** (`ms-toolsai.jupyter`) is installed. The remaining tools work with VS Code's native notebook support alone.
+Tools that require a **kernel** — `list_kernels`, `configure_kernel`, `select_kernel`, `run_cells`, `restart_kernels`, `interrupt_kernels`, `upload_file`, and `download_file` — are only exposed when the **Jupyter extension** (`ms-toolsai.jupyter`) is installed. The remaining tools work with VS Code's native notebook support alone.
+
+### Optional provider integrations
+
+The optional Google Colab VS Code extension (for example, locally installed `google.colab` 0.9.3) can contribute controllers through Jupyter. `upload_file` and `download_file` use only the public Jupyter kernel API and the filesystem belonging to the currently active idle Python kernel; they do not infer a remote provider, start a kernel, select a kernel, or provide dedicated Colab APIs. The kernel API may display a one-time authorization UI. `configure_kernel` may open the provider's normal UI. On 6 September 2026, live checks in an existing Colab Python session verified targeted cell execution, clearing two nonadjacent cells while preserving their sources and stable IDs, and a 524,425-byte MCP upload/download round trip with matching SHA-256 hashes. Initial provider discovery still required the normal Colab picker after a window reload.
+
+After an extension upgrade, reconnect or refresh the MCP client's tool catalog if it still shows obsolete tool names or parameters. The server's current `tools/list` response is authoritative.
+
+### Adjacent projects (checked 2026-09-06)
+
+This bounded source comparison records documented interfaces; no competitor was installed or behaviorally tested. The [Microsoft Jupyter Extension API](https://github.com/microsoft/vscode-jupyter/wiki/Extension-API) and [kernel execution sample](https://github.com/microsoft/vscode-extension-samples/tree/main/jupyter-kernel-execution-sample) document kernel execution and server-provider integration. The [Colab VS Code guide](https://github.com/googlecolab/colab-vscode/wiki/User-Guide) documents remote providers, server lifecycle, resources, Drive, and context upload; this project consumes controllers through Jupyter rather than implementing those Colab management APIs.
+
+The closest in-editor comparison is [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp), which documents live multi-window URI routing, cell/range/all execution, and operation IDs with polling or streaming. [vscode-runtime-notebook-mcp](https://github.com/olavocarvalho/vscode-runtime-notebook-mcp) embeds a VS Code Jupyter runtime for cell edits, execution, and outputs. [Agentic Jupyter MCP](https://marketplace.visualstudio.com/items?itemName=koyo922.agentic-jupyter-mcp) documents live IDE IPython operations and per-window routing. [mcp-jupyter-complete](https://github.com/tofunori/mcp-jupyter-complete) documents position-based edits and VS Code reload integration. The separate [Datalayer Jupyter MCP server](https://github.com/datalayer/jupyter-mcp-server) targets standalone Python/Jupyter Server workflows, including documented optional Colab sandbox support.
+
+Adjacent Google projects take different boundaries: [Colab MCP](https://github.com/googlecolab/colab-mcp) targets browser Colab sessions and a local MCP client, while [Google Colab CLI](https://github.com/googlecolab/google-colab-cli) documents runtime, file, and execution CLI workflows. Generic [vscode-mcp-server](https://github.com/juehang/vscode-mcp-server) and [vscode-as-mcp-server](https://github.com/acomagu/vscode-as-mcp-server) document editor/file features; this comparison found no verified notebook/kernel contract for them. Future gaps here include operation IDs/polling/streaming and provider-specific management APIs.
 
 ## Recommended flow
 
 1. `list_notebooks` → pick the notebook URI; use `notebookId` if that URI appears in multiple windows
 2. `read_notebook` (or `inspect_notebooks`) → see the notebook's structure/state
 3. `edit_cells` → write/change cells
-4. `list_kernels` → enumerate read-only by default; use `configure=true` when a remote provider has not registered a controller yet
-5. `select_kernel` → optionally choose a specific local or extension-provided kernel
+4. `list_kernels` → enumerate exact ids read-only
+5. `configure_kernel` → explicitly configure a provider when needed; `select_kernel` → choose an exact listed kernel id
 6. `run_cells` → execute cells **headlessly**, get outputs back, and persist completed remote execution state
 7. `read_cell_outputs` (or `read_notebook` with outputs) → read results
-8. `save_notebooks` → persist; `export_notebook` → share
+8. `save_notebooks` → persist file state; saved outputs can remain stale after edits until execution refreshes them; `export_notebook` → share
 
 ## Why a VS Code extension?
 
@@ -79,7 +95,7 @@ Notebook execution, kernels, and the Jupyter extension's tools exist only inside
 
 ## Why native tools instead of forwarding Copilot's?
 
-The VS Code notebook API covers cell execution (`notebook.execute`), reading cells/outputs (`cell.outputs`, `executionSummary`), and kernel restart (`notebook.restartKernel`), so those paths remain native. Provider configuration and startup have no equivalent public notebook command, so `list_kernels(configure=true)` and the explicit `select_kernel(start=true)` path delegate that step to Jupyter's contributed `configure_notebook` tool. Keeping all other operations native avoids the problems with broadly forwarding Copilot tools:
+The VS Code notebook API covers targeted cell execution (`notebook.cell.execute` with an explicit target editor and selected ranges), reading cells/outputs (`cell.outputs`, `executionSummary`), and kernel restart (`notebook.restartKernel`). Provider configuration delegates only the explicit `configure_kernel` call to Jupyter's contributed `configure_notebook` tool. Ambiguous targets fail closed.
 - **Tool-approval dialogs** for execution tools invoked outside a live chat session (`chat.tools.autoApprove` doesn't suppress these — [microsoft/vscode#319094](https://github.com/microsoft/vscode/issues/319094))
 - **Stream requirements** for interactive tools (edit/create need a chat stream)
 - **Coupling** to Copilot Chat's tool contributions and their schemas
@@ -125,9 +141,8 @@ If the same notebook URI is open in two windows, `list_notebooks` returns two en
 
 - Notebooks must be open in VS Code to be listed/read/edited (`list_notebooks` lists open ones).
 - Requires the **Jupyter extension** (`ms-toolsai.jupyter`) for kernel-backed execution; `run_cells` uses the notebook's current kernel.
-- `select_kernel.kernelId` requires an exact id returned by `list_kernels` and never falls back. The older `run_cells.kernel` field remains a best-effort label/id hint for compatibility; use `select_kernel` first and omit `run_cells.kernel` when exact selection matters.
-- `select_kernel` is headless by default. `start=true` uses Jupyter's contributed notebook configuration tool and may show the provider's normal confirmation or sign-in UI (for example, Colab authentication).
-- `list_kernels(configure=true)` may inherently require user interaction for a provider's server picker, authentication, consent, or runtime allocation. Its response includes configuration status and the refreshed controller list; plain `list_kernels` remains read-only.
+- `select_kernel.kernelId` requires an exact id returned by `list_kernels` and never falls back. `run_cells` has no kernel hint; select an exact id with `select_kernel` first.
+- `configure_kernel` may require provider UI for server picker, authentication, consent, or runtime allocation. `list_kernels` remains read-only and `select_kernel` requires an exact listed id.
 - Cell references use 0-based indices (`cellIds`) — after an edit, call `inspect_notebooks` for fresh indices.
 - The HTTP transport supports multi-window routing; stdio remains scoped to the extension host that owns its process.
 - Workspace-trust / tool-approval dialogs do **not** apply to these native tools (they use the VS Code notebook API, not `invokeTool`).

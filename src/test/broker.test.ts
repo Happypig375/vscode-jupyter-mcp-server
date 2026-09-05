@@ -81,7 +81,7 @@ async function main(): Promise<void> {
             await originalBroker.invokeNotebook('read_notebook', routed.notebookId, {}),
             'window-b:read_notebook'
         );
-        assert.strictEqual(invocations.get('window-b')!.at(-1)!.args.filePath, shared);
+        assert.strictEqual(invocations.get('window-b')!.at(-1)!.args.notebookRef, shared);
 
         for (const calls of invocations.values()) calls.length = 0;
         await originalBroker.invokeNotebooks('save_notebooks', [
@@ -91,11 +91,11 @@ async function main(): Promise<void> {
         ]);
         assert.deepStrictEqual(invocations.get('window-a'), [{
             operation: 'save_notebooks',
-            args: { filePaths: ['file:///C:/a.ipynb'] }
+            args: { notebookRefs: ['file:///C:/a.ipynb'] }
         }]);
         assert.deepStrictEqual(invocations.get('window-b'), [{
             operation: 'save_notebooks',
-            args: { filePaths: ['file:///C:/b.ipynb', shared] }
+            args: { notebookRefs: ['file:///C:/b.ipynb', shared] }
         }]);
 
         const originalOwnerId = originalBroker.windowId;

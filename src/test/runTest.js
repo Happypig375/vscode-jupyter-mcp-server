@@ -38,6 +38,12 @@ async function main() {
         timeout: 60000
     });
     if (broker.status !== 0) process.exit(broker.status || 1);
+    const transfer = spawnSync('node', [path.join(root, '.vscode-test', 'kernelFiles.test.cjs')], {
+        cwd: root,
+        stdio: 'inherit',
+        timeout: 60000
+    });
+    if (transfer.status !== 0) process.exit(transfer.status || 1);
     process.exit(0);
 }
 

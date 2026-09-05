@@ -12,5 +12,6 @@ tsconfig.json
 .coverage
 coverage
 .github
+AGENTS.md
 *.map
 dist/*.map

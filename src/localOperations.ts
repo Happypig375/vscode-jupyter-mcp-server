@@ -6,6 +6,7 @@ import {
     getCells,
     getCellsOutput,
     getKernelInfo,
+    configureKernel,
     getNotebooksSummary,
     interruptKernels,
     listKernels,
@@ -19,6 +20,7 @@ import {
     saveNotebooks,
     searchCells
 } from './notebookOps';
+import { downloadFile, uploadFile } from './kernelFiles';
 
 export type LocalOperation =
     | 'create_notebook'
@@ -26,6 +28,7 @@ export type LocalOperation =
     | 'read_cells'
     | 'clear_cell_outputs'
     | 'get_kernel_info'
+    | 'configure_kernel'
     | 'list_kernels'
     | 'select_kernel'
     | 'read_cell_outputs'
@@ -38,13 +41,15 @@ export type LocalOperation =
     | 'interrupt_kernels'
     | 'move_cells'
     | 'open_notebooks'
-    | 'save_notebooks';
+    | 'save_notebooks'
+    | 'upload_file'
+    | 'download_file';
 
 type Args = Record<string, unknown>;
 
-function filePath(args: Args): string {
-    if (typeof args.filePath !== 'string' || !args.filePath) throw new Error('filePath is required');
-    return args.filePath;
+function notebookRef(args: Args): string {
+    if (typeof args.notebookRef !== 'string' || !args.notebookRef) throw new Error('notebookRef is required');
+    return args.notebookRef;
 }
 
 /** Execute one validated tool operation against notebooks owned by this VS Code window. */
@@ -52,45 +57,46 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
     const ids = args.cellIds as Array<string | number> | undefined;
     switch (operation) {
         case 'create_notebook':
-            return createNotebook(typeof args.query === 'string' ? args.query : 'New notebook');
+            return createNotebook(typeof args.title === 'string' ? args.title : 'New notebook');
         case 'inspect_notebooks':
-            return getNotebooksSummary(args.filePaths as string[]);
+            return getNotebooksSummary(args.notebookRefs as string[]);
         case 'read_cells':
-            return getCells(filePath(args), ids);
+            return getCells(notebookRef(args), ids, { startLine: args.startLine as number | undefined, endLine: args.endLine as number | undefined, maxSourceChars: args.maxSourceChars as number | undefined });
         case 'clear_cell_outputs':
-            return clearOutputs(filePath(args), ids ?? []);
+            return clearOutputs(notebookRef(args), ids ?? []);
         case 'get_kernel_info':
-            return getKernelInfo(filePath(args));
+            return getKernelInfo(notebookRef(args));
+        case 'configure_kernel':
+            return configureKernel(notebookRef(args));
         case 'list_kernels':
-            return listKernels(filePath(args), args.configure === true);
+            return listKernels(notebookRef(args));
         case 'select_kernel':
-            return selectKernel(filePath(args), args.kernelId as string, args.start === true);
+            return selectKernel(notebookRef(args), args.kernelId as string);
         case 'read_cell_outputs':
-            return getCellsOutput(filePath(args), ids ?? [], {
+            return getCellsOutput(notebookRef(args), ids ?? [], {
                 mode: args.outputMode as OutputMode | undefined,
                 maxChars: args.maxOutputChars as number | undefined
             });
         case 'search_cells':
             return searchCells(
-                filePath(args),
+                notebookRef(args),
                 typeof args.query === 'string' ? args.query : '',
                 args.caseSensitive === true,
                 ids
             );
         case 'read_notebook':
-            return readNotebook(filePath(args), {
+            return readNotebook(notebookRef(args), {
                 includeOutputs: args.includeOutputs === true,
                 cellIds: ids,
                 outputMode: args.outputMode as OutputMode | undefined,
                 maxOutputChars: args.maxOutputChars as number | undefined
             });
         case 'export_notebook':
-            return exportNotebook(filePath(args), args.format as 'markdown' | 'python' | 'html');
+            return exportNotebook(notebookRef(args), args.format as 'markdown' | 'python' | 'html');
         case 'edit_cells':
-            return editNotebookCells(filePath(args), args.edits as Parameters<typeof editNotebookCells>[1]);
+            return editNotebookCells(notebookRef(args), args.edits as Parameters<typeof editNotebookCells>[1]);
         case 'run_cells':
-            return runNotebookCells(filePath(args), ids ?? [], {
-                kernel: args.kernel as string | undefined,
+            return runNotebookCells(notebookRef(args), ids ?? [], {
                 timeoutMs: args.timeoutMs as number | undefined,
                 wait: args.wait as boolean | undefined,
                 includeOutputs: args.includeOutputs as boolean | undefined,
@@ -98,15 +104,19 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
                 maxChars: args.maxOutputChars as number | undefined
             });
         case 'restart_kernels':
-            return (await Promise.all((args.filePaths as string[]).map((path) => restartKernel(path)))).join('\n');
+            return (await Promise.all((args.notebookRefs as string[]).map((path) => restartKernel(path)))).join('\n');
         case 'interrupt_kernels':
-            return interruptKernels(args.filePaths as string[]);
+            return interruptKernels(args.notebookRefs as string[]);
         case 'move_cells':
-            return moveCells(filePath(args), ids ?? [], args.toIndex as number);
+            return moveCells(notebookRef(args), ids ?? [], args.toIndex as number);
         case 'open_notebooks':
-            return openNotebooks(args.filePaths as string[]);
+            return openNotebooks(args.uris as string[]);
         case 'save_notebooks':
-            return saveNotebooks(args.filePaths as string[]);
+            return saveNotebooks(args.notebookRefs as string[]);
+        case 'upload_file':
+            return uploadFile({ notebookRef: notebookRef(args), localPath: args.localPath as string, kernelPath: args.kernelPath as string, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
+        case 'download_file':
+            return downloadFile({ notebookRef: notebookRef(args), localPath: args.localPath as string, kernelPath: args.kernelPath as string, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
         default:
             throw new Error(`Unknown local notebook operation: ${String(operation)}`);
     }

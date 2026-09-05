@@ -169,19 +169,19 @@ export class BrokerCoordinator implements NotebookRouter {
 
     async invokeNotebook(operation: LocalOperation, notebookRef: string, args: Record<string, unknown>): Promise<string> {
         const target = await this.resolveNotebook(notebookRef);
-        return this.invokeRegistration(target.registration, operation, { ...args, filePath: target.uri });
+        return this.invokeRegistration(target.registration, operation, { ...args, notebookRef: target.uri });
     }
 
     async invokeNotebooks(operation: LocalOperation, notebookRefs: string[], args: Record<string, unknown> = {}): Promise<string> {
         const targets = await Promise.all(notebookRefs.map((notebookRef) => this.resolveNotebook(notebookRef)));
-        const groups = new Map<string, { registration: WindowRegistration; filePaths: string[] }>();
+        const groups = new Map<string, { registration: WindowRegistration; notebookRefs: string[] }>();
         for (const target of targets) {
-            const group = groups.get(target.registration.id) ?? { registration: target.registration, filePaths: [] };
-            group.filePaths.push(target.uri);
+            const group = groups.get(target.registration.id) ?? { registration: target.registration, notebookRefs: [] };
+            group.notebookRefs.push(target.uri);
             groups.set(target.registration.id, group);
         }
         const results = await Promise.all([...groups.values()].map((group) =>
-            this.invokeRegistration(group.registration, operation, { ...args, filePaths: group.filePaths })
+            this.invokeRegistration(group.registration, operation, { ...args, notebookRefs: group.notebookRefs })
         ));
         return results.join('\n\n');
     }
@@ -382,7 +382,7 @@ export class BrokerCoordinator implements NotebookRouter {
         if (matches.length === 0) throw new Error(`No connected VS Code window has notebook '${notebookRef}' open. Use list_notebooks to list them.`);
         if (matches.length > 1) {
             const choices = matches.map((match) => `${match.windowLabel}: ${match.notebookId}`).join('\n');
-            throw new Error(`Notebook '${notebookRef}' is open in ${matches.length} VS Code windows. Pass one of these notebookId values as filePath:\n${choices}`);
+            throw new Error(`Notebook '${notebookRef}' is open in ${matches.length} VS Code windows. Pass one of these notebookId values as notebookRef:\n${choices}`);
         }
         const match = matches[0];
         const registration = this.peers.get(match.windowId);

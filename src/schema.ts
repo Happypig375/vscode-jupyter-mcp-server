@@ -71,6 +71,9 @@ export function jsonSchemaToZod(schema: Record<string, unknown> | undefined): z.
     }
 
     const props = (schema.properties ?? {}) as Record<string, Record<string, unknown>>;
+    if (schema.additionalProperties === true && Object.keys(props).length === 0) {
+        return z.record(z.string(), z.unknown());
+    }
     const required = Array.isArray(schema.required) ? (schema.required as string[]) : [];
 
     const shape: Record<string, z.ZodTypeAny> = {};
@@ -86,5 +89,8 @@ export function jsonSchemaToZod(schema: Record<string, unknown> | undefined): z.
         shape[key] = required.includes(key) ? field : field.optional();
     }
 
-    return z.object(shape);
+    // MCP tool inputs must fail closed: Zod's default object behavior strips
+    // unknown keys, which can silently turn obsolete/unsafe requests into a
+    // different operation.
+    return z.object(shape).strict();
 }

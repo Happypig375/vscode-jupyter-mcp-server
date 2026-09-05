@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Renamed public notebook targets to `notebookRef`/`notebookRefs`; `open_notebooks` now accepts `uris` and `windowId`.
+- Added explicit `configure_kernel`; kernel listing is read-only and selection requires an exact id.
+- Removed unsafe implicit kernel/start parameters and made tool validation reject unknown keys.
+- Added bounded source reads and `edit_cells` exact-match `replace` edits.
+- Added bounded `upload_file` and `download_file` through the public API of an existing idle Python kernel, with chunked transfer, size and SHA-256 verification, atomic promotion, and no-overwrite defaults.
+- Reimplemented `clear_cell_outputs` with public notebook edits so clearing preserves cell identity, source, language, and metadata.
+
 ## 0.2.5
 
 - Force-save file-backed notebooks on explicit `save_notebooks` calls even when VS Code incorrectly reports a remote-executed notebook as clean.

@@ -2,7 +2,7 @@
   "name": "vscode-jupyter-mcp-server",
   "displayName": "Jupyter MCP Server",
   "description": "A notebook-specific MCP server: run, edit, create, and manage Jupyter notebooks from any MCP client (Command Code CLI/desktop, Claude, etc.).",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "publisher": "Happypig375",
   "license": "MIT",
   "icon": "icon.png",
@@ -83,7 +83,7 @@
   },
   "scripts": {
     "compile": "esbuild src/extension.ts --bundle --external:vscode --format=cjs --platform=node --target=node20 --sourcemap --outfile=dist/extension.js",
-    "compile:test": "esbuild src/test/broker.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/broker.test.cjs",
+    "compile:test": "esbuild src/test/broker.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/broker.test.cjs && esbuild src/test/kernelFiles.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.test.cjs",
     "watch": "esbuild src/extension.ts --bundle --external:vscode --format=cjs --platform=node --target=node20 --sourcemap --outfile=dist/extension.js --watch",
     "typecheck": "tsc --noEmit",
     "test": "npm run compile && npm run compile:test && node src/test/runTest.js",

@@ -10,8 +10,9 @@ export interface EditNotebookArgs {
     /** Cell to edit/delete, or anchor for insert. Accepts cell index (number/string) or cell id. */
     cellId?: string | number;
     /** For insert: TOP | BOTTOM, or a cellId/cellIndex after which to insert. */
-    editType: 'insert' | 'edit' | 'delete';
+    editType: 'insert' | 'edit' | 'delete' | 'replace';
     newCode?: string;
+    oldText?: string;
     language?: string;
     /** Optional cell metadata to set (e.g. { tags: ["parameters"] }) — applied via NotebookEdit.updateCellMetadata. */
     metadata?: Record<string, unknown>;
@@ -92,6 +93,16 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
     if (!nb) {
         throw new Error(`No open notebook matches '${args.filePath}' in this window. Use list_notebooks to list them.`);
     }
+    if (args.editType === 'replace') {
+        if (!args.oldText) throw new Error('oldText is required and must be non-empty for replace');
+        if (args.newCode === undefined) throw new Error('newCode is required for replace; use an empty string to delete the snippet');
+        const idx = resolveCellIndex(nb, args.cellId);
+        const source = nb.cellAt(idx).document.getText();
+        const first = source.indexOf(args.oldText);
+        if (first < 0 || source.indexOf(args.oldText, first + args.oldText.length) >= 0) {
+            throw new Error(`oldText must occur exactly once in cell ${idx}; no edit was applied.`);
+        }
+    }
     await saveDirtyNotebook(args.filePath);
 
     const edit = new vscode.WorkspaceEdit();
@@ -134,8 +145,19 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
             edit.set(nb.uri, [vscode.NotebookEdit.deleteCells(new vscode.NotebookRange(idx, idx + 1))]);
             break;
         }
+        case 'replace': {
+            const idx = resolveCellIndex(nb, args.cellId);
+            const existing = nb.cellAt(idx);
+            const replacement = existing.document.getText().replace(args.oldText!, args.newCode ?? '');
+            affectedIndex = idx;
+            const cell = new vscode.NotebookCellData(existing.kind, replacement, args.language ?? existing.document.languageId);
+            cell.metadata = { ...(existing.metadata ?? {}), ...(args.metadata ?? {}) };
+            cell.outputs = [...existing.outputs];
+            edit.set(nb.uri, [vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(idx, idx + 1), [cell])]);
+            break;
+        }
         default:
-            throw new Error(`Unknown editType '${args.editType}' (use insert|edit|delete)`);
+            throw new Error(`Unknown editType '${args.editType}' (use insert|edit|delete|replace)`);
     }
 
     const applied = await vscode.workspace.applyEdit(edit);
@@ -334,18 +356,30 @@ export async function readCellOutput(filePath: string, cellId: string | number |
 }
 
 /** Native cell source: return each requested cell's source text with index/kind/language. */
-export async function getCells(filePath: string, cellIds?: Array<string | number>): Promise<string> {
+export async function getCells(filePath: string, cellIds?: Array<string | number>, options: GetCellsOptions = {}): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
+    if (options.startLine !== undefined && (!Number.isInteger(options.startLine) || options.startLine < 1)) throw new Error('startLine must be a positive 1-based line number.');
+    if (options.endLine !== undefined && (!Number.isInteger(options.endLine) || options.endLine < 1)) throw new Error('endLine must be a positive 1-based line number.');
+    if (options.startLine !== undefined && options.endLine !== undefined && options.endLine < options.startLine) throw new Error('endLine must be greater than or equal to startLine.');
+    if (options.maxSourceChars !== undefined && (!Number.isInteger(options.maxSourceChars) || options.maxSourceChars < 0)) throw new Error('maxSourceChars must be a non-negative integer.');
     const idxs = cellIds && cellIds.length ? cellIds.map((c) => resolveCellIndex(nb, c)) : Array.from({ length: nb.cellCount }, (_, i) => i);
     const blocks: string[] = [];
     for (const idx of idxs) {
         const cell = nb.cellAt(idx);
+        const lines = cell.document.getText().split('\n');
+        const start = options.startLine ?? 1;
+        const end = options.endLine ?? lines.length;
+        if (start > lines.length || end > lines.length) throw new Error(`Requested source lines ${start}-${end} exceed cell ${idx} line count ${lines.length}.`);
+        let source = lines.slice(start - 1, end).join('\n');
+        if (options.maxSourceChars !== undefined && source.length > options.maxSourceChars) {
+            source = `${source.slice(0, options.maxSourceChars)}\n[truncated at ${options.maxSourceChars} characters]`;
+        }
         blocks.push(
             `[cell ${idx} | id:${cellIdentifier(cell, idx)} | ${cell.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown'} | ${cell.document.languageId}]\n` +
-            cell.document.getText()
+            source
         );
     }
     return blocks.join('\n\n');
@@ -433,27 +467,38 @@ export async function getKernelInfo(filePath: string): Promise<string> {
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
-    let label = 'unknown';
+    type ActiveKernel = { label?: string; language?: string; status?: string };
+    let kernel: ActiveKernel | undefined;
     try {
-        type ActiveKernel = { label?: string; language?: string; status?: string };
         type JupyterApi = {
             /** Compatibility with older Jupyter extension exports. */
             getKernel?: (u: vscode.Uri) => ActiveKernel | undefined;
             kernels?: { getKernel(u: vscode.Uri): Thenable<ActiveKernel | undefined> };
         };
         const api = await vscode.extensions.getExtension<JupyterApi>('ms-toolsai.jupyter')?.activate();
-        const kernel = api?.kernels
+        kernel = api?.kernels
             ? await api.kernels.getKernel(nb.uri)
             : api?.getKernel?.(nb.uri);
-        if (kernel?.label) {
-            label = kernel.label;
-        } else if (kernel?.language) {
-            label = `${kernel.language}${kernel.status ? ` (${kernel.status})` : ''}`;
-        }
     } catch {
         // best-effort
     }
-    return `Notebook: ${nb.uri.toString()}\nKernel: ${label}`;
+    return JSON.stringify({
+        notebook: nb.uri.toString(),
+        kernel: { label: kernel?.label ?? 'unknown', language: kernel?.language ?? 'unknown', status: kernel?.status ?? 'unknown' },
+        capabilities: {
+            selectedController: 'unknown',
+            provider: 'unknown',
+            kernelFileTransfer: { available: 'unknown', scope: 'active idle Python kernel filesystem; public executeCode API access required' }
+        }
+    }, null, 2);
+}
+
+/** Explicitly request generic Jupyter provider setup; completion does not imply runtime startup. */
+export async function configureKernel(filePath: string): Promise<string> {
+    const nb = findNotebook(filePath);
+    if (!nb) throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
+    const result = await invokeJupyterConfigureTool(nb);
+    return `Kernel configuration requested for ${nb.uri.toString()}.${result.detail ? `\n${result.detail}` : ''}`;
 }
 
 /** Enumerate registered notebook controllers, optionally configuring providers first. */
@@ -462,18 +507,18 @@ export async function listKernels(filePath: string, configure = false): Promise<
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
-    const startup = configure ? await invokeJupyterConfigureTool(nb) : undefined;
+    if (configure) throw new Error('configure=true is no longer implicit. Call configure_kernel explicitly, then list_kernels again.');
     const kernels = await resolveNotebookKernels(nb);
     return JSON.stringify({
         notebook: nb.uri.toString(),
-        ...(startup ? {
-            configuration: {
-                status: startup.pending ? 'pending' : 'configured',
-                detail: startup.detail
-            }
-        } : {}),
         kernels
     }, null, 2);
+}
+
+export interface GetCellsOptions {
+    startLine?: number;
+    endLine?: number;
+    maxSourceChars?: number;
 }
 
 /** Force serialization when remote output changes did not set isDirty. */
@@ -514,6 +559,7 @@ export async function selectKernel(filePath: string, kernelId: string, start = f
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     if (!kernelId) throw new Error('kernelId is required');
+    if (start) throw new Error('start=true is unsupported. Call configure_kernel separately, then select_kernel with start=false.');
 
     const kernels = await resolveNotebookKernels(nb);
     const kernel = kernels.find((candidate) => candidate.id === kernelId);
@@ -524,7 +570,7 @@ export async function selectKernel(filePath: string, kernelId: string, start = f
 
     // Kernel selection is scoped to the active notebook editor. Bring the requested
     // document forward, then use the exact extension/controller pair resolved by VS Code.
-    await vscode.window.showNotebookDocument(nb, { preview: false, preserveFocus: false });
+    await revealNotebookForExecution(nb);
     const slash = kernel.id.indexOf('/');
     const selected = await vscode.commands.executeCommand<boolean>('_notebook.selectKernel', {
         id: kernel.id.slice(slash + 1),
@@ -534,15 +580,7 @@ export async function selectKernel(filePath: string, kernelId: string, start = f
         throw new Error(`VS Code did not select kernel '${kernel.id}' for ${nb.uri.toString()}.`);
     }
 
-    if (!start) {
-        return `Selected kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}.`;
-    }
-
-    const startup = await invokeJupyterConfigureTool(nb);
-    if (startup.pending) {
-        return `Selected kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}. Startup was requested and is still pending.${startup.detail ? `\n${startup.detail}` : ''}`;
-    }
-    return `Selected and started kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}.${startup.detail ? `\n${startup.detail}` : ''}`;
+    return `Selected kernel '${kernel.label}' (${kernel.id}) for ${nb.uri.toString()}.`;
 }
 
 async function invokeJupyterConfigureTool(nb: vscode.NotebookDocument): Promise<{ detail: string; pending: boolean }> {
@@ -609,11 +647,17 @@ export async function clearOutputs(filePath: string, cellIds: Array<string | num
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     const idxs = cellIds.map((c) => resolveCellIndex(nb, c));
-    // Clear in reverse order so index-based edits stay valid.
-    const sorted = [...idxs].sort((a, b) => b - a);
-    for (const idx of sorted) {
-        await vscode.commands.executeCommand('notebook.clearOutputs', nb.uri, [nb.cellAt(idx).document.uri]);
+    const edit = new vscode.WorkspaceEdit();
+    const edits: vscode.NotebookEdit[] = [];
+    for (const idx of idxs) {
+        const cell = nb.cellAt(idx);
+        const replacement = new vscode.NotebookCellData(cell.kind, cell.document.getText(), cell.document.languageId);
+        replacement.metadata = { ...cell.metadata };
+        replacement.outputs = [];
+        edits.push(vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(idx, idx + 1), [replacement]));
     }
+    edit.set(nb.uri, edits);
+    if (!await vscode.workspace.applyEdit(edit)) throw new Error(`VS Code rejected clearing outputs for ${nb.uri.toString()}.`);
     return `Cleared outputs of ${idxs.length} cell(s) in ${nb.uri.toString()}.`;
 }
 
@@ -776,16 +820,18 @@ function outputSignature(cell: vscode.NotebookCell): string {
 }
 
 /** Baseline before executing a cell, to detect when the execution actually completes. */
-function executionBaseline(cell: vscode.NotebookCell): { order?: number; signature: string; hadSummary: boolean } {
+function executionBaseline(cell: vscode.NotebookCell): { order?: number; startTime?: number; endTime?: number; signature: string; hadSummary: boolean } {
     return {
         order: cell.executionSummary?.executionOrder,
+        startTime: cell.executionSummary?.timing?.startTime,
+        endTime: cell.executionSummary?.timing?.endTime,
         signature: outputSignature(cell),
         hadSummary: typeof cell.executionSummary?.success === 'boolean'
     };
 }
 
 /** Whether a cell shows a fresh execution result relative to a baseline taken before the run. */
-function isFreshExecution(cell: vscode.NotebookCell, baseline: { order?: number; signature: string; hadSummary: boolean }, requestedAt: number): boolean {
+function isFreshExecution(cell: vscode.NotebookCell, baseline: { order?: number; startTime?: number; endTime?: number; signature: string; hadSummary: boolean }, requestedAt: number): boolean {
     const s = cell.executionSummary;
     if (typeof s?.success !== 'boolean') {
         return false;
@@ -793,7 +839,7 @@ function isFreshExecution(cell: vscode.NotebookCell, baseline: { order?: number;
     if (!baseline.hadSummary) {
         return true;
     }
-    if (s.timing?.endTime !== undefined && s.timing.endTime >= requestedAt) {
+    if (s.timing?.endTime !== undefined && s.timing.endTime >= requestedAt && s.timing.endTime !== baseline.endTime) {
         return true;
     }
     if (s.executionOrder !== undefined && s.executionOrder !== baseline.order) {
@@ -803,16 +849,32 @@ function isFreshExecution(cell: vscode.NotebookCell, baseline: { order?: number;
 }
 
 /** Wait until a cell completes. A timeout is a non-error because the kernel may still be running. */
-async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, baseline: { order?: number; signature: string; hadSummary: boolean }, requestedAt: number, timeoutMs: number): Promise<vscode.NotebookCell | undefined> {
+async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, baseline: { order?: number; startTime?: number; endTime?: number; signature: string; hadSummary: boolean }, requestedAt: number, timeoutMs: number): Promise<{ cell?: vscode.NotebookCell; observed: boolean }> {
     const deadline = Date.now() + (timeoutMs > 0 ? timeoutMs : 24 * 60 * 60 * 1000);
+    let observed = false;
     while (Date.now() < deadline) {
         const cell = notebook.cellAt(index);
         if (isFreshExecution(cell, baseline, requestedAt)) {
-            return cell;
+            return { cell, observed: true };
         }
+        const summary = cell.executionSummary;
+        observed ||= Boolean(summary && (
+            (summary.timing?.startTime !== undefined && summary.timing.startTime >= requestedAt && summary.timing.startTime !== baseline.startTime) ||
+            (summary.executionOrder !== undefined && summary.executionOrder !== baseline.order) ||
+            outputSignature(cell) !== baseline.signature
+        ));
         await new Promise((r) => setTimeout(r, 100));
     }
-    return undefined;
+    return { observed };
+}
+
+/** Reveal the target notebook and fail closed if VS Code returns another editor. */
+async function revealNotebookForExecution(nb: vscode.NotebookDocument): Promise<void> {
+    const editor = await vscode.window.showNotebookDocument(nb, { preview: false, preserveFocus: false });
+    const revealed = editor?.notebook;
+    if (!revealed || revealed.uri.toString() !== nb.uri.toString()) {
+        throw new Error(`VS Code did not reveal notebook ${nb.uri.toString()} for execution.`);
+    }
 }
 
 /**
@@ -830,21 +892,13 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
+    if (options.kernel) {
+        throw new Error('The kernel option is unsupported. Call select_kernel with an exact kernelId before run_cells.');
+    }
     await saveDirtyNotebook(filePath);
 
     // Preserve the pre-v0.2.2 best-effort kernel hint. Exact fail-closed selection is
     // available through select_kernel and must be performed as a separate call.
-    if (options.kernel) {
-        try {
-            await vscode.commands.executeCommand('notebook.selectKernel', {
-                notebookEditor: nb.uri,
-                kernelInfo: { label: options.kernel }
-            });
-        } catch {
-            // Compatibility behavior: execution proceeds with the current kernel.
-        }
-    }
-
     const indices = cellIds.map((c) => resolveCellIndex(nb, c));
     for (const idx of indices) {
         if (nb.cellAt(idx).kind !== vscode.NotebookCellKind.Code) {
@@ -852,8 +906,13 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
         }
     }
 
+    await revealNotebookForExecution(nb);
+
     if (options.wait === false) {
-        await vscode.commands.executeCommand('notebook.execute', nb.uri, indices.map((idx) => nb.cellAt(idx).document.uri));
+        await vscode.commands.executeCommand('notebook.cell.execute', {
+            document: nb.uri,
+            ranges: indices.map((idx) => ({ start: idx, end: idx + 1 }))
+        });
         return `Queued ${indices.length} cell(s) in ${nb.uri.toString()}: ${indices.join(', ')}. Use inspect_notebooks or read_cell_outputs to inspect progress.`;
     }
 
@@ -861,12 +920,18 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     for (const idx of indices) {
         const baseline = executionBaseline(nb.cellAt(idx));
         const requestedAt = Date.now();
-        await vscode.commands.executeCommand('notebook.execute', nb.uri, [nb.cellAt(idx).document.uri]);
-        const cell = await waitForCellExecution(nb, idx, baseline, requestedAt, options.timeoutMs ?? 60_000);
-        if (!cell) {
-            results.push(`[cell ${idx}] still running after ${options.timeoutMs ?? 60_000} ms. Execution was not interrupted.`);
+        await vscode.commands.executeCommand('notebook.cell.execute', {
+            document: nb.uri,
+            ranges: [{ start: idx, end: idx + 1 }]
+        });
+        const observation = await waitForCellExecution(nb, idx, baseline, requestedAt, options.timeoutMs ?? 60_000);
+        if (!observation.cell) {
+            results.push(observation.observed
+                ? `[cell ${idx}] execution observed but did not complete within ${options.timeoutMs ?? 60_000} ms. Execution was not interrupted.`
+                : `[cell ${idx}] execution was not observed to start within ${options.timeoutMs ?? 60_000} ms. The request was not cancelled and may still start after the timeout.`);
             break;
         }
+        const cell = observation.cell;
         const status = cell.executionSummary?.success === true ? 'success' : 'error';
         const output = options.includeOutputs === false ? '' : `\n${formatCellOutputs(cell, options)}`;
         results.push(
