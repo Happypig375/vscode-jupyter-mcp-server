@@ -22,6 +22,7 @@ const openNotebooks = [];
 const executionCalls = [];
 let saveCalls = 0;
 let executionMode = 'complete';
+let executionDeferred;
 let exactSelectionAccepted = true;
 let rejectLegacyKernelHint = false;
 let configureAvailable = true;
@@ -129,7 +130,9 @@ const vscodeShim = {
             if (cmd === 'notebook.cell.execute') {
                 assert.ok(uri && uri.document && Array.isArray(uri.ranges), 'expected cell execution options');
                 executionCalls.push(uri);
+                if (executionMode === 'reject') throw new Error('dispatch rejected');
                 if (executionMode === 'hang') return;
+                if (executionMode === 'deferred-hang') return executionDeferred.promise;
                 const nb = openNotebooks.find((candidate) => candidate.uri.toString() === uri.document.toString());
                 assert.ok(nb, 'target notebook must be selected by document URI');
                 // Simulate execution completing only for the requested ranges.
@@ -142,7 +145,7 @@ const vscodeShim = {
                         cell.executionSummary = { timing: { startTime: Date.now() } };
                         continue;
                     }
-                    cell.executionSummary = { success: true, executionOrder: 1, timing: { startTime: Date.now() - 50, endTime: Date.now() } };
+                    cell.executionSummary = { success: executionMode !== 'error', executionOrder: 1, timing: { startTime: Date.now() - 50, endTime: Date.now() } };
                     cell.outputs = [{ items: [
                         { mime: 'text/html', data: Buffer.from(`<div>${'duplicated-rich-output '.repeat(2000)}</div>`) },
                         { mime: 'text/plain', data: Buffer.from('hello\n') },
@@ -151,6 +154,7 @@ const vscodeShim = {
                         { mime: 'application/vnd.code.notebook.stdout', data: Buffer.from('stream-line\n') }
                     ] }];
                 }
+                if (executionMode === 'deferred-complete') return executionDeferred.promise;
             }
             if (cmd === 'notebook.clearOutputs' && cellUris) {
                 for (const cu of cellUris) {
@@ -277,16 +281,46 @@ async function main() {
         assert.ok(res.content[0].text.length < 1000);
     });
 
-    await check('run_cells can queue without waiting', async () => {
+    await check('inspect_notebooks distinguishes saved state from current execution state', async () => {
+        const fixture = openNotebooks[0];
+        const savedOutput = fixture._cells[0].outputs;
+        const savedSummary = fixture._cells[0].executionSummary;
+        const orderedSummary = fixture._cells[2].executionSummary;
+        const orderedOutputs = fixture._cells[2].outputs;
+        try {
+            fixture._cells[0].executionSummary = undefined;
+            fixture._cells[0].outputs = [{ items: [{ mime: 'text/plain', data: Buffer.from('saved') }] }];
+            fixture._cells[2].executionSummary = { executionOrder: 9 };
+            fixture._cells[2].outputs = [];
+            const res = await client.callTool({ name: 'inspect_notebooks', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
+            assert.ok(!res.isError, JSON.stringify(res));
+            assert.match(res.content[0].text, /state=unknown.*outputs=\[text\/plain\]/);
+            assert.match(res.content[0].text, /state=unknown.*outputs=\[\]/);
+        } finally {
+            fixture._cells[0].executionSummary = savedSummary;
+            fixture._cells[0].outputs = savedOutput;
+            fixture._cells[2].executionSummary = orderedSummary;
+            fixture._cells[2].outputs = orderedOutputs;
+        }
+    });
+
+    await check('run_cells dispatches without waiting for command settlement', async () => {
         const callsBefore = executionCalls.length;
-        const res = await client.callTool({ name: 'run_cells', arguments: {
+        executionMode = 'deferred-hang';
+        executionDeferred = {};
+        executionDeferred.promise = new Promise((resolve, reject) => { executionDeferred.resolve = resolve; executionDeferred.reject = reject; });
+        const call = client.callTool({ name: 'run_cells', arguments: {
             notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], wait: false
         } });
+        const res = await Promise.race([call, new Promise((_, reject) => setTimeout(() => reject(new Error('wait=false blocked on command promise')), 250))]);
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /Queued 1 cell/);
+        assert.match(res.content[0].text, /Dispatched 1 cell/);
+        assert.match(res.content[0].text, /Queue admission is unconfirmed/);
         assert.strictEqual(executionCalls.length, callsBefore + 1);
         assert.deepStrictEqual(executionCalls.at(-1).ranges, [{ start: 0, end: 1 }]);
         assert.strictEqual(executionCalls.at(-1).document.toString(), 'file:///C:/nb.ipynb');
+        executionDeferred.resolve();
+        executionMode = 'complete';
     });
 
     await check('run_cells targets the requested notebook and preserves requested order', async () => {
@@ -339,10 +373,15 @@ async function main() {
     });
 
     await check('run_cells timeout reports a live execution without failing', async () => {
-        executionMode = 'hang';
+        executionMode = 'deferred-hang';
+        executionDeferred = {};
+        executionDeferred.promise = new Promise((resolve) => { executionDeferred.resolve = resolve; });
+        const started = Date.now();
         const res = await client.callTool({ name: 'run_cells', arguments: {
             notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 5
         } });
+        assert.ok(Date.now() - started < 1000, 'timeout must not await the command promise');
+        executionDeferred.resolve();
         executionMode = 'complete';
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(res.content[0].text, /not observed to start/);
@@ -355,6 +394,47 @@ async function main() {
         executionMode = 'complete';
         assert.ok(!observed.isError, JSON.stringify(observed));
         assert.match(observed.content[0].text, /execution observed but did not complete/);
+    });
+
+    await check('run_cells observes completion while command promise remains pending', async () => {
+        executionMode = 'deferred-complete';
+        executionDeferred = {};
+        executionDeferred.promise = new Promise((resolve) => { executionDeferred.resolve = resolve; });
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 500 } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /success/);
+        executionDeferred.resolve();
+        executionMode = 'complete';
+    });
+
+    await check('run_cells stops ordered dispatch after a completed cell error', async () => {
+        executionMode = 'error';
+        const before = executionCalls.length;
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], timeoutMs: 500 } });
+        executionMode = 'complete';
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.match(res.content[0].text, /\[cell 0\] error/);
+        assert.strictEqual(executionCalls.length, before + 1, 'later cells must not dispatch after a completed error');
+        assert.deepStrictEqual(executionCalls.at(-1).ranges, [{ start: 0, end: 1 }]);
+    });
+
+    await check('run_cells reports immediate command rejection and consumes detached rejection', async () => {
+        executionMode = 'reject';
+        const failed = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 500 } });
+        assert.ok(failed.isError);
+        const unhandled = [];
+        const listener = (error) => unhandled.push(error);
+        process.on('unhandledRejection', listener);
+        executionMode = 'deferred-hang';
+        executionDeferred = {};
+        executionDeferred.promise = new Promise((resolve, reject) => { executionDeferred.resolve = resolve; executionDeferred.reject = reject; });
+        const detached = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], wait: false } });
+        assert.ok(!detached.isError, JSON.stringify(detached));
+        executionDeferred.reject(new Error('late rejection'));
+        await new Promise((resolve) => setImmediate(resolve));
+        process.off('unhandledRejection', listener);
+        executionMode = 'complete';
+        assert.deepStrictEqual(unhandled, []);
     });
 
     // 4. Cell-id anchors resolve in read_cells.

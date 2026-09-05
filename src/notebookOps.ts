@@ -260,9 +260,11 @@ export function resolveInsertionIndex(nb: vscode.NotebookDocument, cellId: strin
 
 function executionState(cell: vscode.NotebookCell): string {
     if (cell.kind !== vscode.NotebookCellKind.Code) return 'n/a';
-    const success = cell.executionSummary?.success;
+    const summary = cell.executionSummary;
+    const success = summary?.success;
     if (success === true) return 'success';
     if (success === false) return 'error';
+    if (cell.outputs.length > 0 || summary?.executionOrder !== undefined) return 'unknown';
     return 'not-run';
 }
 
@@ -850,7 +852,7 @@ function isFreshExecution(cell: vscode.NotebookCell, baseline: { order?: number;
 
 /** Wait until a cell completes. A timeout is a non-error because the kernel may still be running. */
 async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, baseline: { order?: number; startTime?: number; endTime?: number; signature: string; hadSummary: boolean }, requestedAt: number, timeoutMs: number): Promise<{ cell?: vscode.NotebookCell; observed: boolean }> {
-    const deadline = Date.now() + (timeoutMs > 0 ? timeoutMs : 24 * 60 * 60 * 1000);
+    const deadline = requestedAt + (timeoutMs > 0 ? timeoutMs : 24 * 60 * 60 * 1000);
     let observed = false;
     while (Date.now() < deadline) {
         const cell = notebook.cellAt(index);
@@ -881,8 +883,6 @@ async function revealNotebookForExecution(nb: vscode.NotebookDocument): Promise<
  * Run several cells in a notebook, in order, waiting for each to complete and returning
  * its outputs (success/error + parsed output items). Adopted from the pattern used by
  * vscode-runtime-notebook-mcp: poll executionSummary until the run produces a fresh result.
- * @param kernel legacy optional label/id hint, selected best-effort for compatibility.
- * Use select_kernel before run_cells for exact, fail-closed selection.
  */
 export async function runNotebookCells(filePath: string, cellIds: Array<string | number>, options: RunCellsOptions = {}): Promise<string> {
     if (cellIds.length === 0) {
@@ -897,8 +897,6 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     }
     await saveDirtyNotebook(filePath);
 
-    // Preserve the pre-v0.2.2 best-effort kernel hint. Exact fail-closed selection is
-    // available through select_kernel and must be performed as a separate call.
     const indices = cellIds.map((c) => resolveCellIndex(nb, c));
     for (const idx of indices) {
         if (nb.cellAt(idx).kind !== vscode.NotebookCellKind.Code) {
@@ -909,22 +907,33 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     await revealNotebookForExecution(nb);
 
     if (options.wait === false) {
-        await vscode.commands.executeCommand('notebook.cell.execute', {
+        const dispatch = vscode.commands.executeCommand('notebook.cell.execute', {
             document: nb.uri,
             ranges: indices.map((idx) => ({ start: idx, end: idx + 1 }))
         });
-        return `Queued ${indices.length} cell(s) in ${nb.uri.toString()}: ${indices.join(', ')}. Use inspect_notebooks or read_cell_outputs to inspect progress.`;
+        void Promise.resolve(dispatch).catch(() => undefined);
+        return `Dispatched ${indices.length} cell(s) in ${nb.uri.toString()}: ${indices.join(', ')}. Queue admission is unconfirmed; use inspect_notebooks or read_cell_outputs to inspect progress.`;
     }
 
     const results: string[] = [];
     for (const idx of indices) {
         const baseline = executionBaseline(nb.cellAt(idx));
         const requestedAt = Date.now();
-        await vscode.commands.executeCommand('notebook.cell.execute', {
+        const command = Promise.resolve(vscode.commands.executeCommand('notebook.cell.execute', {
             document: nb.uri,
             ranges: [{ start: idx, end: idx + 1 }]
-        });
-        const observation = await waitForCellExecution(nb, idx, baseline, requestedAt, options.timeoutMs ?? 60_000);
+        }));
+        const commandOutcome = command.then(
+            () => ({ kind: 'resolved' as const }),
+            (error: unknown) => ({ kind: 'rejected' as const, error })
+        );
+        const observationPromise = waitForCellExecution(nb, idx, baseline, requestedAt, options.timeoutMs ?? 60_000);
+        const first = await Promise.race([
+            commandOutcome,
+            observationPromise.then((observation) => ({ kind: 'observed' as const, observation }))
+        ]);
+        if (first.kind === 'rejected') throw first.error;
+        const observation = first.kind === 'observed' ? first.observation : await observationPromise;
         if (!observation.cell) {
             results.push(observation.observed
                 ? `[cell ${idx}] execution observed but did not complete within ${options.timeoutMs ?? 60_000} ms. Execution was not interrupted.`
@@ -938,6 +947,7 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
             `[cell ${idx}] ${status}${cell.executionSummary?.executionOrder !== undefined ? ` (execution #${cell.executionSummary.executionOrder})` : ''}\n` +
             output.trimStart()
         );
+        if (status === 'error') break;
     }
     // Do not trust isDirty here. Some remote providers update outputs and execution
     // summaries in the live notebook model without marking the document dirty.
