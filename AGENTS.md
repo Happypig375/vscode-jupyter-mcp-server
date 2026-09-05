@@ -8,7 +8,7 @@
 
 ## Authoritative 0.3.0 contract
 
-Existing-notebook tools use `notebookRef` for one target and `notebookRefs` for multiple targets. A ref is a URI or a window-qualified `notebookId` from `list_notebooks`. `open_notebooks` accepts actual file URIs in `uris` and an optional `windowId`. `create_notebook` accepts `title`.
+Existing-notebook tools use `notebookRef` for one target and `notebookRefs` for multiple targets. A ref is a direct URI or a short opaque `nb_` handle from `list_notebooks`; handles resolve only against currently open notebooks. `list_notebooks` returns grouped connected windows, including empty groups. `open_notebooks` accepts actual file URIs in `uris` and an optional `windowId`. `create_notebook` accepts `title`.
 
 Tool schemas are strict. Unknown or obsolete keys fail validation. `list_kernels` is read-only; provider setup is explicit through `configure_kernel`; `select_kernel` accepts only an exact listed id. `run_cells` has no kernel hint. User supplied runtime selection takes precedence over defaults.
 

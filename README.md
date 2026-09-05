@@ -34,18 +34,18 @@ The VS Code Marketplace also lists generic "VS Code as an MCP server" extensions
 
 ## Tools
 
-Batch-oriented tools accept arrays and are grouped by owning window. Existing-notebook tools use `notebookRef` or `notebookRefs`, each accepting a URI or a window-qualified `notebookId` from `list_notebooks`. `open_notebooks` takes file URIs in `uris` plus an optional `windowId`; `create_notebook` takes `title`.
+Batch-oriented tools accept arrays and are grouped by owning window. Existing-notebook tools use `notebookRef` or `notebookRefs`, each accepting a URI or a short opaque `notebookRef` from `list_notebooks`. `open_notebooks` takes file URIs in `uris` plus an optional `windowId`; `create_notebook` takes `title`.
 
 | Tool | Category | Description |
 |---|---|---|
 | `create_notebook` | Create | Create a new notebook (file in a workspace, or **untitled in an empty window**) and open it |
-| `list_notebooks` | Read | List notebooks across connected windows with `uri`, `windowId`, `windowLabel`, and routable `notebookId` |
+| `list_notebooks` | Read | List grouped connected windows with `windowId`, `windowLabel`, and notebooks containing `uri` plus routable `notebookRef` |
 | `read_notebook` | Read | **Whole-notebook read** in one call: cell index, stable `cell_id` anchor, kind, language, source, execution state, optional outputs |
 | `inspect_notebooks` | Read | Inspect cell metadata for one or more notebooks without returning source or output content |
 | `read_cells` | Read | Read cell source by index or cell anchor, with optional 1-based inclusive `startLine`/`endLine` and `maxSourceChars` |
 | `read_cell_outputs` | Read | Read bounded `summary`, preferred-`text`, or all-text `full` output; binary images are summarized, never decoded |
 | `search_cells` | Read | **Search** a notebook's cells (source + output text) for a query, with per-cell match locations; case-insensitive by default |
-| `get_kernel_info` | Read | Get active kernel label or language/status (best-effort via the Jupyter extension) |
+| `get_kernel_info` | Read | Get observed active kernel runtime fields via the public Jupyter API; identity and file-transfer availability are reported explicitly when unavailable or unchecked |
 | `list_kernels` | Read | List exact available kernel/controller ids; never configures providers |
 | `configure_kernel` | Manage | Explicitly invoke provider configuration, which may require normal UI |
 | `edit_cells` | Write | Insert/edit/delete cells in order, plus unique exact-text `replace`; preserves existing metadata; optional explicit re-run (off by default) |
@@ -80,7 +80,7 @@ Adjacent Google projects take different boundaries: [Colab MCP](https://github.c
 
 ## Recommended flow
 
-1. `list_notebooks` → pick the notebook URI; use `notebookId` if that URI appears in multiple windows
+1. `list_notebooks` → pick the notebook URI; use its `notebookRef` if that URI appears in multiple windows
 2. `read_notebook` (or `inspect_notebooks`) → see the notebook's structure/state
 3. `edit_cells` → write/change cells
 4. `list_kernels` → enumerate exact ids read-only
@@ -108,7 +108,7 @@ All VS Code windows on the machine share one externally visible HTTP URL. The fi
 
 When the broker window closes, the surviving peers race safely for the same configured port. One becomes the replacement broker and the others reconnect. The external URL remains unchanged, although an MCP client with an existing connection may need to reconnect after the listener changes.
 
-If the same notebook URI is open in two windows, `list_notebooks` returns two entries with distinct `notebookId` values. Passing the plain URI produces an explicit ambiguity error; passing a `notebookId` routes to the selected window. Multi-notebook operations are grouped into one internal batch per owning window.
+If the same notebook URI is open in two windows, `list_notebooks` returns two grouped entries with distinct short opaque `notebookRef` values. Passing the plain URI produces an explicit ambiguity error; passing a listed ref routes to the selected window. Refs resolve only against currently open notebooks. Multi-notebook operations are grouped into one internal batch per owning window.
 
 ## Install & run
 
@@ -133,7 +133,7 @@ If the same notebook URI is open in two windows, `list_notebooks` returns two en
 
 ## Testing
 
-`npm test` runs two deterministic MCP integration suites plus a dedicated multi-window broker suite. The MCP suites exercise the exact public tool surface over real Streamable HTTP connections. The broker suite starts three independent window coordinators and verifies aggregation, duplicate-file conflicts, `notebookId` routing, per-window batching, and takeover of the same external port after the owner stops.
+`npm test` runs two deterministic MCP integration suites plus a dedicated multi-window broker suite. The MCP suites exercise the exact public tool surface over real Streamable HTTP connections. The broker suite starts independent window coordinators and verifies grouped aggregation including empty windows, duplicate-file conflicts, opaque `notebookRef` routing, per-window batching, stale/disconnected rejection, and takeover of the same external port after the owner stops.
 
 `npm run coverage` additionally measures coverage with **c8** (sourcemap-remapped to `src/**`, merged across both suites) and enforces thresholds (statements/lines ≥75%, branches ≥55%, functions ≥85%) via `src/test/checkCoverage.js`. Both are wired into **GitHub Actions CI** (`.github/workflows/ci.yml`, matrix: ubuntu/windows/macos).
 

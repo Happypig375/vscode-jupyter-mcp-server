@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as http from 'http';
 import { BrokerCoordinator } from '../broker';
 import { LocalOperation } from '../localOperations';
+import { notebookRefFor } from '../notebookRefs';
 
 interface Invocation {
     operation: LocalOperation;
@@ -35,7 +36,8 @@ async function main(): Promise<void> {
     const notebooks = new Map<string, string[]>([
         ['window-a', [shared, 'file:///C:/a.ipynb']],
         ['window-b', [shared, 'file:///C:/b.ipynb']],
-        ['window-c', ['file:///C:/c.ipynb']]
+        ['window-c', ['file:///C:/c.ipynb']],
+        ['window-d', []]
     ]);
     const invocations = new Map<string, Invocation[]>([...notebooks.keys()].map((id) => [id, []]));
 
@@ -65,20 +67,24 @@ async function main(): Promise<void> {
 
         const originalBroker = coordinators.find((coordinator) => coordinator.isBroker)!;
         assert.strictEqual(originalBroker.url, `http://127.0.0.1:${port}/mcp`);
-        await waitFor(async () => (await originalBroker.listNotebooks()).length === 5, 'Broker did not aggregate all windows.');
+        await waitFor(async () => (await originalBroker.listNotebooks()).reduce((n, group) => n + group.notebooks.length, 0) === 5, 'Broker did not aggregate all windows.');
 
         const listed = await originalBroker.listNotebooks();
-        const duplicates = listed.filter((notebook) => notebook.uri === shared);
+        assert.strictEqual(listed.length, 4);
+        assert.ok(listed.some((group) => group.windowId === 'window-d' && group.notebooks.length === 0));
+        const duplicates = listed.flatMap((group) => group.notebooks.map((notebook) => ({ ...notebook, windowId: group.windowId }))).filter((notebook) => notebook.uri === shared);
         assert.strictEqual(duplicates.length, 2);
-        assert.notStrictEqual(duplicates[0].notebookId, duplicates[1].notebookId);
+        assert.match(duplicates[0].notebookRef, /^nb_[0-9a-f]{24}$/);
+        assert.notStrictEqual(duplicates[0].notebookRef, duplicates[1].notebookRef);
+        assert.strictEqual(duplicates.find((notebook) => notebook.windowId === 'window-a')!.notebookRef, notebookRefFor('window-a', shared));
 
         await assert.rejects(
             () => originalBroker.invokeNotebook('read_notebook', shared, {}),
-            /open in 2 VS Code windows.*notebookId/s
+            /open in 2 VS Code windows.*notebookRef/s
         );
         const routed = duplicates.find((notebook) => notebook.windowId === 'window-b')!;
         assert.strictEqual(
-            await originalBroker.invokeNotebook('read_notebook', routed.notebookId, {}),
+            await originalBroker.invokeNotebook('read_notebook', routed.notebookRef, {}),
             'window-b:read_notebook'
         );
         assert.strictEqual(invocations.get('window-b')!.at(-1)!.args.notebookRef, shared);
@@ -87,7 +93,7 @@ async function main(): Promise<void> {
         await originalBroker.invokeNotebooks('save_notebooks', [
             'file:///C:/a.ipynb',
             'file:///C:/b.ipynb',
-            routed.notebookId
+            routed.notebookRef
         ]);
         assert.deepStrictEqual(invocations.get('window-a'), [{
             operation: 'save_notebooks',
@@ -98,9 +104,19 @@ async function main(): Promise<void> {
             args: { notebookRefs: ['file:///C:/b.ipynb', shared] }
         }]);
 
+        await assert.rejects(() => originalBroker.invokeNotebook('read_notebook', 'nb_000000000000000000000000', {}), /unknown, stale, or collides/);
+        await assert.rejects(() => originalBroker.invokeNotebook('read_notebook', 'nb_bad', {}), /Malformed notebook reference/);
+        await coordinators.find((coordinator) => coordinator.windowId === 'window-b')!.stop();
+        await waitFor(async () => (await originalBroker.listNotebooks()).every((group) => group.windowId !== 'window-b'), 'Disconnected window was not pruned.');
+        await assert.rejects(() => originalBroker.invokeNotebook('read_notebook', routed.notebookRef, {}), /unknown, stale, or collides|disconnected/);
+
         const originalOwnerId = originalBroker.windowId;
         await originalBroker.stop();
-        const survivors = coordinators.filter((coordinator) => coordinator !== originalBroker);
+        const survivors = coordinators.filter((coordinator) => coordinator !== originalBroker && coordinator.windowId !== 'window-b');
+        const expectedSurvivingNotebookCount = survivors.reduce(
+            (count, coordinator) => count + notebooks.get(coordinator.windowId)!.length,
+            0
+        );
         await waitFor(
             () => survivors.filter((coordinator) => coordinator.isBroker).length === 1 && survivors.every((coordinator) => coordinator.role === 'broker' || coordinator.role === 'peer'),
             'A surviving window did not take over the broker port.'
@@ -108,12 +124,15 @@ async function main(): Promise<void> {
         const replacement = survivors.find((coordinator) => coordinator.isBroker)!;
         assert.strictEqual(replacement.url, `http://127.0.0.1:${port}/mcp`);
         assert.notStrictEqual(replacement.windowId, originalOwnerId);
-        await waitFor(async () => (await replacement.listNotebooks()).length === 3, 'Replacement broker did not aggregate surviving windows.');
+        await waitFor(
+            async () => (await replacement.listNotebooks()).reduce((n, group) => n + group.notebooks.length, 0) === expectedSurvivingNotebookCount,
+            'Replacement broker did not aggregate surviving windows.'
+        );
 
         const health = await fetch(`http://127.0.0.1:${port}/broker/health`).then((response) => response.json()) as { ownerId: string };
         assert.strictEqual(health.ownerId, replacement.windowId);
         console.log('  ✓ broker aggregates windows and reports duplicate notebook conflicts');
-        console.log('  ✓ notebookId routes to the selected window and batches multi-window operations');
+        console.log('  ✓ notebookRef routes to the selected window and batches multi-window operations');
         console.log('  ✓ a surviving window takes over the same external port after broker shutdown');
     } finally {
         await Promise.all(coordinators.map((coordinator) => coordinator.stop()));

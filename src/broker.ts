@@ -1,18 +1,14 @@
 import * as crypto from 'crypto';
 import * as http from 'http';
 import { LocalOperation } from './localOperations';
+import { isNotebookRef, ListedNotebookGroup, notebookRefFor } from './notebookRefs';
 
 const BROKER_PROTOCOL = 'jupyter-mcp-window-broker-v1';
 const MAX_CONTROL_BODY = 5 * 1024 * 1024;
 
 export type BrokerRole = 'broker' | 'peer' | 'blocked' | 'stopped';
 
-export interface RoutedNotebook {
-    notebookId: string;
-    uri: string;
-    windowId: string;
-    windowLabel: string;
-}
+export type RoutedNotebook = ListedNotebookGroup;
 
 interface WindowRegistration {
     id: string;
@@ -153,18 +149,14 @@ export class BrokerCoordinator implements NotebookRouter {
                 const uris = registration.id === this.windowId
                     ? await this.options.listLocalNotebooks()
                     : await this.getRemoteNotebooks(registration);
-                return uris.map((uri) => ({
-                    notebookId: `${registration.id}::${uri}`,
-                    uri,
-                    windowId: registration.id,
-                    windowLabel: registration.label
-                }));
+                return { windowId: registration.id, windowLabel: registration.label,
+                    notebooks: uris.map((uri) => ({ notebookRef: notebookRefFor(registration.id, uri), uri })) };
             } catch (error) {
                 this.options.log?.(`peer ${registration.label} unavailable: ${String(error)}`);
-                return [];
+                return { windowId: registration.id, windowLabel: registration.label, notebooks: [] };
             }
         }));
-        return groups.flat().sort((a, b) => a.windowLabel.localeCompare(b.windowLabel) || a.uri.localeCompare(b.uri));
+        return groups.sort((a, b) => a.windowLabel.localeCompare(b.windowLabel) || a.windowId.localeCompare(b.windowId));
     }
 
     async invokeNotebook(operation: LocalOperation, notebookRef: string, args: Record<string, unknown>): Promise<string> {
@@ -370,23 +362,25 @@ export class BrokerCoordinator implements NotebookRouter {
 
     private async resolveNotebook(notebookRef: string): Promise<{ registration: WindowRegistration; uri: string }> {
         this.prunePeers();
-        const separator = notebookRef.indexOf('::');
-        if (separator > 0) {
-            const id = notebookRef.slice(0, separator);
-            const registration = this.peers.get(id);
-            if (!registration) throw new Error(`The VS Code window in notebookId '${notebookRef}' is no longer connected.`);
-            return { registration, uri: notebookRef.slice(separator + 2) };
+        const groups = await this.listNotebooks();
+        const entries = groups.flatMap((group) => group.notebooks.map((notebook) => ({ ...notebook, group })));
+        if (isNotebookRef(notebookRef)) {
+            const matches = entries.filter((entry) => entry.notebookRef === notebookRef);
+            if (matches.length !== 1) throw new Error(`Notebook reference '${notebookRef}' is unknown, stale, or collides with another open notebook.`);
+            const registration = this.peers.get(matches[0].group.windowId);
+            if (!registration) throw new Error(`VS Code window '${matches[0].group.windowId}' disconnected while resolving notebook reference.`);
+            return { registration, uri: matches[0].uri };
         }
-
-        const matches = (await this.listNotebooks()).filter((notebook) => notebook.uri.toLowerCase() === notebookRef.toLowerCase());
+        if (notebookRef.startsWith('nb_')) throw new Error(`Malformed notebook reference '${notebookRef}'. Use a notebookRef from list_notebooks.`);
+        const matches = entries.filter((entry) => entry.uri.toLowerCase() === notebookRef.toLowerCase());
         if (matches.length === 0) throw new Error(`No connected VS Code window has notebook '${notebookRef}' open. Use list_notebooks to list them.`);
         if (matches.length > 1) {
-            const choices = matches.map((match) => `${match.windowLabel}: ${match.notebookId}`).join('\n');
-            throw new Error(`Notebook '${notebookRef}' is open in ${matches.length} VS Code windows. Pass one of these notebookId values as notebookRef:\n${choices}`);
+            const choices = matches.map((match) => `${match.group.windowLabel}: ${match.notebookRef}`).join('\n');
+            throw new Error(`Notebook '${notebookRef}' is open in ${matches.length} VS Code windows. Pass one of these notebookRef values as notebookRef:\n${choices}`);
         }
         const match = matches[0];
-        const registration = this.peers.get(match.windowId);
-        if (!registration) throw new Error(`VS Code window '${match.windowId}' disconnected while routing the request.`);
+        const registration = this.peers.get(match.group.windowId);
+        if (!registration) throw new Error(`VS Code window '${match.group.windowId}' disconnected while routing the request.`);
         return { registration, uri: match.uri };
     }
 }

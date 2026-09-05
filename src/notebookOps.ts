@@ -460,9 +460,8 @@ export async function interruptKernels(filePaths: string[]): Promise<string> {
 }
 
 /**
- * Best-effort kernel info for a notebook: resolves the active kernel label via the
- * Jupyter extension's kernel API if available; falls back to 'unknown' so the tool
- * stays deterministic when the Jupyter extension is absent.
+ * Kernel info exposed by the public Jupyter API. Identity and file-transfer access
+ * are reported explicitly when that API does not expose or check them.
  */
 export async function getKernelInfo(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
@@ -471,26 +470,41 @@ export async function getKernelInfo(filePath: string): Promise<string> {
     }
     type ActiveKernel = { label?: string; language?: string; status?: string };
     let kernel: ActiveKernel | undefined;
-    try {
-        type JupyterApi = {
-            /** Compatibility with older Jupyter extension exports. */
-            getKernel?: (u: vscode.Uri) => ActiveKernel | undefined;
-            kernels?: { getKernel(u: vscode.Uri): Thenable<ActiveKernel | undefined> };
-        };
-        const api = await vscode.extensions.getExtension<JupyterApi>('ms-toolsai.jupyter')?.activate();
-        kernel = api?.kernels
-            ? await api.kernels.getKernel(nb.uri)
-            : api?.getKernel?.(nb.uri);
-    } catch {
-        // best-effort
+    let runtimeReason: string | undefined;
+    type JupyterApi = {
+        /** Compatibility with older Jupyter extension exports. */
+        getKernel?: (u: vscode.Uri) => ActiveKernel | undefined;
+        kernels?: { getKernel(u: vscode.Uri): Thenable<ActiveKernel | undefined> };
+    };
+    const extension = vscode.extensions.getExtension<JupyterApi>('ms-toolsai.jupyter');
+    if (!extension) {
+        runtimeReason = 'The Jupyter extension is unavailable through the public VS Code API.';
+    } else {
+        let api: JupyterApi | undefined;
+        try { api = await extension.activate(); }
+        catch { runtimeReason = 'Jupyter extension activation failed; runtime state could not be observed.'; }
+        if (!runtimeReason && (!api?.kernels?.getKernel && !api?.getKernel)) {
+            runtimeReason = 'The public Jupyter API does not expose active-kernel lookup.';
+        } else if (!runtimeReason) {
+            try {
+                kernel = api!.kernels ? await api!.kernels.getKernel(nb.uri) : api!.getKernel!(nb.uri);
+            } catch { runtimeReason = 'Jupyter active-kernel lookup failed; runtime state could not be observed.'; }
+        }
     }
+    const hasActiveKernel = Boolean(kernel);
     return JSON.stringify({
         notebook: nb.uri.toString(),
-        kernel: { label: kernel?.label ?? 'unknown', language: kernel?.language ?? 'unknown', status: kernel?.status ?? 'unknown' },
+        kernel: {
+            label: kernel?.label ?? null,
+            language: kernel?.language ?? 'unknown',
+            status: kernel?.status ?? 'unknown',
+            runtime: hasActiveKernel ? 'active' : 'unknown',
+            runtimeReason: hasActiveKernel ? undefined : (runtimeReason ?? 'No active kernel was returned by the public Jupyter API.')
+        },
         capabilities: {
-            selectedController: 'unknown',
-            provider: 'unknown',
-            kernelFileTransfer: { available: 'unknown', scope: 'active idle Python kernel filesystem; public executeCode API access required' }
+            selectedController: { availability: 'not-exposed', reason: 'The public Jupyter API does not expose the selected controller identity.' },
+            provider: { availability: 'not-exposed', reason: 'The public Jupyter API does not expose the provider identity.' },
+            kernelFileTransfer: { availability: 'not-checked', reason: 'File-transfer access was not checked; this tool does not execute code or start/select a kernel.' }
         }
     }, null, 2);
 }

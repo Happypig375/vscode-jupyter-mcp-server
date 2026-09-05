@@ -2,6 +2,7 @@
 
 ## 0.3.0
 
+- Breaking: `list_notebooks` now returns grouped connected windows (including empty windows), with each notebook represented once by its URI and a short opaque deterministic `nb_...` `notebookRef`; the legacy composite `windowId::uri` `notebookId` contract is removed.
 - Renamed public notebook targets to `notebookRef`/`notebookRefs`; `open_notebooks` now accepts `uris` and `windowId`.
 - Added explicit `configure_kernel`; kernel listing is read-only and selection requires an exact id.
 - Removed unsafe implicit kernel/start parameters and made tool validation reject unknown keys.

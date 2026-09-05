@@ -43,8 +43,9 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         'list_notebooks',
         {
             description:
-                'List notebooks across all connected VS Code windows. Returns uri, windowId, windowLabel, and notebookId. ' +
-                'Use notebookId as notebookRef when the same URI is open in more than one window.',
+                'List notebooks grouped by connected VS Code window. Each group includes windowId and windowLabel once, ' +
+                'and notebooks containing uri plus a short opaque notebookRef. Empty connected windows are included. ' +
+                'Use notebookRef for stable routing when the same URI is open in more than one window.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {} })
         },
         async () => {
@@ -61,7 +62,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
                 'use read_cells for source and read_cell_outputs for outputs.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
-                properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },
+                properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookRefs from list_notebooks.' } },
                 required: ['notebookRefs']
             })
         },
@@ -81,7 +82,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices to read (omit for all).' },
                     startLine: { type: 'number', description: 'Optional 1-based inclusive source start line per selected cell.' },
                     endLine: { type: 'number', description: 'Optional 1-based inclusive source end line per selected cell.' },
@@ -107,7 +108,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or ids) to clear outputs from.' }
                 },
                 required: ['notebookRef', 'cellIds']
@@ -126,12 +127,12 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         'get_kernel_info',
         {
             description:
-                'Get active kernel information for a notebook (best-effort via the Jupyter extension; "unknown" if unavailable). ' +
+                'Get active kernel runtime information via the public Jupyter API; unavailable identity and unchecked file-transfer access are reported explicitly. ' +
                 'Use list_kernels for exact ids accepted by select_kernel; run_cells has no kernel hint.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' }
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' }
                 },
                 required: ['notebookRef']
             })
@@ -155,7 +156,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: {
-                        notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                        notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
 
                     },
                     required: ['notebookRef']
@@ -172,7 +173,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         server.registerTool('configure_kernel', {
             description: 'Run the explicit Jupyter provider configuration workflow for a notebook. This may show provider UI and does not select or start a kernel.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {
-                notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' }
+                notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' }
             }, required: ['notebookRef'] })
         }, async (args) => {
             const a = (args ?? {}) as { notebookRef?: string };
@@ -190,7 +191,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: {
-                        notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                        notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                         kernelId: { type: 'string', description: 'Exact id returned by list_kernels.' }
                     },
                     required: ['notebookRef', 'kernelId']
@@ -216,7 +217,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Cell indices/ids to read output from.' },
                     outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail: summary, preferred text (default), or all text representations.' },
                     maxOutputChars: { type: 'number', description: 'Maximum output characters per cell (default 12000; clamped to 1000..100000).' }
@@ -242,7 +243,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     query: { type: 'string', description: 'Text to search for (source or output).' },
                     caseSensitive: { type: 'boolean', description: 'Match case (default false).' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Restrict search to these cell indices/ids (default: all).' }
@@ -268,7 +269,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Optional cell indices/ids to read (default: all).' },
                     includeOutputs: { type: 'boolean', description: 'Include compact cell outputs (default false).' },
                     outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail when included: summary, preferred text (default), or all text representations.' },
@@ -293,7 +294,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     format: { type: 'string', enum: ['markdown', 'python', 'html'], description: 'Export format.' }
                 },
 required: ['notebookRef', 'format']
@@ -320,7 +321,7 @@ required: ['notebookRef', 'format']
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     edits: {
                         type: 'array',
                         items: {
@@ -368,7 +369,7 @@ required: ['notebookRef', 'edits']
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: {
-                        notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                        notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                         cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or cell ids) to run.' },
                         timeoutMs: { type: 'number', description: 'Max ms to wait per cell (default 60000); does not interrupt on timeout.' },
                         wait: { type: 'boolean', description: 'Wait for each result (default true). False dispatches all selected cells immediately without confirming queue admission.' },
@@ -396,7 +397,7 @@ required: ['notebookRef', 'edits']
                 description: 'Restart the kernel of one or more open notebooks. Provide an array of notebook URIs. Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
-                    properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },
+                    properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookRefs from list_notebooks.' } },
                 required: ['notebookRefs']
                 })
             },
@@ -415,7 +416,7 @@ const a = (args ?? {}) as { notebookRefs?: string[] };
                 description: 'Interrupt (stop) the running execution of one or more open notebooks. Provide an array of notebook URIs. Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
-                    properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },
+                    properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookRefs from list_notebooks.' } },
                 required: ['notebookRefs']
                 })
             },
@@ -438,7 +439,7 @@ const a = (args ?? {}) as { notebookRefs?: string[] };
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookId from list_notebooks.' },
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices to move.' },
                     toIndex: { type: 'number', description: 'Index where the first moved cell should land.' }
                 },
@@ -486,10 +487,10 @@ if (!a.notebookRef) throw new Error('notebookRef is required');
         {
             description:
                 'Force-save one or more open file-backed notebooks, including remote-kernel outputs and execution state ' +
-                'when VS Code does not mark the notebook dirty. Provide notebook URIs or notebookIds from list_notebooks.',
+                'when VS Code does not mark the notebook dirty. Provide notebook URIs or notebookRefs from list_notebooks.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
-                properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookIds from list_notebooks.' } },
+                properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookRefs from list_notebooks.' } },
 required: ['notebookRefs']
             })
         },
@@ -503,7 +504,7 @@ const a = (args ?? {}) as { notebookRefs?: string[] };
 
     if (hasJupyter) {
     const fileSchema = z.object({
-        notebookRef: z.string().describe('Open notebook URI or notebookId from list_notebooks.'),
+        notebookRef: z.string().describe('Open notebook URI or notebookRef from list_notebooks.'),
         localPath: z.string().describe('Explicit file path on the VS Code host.'),
         kernelPath: z.string().describe('Explicit absolute path in the current active Python kernel filesystem.'),
         overwrite: z.boolean().optional().describe('Replace an existing destination (default false).'),

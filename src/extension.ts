@@ -8,6 +8,7 @@ import { BrokerCoordinator, BrokerRole, NotebookRouter } from './broker';
 import { executeLocalOperation } from './localOperations';
 import { listOpenNotebooks } from './notebookOps';
 import { registerNotebookTools } from './server';
+import { isNotebookRef, notebookRefFor } from './notebookRefs';
 
 const EXTENSION_VERSION = '0.3.0';
 let coordinator: BrokerCoordinator | undefined;
@@ -31,19 +32,15 @@ function localRouter(): NotebookRouter {
         windowId,
         windowLabel: windowLabelValue,
         async listNotebooks() {
-            return listOpenNotebooks().map((uri) => ({
-                notebookId: `${windowId}::${uri}`,
-                uri,
-                windowId,
-                windowLabel: windowLabelValue
-            }));
+            return [{ windowId, windowLabel: windowLabelValue,
+                notebooks: listOpenNotebooks().map((uri) => ({ notebookRef: notebookRefFor(windowId, uri), uri })) }];
         },
         async invokeNotebook(operation, notebookRef, args) {
-            const uri = notebookRef.startsWith(`${windowId}::`) ? notebookRef.slice(windowId.length + 2) : notebookRef;
+            const uri = await resolveLocalNotebook(notebookRef);
             return executeLocalOperation(operation, { ...args, notebookRef: uri });
         },
         async invokeNotebooks(operation, notebookRefs, args = {}) {
-            const refs = notebookRefs.map((ref) => ref.startsWith(`${windowId}::`) ? ref.slice(windowId.length + 2) : ref);
+            const refs = await Promise.all(notebookRefs.map((ref) => resolveLocalNotebook(ref)));
             return executeLocalOperation(operation, { ...args, notebookRefs: refs });
         },
         async invokeWindow(operation, args, targetWindowId = windowId) {
@@ -51,6 +48,19 @@ function localRouter(): NotebookRouter {
             return executeLocalOperation(operation, args);
         }
     };
+
+    async function resolveLocalNotebook(ref: string): Promise<string> {
+        const uris = listOpenNotebooks();
+        if (isNotebookRef(ref)) {
+            const matches = uris.filter((uri) => notebookRefFor(windowId, uri) === ref);
+            if (matches.length !== 1) throw new Error(`Notebook reference '${ref}' is unknown, stale, or malformed.`);
+            return matches[0];
+        }
+        if (ref.startsWith('nb_')) throw new Error(`Malformed notebook reference '${ref}'. Use a notebookRef from list_notebooks.`);
+        const matches = uris.filter((uri) => uri.toLowerCase() === ref.toLowerCase());
+        if (matches.length !== 1) throw new Error(`No connected VS Code window has notebook '${ref}' open.`);
+        return matches[0];
+    }
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {

@@ -197,10 +197,11 @@ async function main() {
     await check('list_notebooks lists the created notebook', async () => {
         const res = await client.callTool({ name: 'list_notebooks', arguments: {} });
         const parsed = JSON.parse(res.content[0].text);
-        assert.ok(parsed.some((n) => n.uri === createdUri), `not listed: ${res.content[0].text}`);
-        const listed = parsed.find((n) => n.uri === createdUri);
-        assert.match(listed.notebookId, new RegExp(`^${listed.windowId}::untitled:`));
-        assert.strictEqual(listed.windowLabel, 'Empty window');
+        assert.ok(parsed.some((group) => group.notebooks.some((n) => n.uri === createdUri)), `not listed: ${res.content[0].text}`);
+        const group = parsed.find((group) => group.notebooks.some((n) => n.uri === createdUri));
+        const listed = group.notebooks.find((n) => n.uri === createdUri);
+        assert.match(listed.notebookRef, /^nb_[0-9a-f]{24}$/);
+        assert.strictEqual(group.windowLabel, 'Empty window');
     });
 
     // 4. read_cells.
@@ -375,11 +376,11 @@ async function main() {
         const res = await client.callTool({ name: 'get_kernel_info', arguments: { notebookRef: createdUri } });
         assert.ok(!res.isError, JSON.stringify(res));
         const info = JSON.parse(res.content[0].text);
-        assert.strictEqual(info.kernel.label, 'unknown');
+        assert.strictEqual(info.kernel.label, null);
         assert.strictEqual(info.kernel.language, 'unknown');
         assert.strictEqual(info.kernel.status, 'unknown');
-        assert.strictEqual(info.capabilities.provider, 'unknown');
-        assert.strictEqual(info.capabilities.kernelFileTransfer.available, 'unknown');
+        assert.strictEqual(info.capabilities.provider.availability, 'not-exposed');
+        assert.strictEqual(info.capabilities.kernelFileTransfer.availability, 'not-checked');
     });
 
     await client.close();

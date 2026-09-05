@@ -23,6 +23,8 @@ const executionCalls = [];
 let saveCalls = 0;
 let executionMode = 'complete';
 let executionDeferred;
+let activeKernelAvailable = true;
+let kernelApiFailure;
 let exactSelectionAccepted = true;
 let rejectLegacyKernelHint = false;
 let configureAvailable = true;
@@ -109,7 +111,7 @@ const vscodeShim = {
         createStatusBarItem: () => statusBar,
         showNotebookDocument: async (doc) => ({ notebook: showNotebookMismatch ? openNotebooks[0] : doc })
     },
-    extensions: { getExtension: () => ({ id: 'ms-toolsai.jupyter', isActive: true, activate: async () => ({ getKernel: () => ({ label: 'Python 3.12.2' }) }) }), onDidChange: () => ({ dispose() {} }) },
+    extensions: { getExtension: () => ({ id: 'ms-toolsai.jupyter', isActive: true, activate: async () => { if (kernelApiFailure === 'activation') throw new Error('secret activation detail'); return { getKernel: () => { if (kernelApiFailure === 'query') throw new Error('secret query detail'); return activeKernelAvailable ? ({ label: 'Python 3.12.2', language: 'python', status: 'idle' }) : undefined; } }; } }), onDidChange: () => ({ dispose() {} }) },
     commands: {
         registerCommand: () => ({ dispose() {} }),
         executeCommand: async (cmd, uri, cellUris) => {
@@ -518,8 +520,36 @@ async function main() {
         assert.ok(!res.isError, JSON.stringify(res));
         const info = JSON.parse(res.content[0].text);
         assert.strictEqual(info.kernel.label, 'Python 3.12.2');
-        assert.strictEqual(info.capabilities.kernelFileTransfer.available, 'unknown');
+        assert.strictEqual(info.kernel.runtime, 'active');
+        assert.strictEqual(info.capabilities.selectedController.availability, 'not-exposed');
+        assert.strictEqual(info.capabilities.kernelFileTransfer.availability, 'not-checked');
     });
+
+    await check('get_kernel_info explains absent active kernel', async () => {
+        activeKernelAvailable = false;
+        try {
+            const res = await client.callTool({ name: 'get_kernel_info', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
+            assert.ok(!res.isError, JSON.stringify(res));
+            const info = JSON.parse(res.content[0].text);
+            assert.strictEqual(info.kernel.label, null);
+            assert.strictEqual(info.kernel.runtime, 'unknown');
+            assert.match(info.kernel.runtimeReason, /No active kernel/);
+            assert.strictEqual(info.capabilities.provider.availability, 'not-exposed');
+        } finally { activeKernelAvailable = true; }
+    });
+
+    for (const [failure, reason] of [['activation', /activation failed/], ['query', /lookup failed/]]) {
+        await check(`get_kernel_info sanitizes ${failure} failure`, async () => {
+            kernelApiFailure = failure;
+            try {
+                const res = await client.callTool({ name: 'get_kernel_info', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
+                const info = JSON.parse(res.content[0].text);
+                assert.strictEqual(info.kernel.runtime, 'unknown');
+                assert.match(info.kernel.runtimeReason, reason);
+                assert.doesNotMatch(res.content[0].text, /secret/);
+            } finally { kernelApiFailure = undefined; }
+        });
+    }
 
     await check('list_kernels initially returns only registered controllers', async () => {
         const configureCallsBefore = startedKernels.length;
