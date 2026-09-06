@@ -73,9 +73,9 @@ async function receipt(kernel: ActiveKernelLike, code: string, nonce: string, to
         return value as Record<string, unknown>;
     } catch { throw new Error('invalid receipt'); }
 }
-function validate(a: { notebookRef: string; localPath: string; kernelPath: string; maxBytes: number }): void {
-    if (!a.notebookRef || !a.localPath || !a.kernelPath) throw new Error('notebookRef, localPath, and kernelPath are required.');
-    if (!path.isAbsolute(a.localPath)) throw new Error('localPath must be an absolute path on the VS Code host.');
+function validate(a: { notebookRef: string; hostPath: string; kernelPath: string; maxBytes: number }): void {
+    if (!a.notebookRef || !a.hostPath || !a.kernelPath) throw new Error('notebookRef, hostPath, and kernelPath are required.');
+    if (!path.isAbsolute(a.hostPath)) throw new Error('hostPath must be an absolute path on the VS Code extension host.');
     if (!path.posix.isAbsolute(a.kernelPath.replace(/\\/g, '/'))) throw new Error('kernelPath must be an absolute path in the kernel filesystem.');
     if (!Number.isSafeInteger(a.maxBytes) || a.maxBytes <= 0) throw new Error('maxBytes must be a positive safe integer.');
 }
@@ -101,13 +101,13 @@ function exactNumber(value: unknown, expected?: number): number {
     return value as number;
 }
 
-export async function uploadFile(a: { notebookRef: string; localPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number }, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
+export async function uploadFile(a: { notebookRef: string; hostPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number }, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
     const maxBytes = a.maxBytes ?? DEFAULT_MAX_BYTES;
     validate({ ...a, maxBytes });
-    const localPath = path.resolve(a.localPath);
+    const hostPath = path.resolve(a.hostPath);
     const kernel = await kernelFor(a.notebookRef, deps);
     ensureNotCancelled(token);
-    const input = await deps.openRead(localPath);
+    const input = await deps.openRead(hostPath);
     const nonce = crypto.randomUUID();
     const temporaryPath = `${a.kernelPath}.jupyter-mcp-${nonce}.part`;
     let closed = false;
@@ -142,7 +142,7 @@ export async function uploadFile(a: { notebookRef: string; localPath: string; ke
         if (completed.kind !== 'done') throw new Error('invalid final');
         exactNumber(completed.bytes, bytes);
         if (completed.sha256 !== digest) throw new Error('invalid hash');
-        return JSON.stringify({ operation: 'upload_file', bytes, sha256: digest, localPath, kernelPath: a.kernelPath, verified: true });
+        return JSON.stringify({ operation: 'upload_file', bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
     } catch {
         if (!closed) await input.close().catch(() => undefined);
         try { await receipt(kernel, transferCode("try:\n os.unlink(a['tmp'])\nexcept FileNotFoundError:\n pass\nresult={'kind':'clean'}", { tmp: temporaryPath }, nonce), nonce, undefined); } catch { /* Cleanup is limited to this operation's random temporary path. */ }
@@ -151,14 +151,14 @@ export async function uploadFile(a: { notebookRef: string; localPath: string; ke
     }
 }
 
-export async function downloadFile(a: { notebookRef: string; localPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number }, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
+export async function downloadFile(a: { notebookRef: string; hostPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number }, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
     const maxBytes = a.maxBytes ?? DEFAULT_MAX_BYTES;
     validate({ ...a, maxBytes });
     const kernel = await kernelFor(a.notebookRef, deps);
     ensureNotCancelled(token);
-    const localPath = path.resolve(a.localPath);
+    const hostPath = path.resolve(a.hostPath);
     const nonce = crypto.randomUUID();
-    const temporaryPath = `${localPath}.jupyter-mcp-${nonce}.part`;
+    const temporaryPath = `${hostPath}.jupyter-mcp-${nonce}.part`;
     const output = await deps.openWrite(temporaryPath);
     let closed = false;
     let committed = false;
@@ -189,10 +189,10 @@ export async function downloadFile(a: { notebookRef: string; localPath: string; 
         if (completed.sha256 !== digest) throw new Error('invalid hash');
         await output.close(); closed = true; ensureNotCancelled(token);
         phase = 'promote destination';
-        if (a.overwrite) await deps.rename(temporaryPath, localPath);
-        else { await deps.link(temporaryPath, localPath); committed = true; await deps.unlink(temporaryPath); }
+        if (a.overwrite) await deps.rename(temporaryPath, hostPath);
+        else { await deps.link(temporaryPath, hostPath); committed = true; await deps.unlink(temporaryPath); }
         committed = true;
-        return JSON.stringify({ operation: 'download_file', bytes, sha256: digest, localPath, kernelPath: a.kernelPath, verified: true });
+        return JSON.stringify({ operation: 'download_file', bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
     } catch {
         if (!closed) await output.close().catch(() => undefined);
         if (!committed) await deps.unlink(temporaryPath).catch(() => undefined);

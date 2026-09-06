@@ -61,11 +61,37 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
     return value as Record<string, unknown>;
 }
 
-async function requestJson(url: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
-    const response = await fetch(url, { ...init, signal: AbortSignal.timeout(1500) });
-    const value = await response.json() as Record<string, unknown>;
-    if (!response.ok) throw new Error(typeof value.error === 'string' ? value.error : `HTTP ${response.status}`);
-    return value;
+async function requestJson(url: string, init: RequestInit = {}, timeoutMs = 1500): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+        const target = new URL(url);
+        const body = typeof init.body === 'string' ? init.body : undefined;
+        const headers = { ...init.headers as Record<string, string>, ...(body ? { 'content-length': String(Buffer.byteLength(body)) } : {}) };
+        const request = http.request({ hostname: target.hostname, port: target.port, path: target.pathname + target.search, method: init.method ?? 'GET', headers }, (response) => {
+            const chunks: Buffer[] = [];
+            response.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+            response.on('end', () => {
+                if (timer) clearTimeout(timer);
+                try {
+                    const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+                    if ((response.statusCode ?? 500) >= 400) throw new Error(typeof value.error === 'string' ? value.error : `HTTP ${response.statusCode}`);
+                    resolve(value);
+                } catch (error) { reject(error); }
+            });
+            response.once('error', (error) => { if (timer) clearTimeout(timer); reject(error); });
+            response.once('aborted', () => { if (timer) clearTimeout(timer); reject(new Error('Peer response ended before completion.')); });
+        });
+        let timer: NodeJS.Timeout | undefined;
+        const deadline = Date.now() + timeoutMs;
+        const scheduleTimeout = () => {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) { request.destroy(new Error(`Peer request timed out after ${timeoutMs} ms.`)); return; }
+            timer = setTimeout(scheduleTimeout, Math.min(remaining, 2_147_000_000));
+        };
+        request.once('error', (error) => { if (timer) clearTimeout(timer); reject(error); });
+        scheduleTimeout();
+        if (body) request.write(body);
+        request.end();
+    });
 }
 
 function listen(server: http.Server, port: number): Promise<number> {
@@ -351,11 +377,15 @@ export class BrokerCoordinator implements NotebookRouter {
 
     private async invokeRegistration(registration: WindowRegistration, operation: LocalOperation, args: Record<string, unknown>): Promise<string> {
         if (registration.id === this.windowId) return this.options.invokeLocal(operation, args);
+        const requestedWait = operation === 'run_cells' || operation === 'get_execution' ? args.waitMs : undefined;
+        const timeoutMs = typeof requestedWait === 'number' && Number.isSafeInteger(requestedWait) && requestedWait >= 0
+            ? Math.max(1500, Math.min(Number.MAX_SAFE_INTEGER, requestedWait + 1500))
+            : 2_147_000_000;
         const value = await requestJson(`http://127.0.0.1:${registration.peerPort}/peer/invoke`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-jupyter-mcp-token': registration.token },
             body: JSON.stringify({ operation, args })
-        });
+        }, timeoutMs);
         if (typeof value.result !== 'string') throw new Error('Peer returned an invalid operation result.');
         return value.result;
     }

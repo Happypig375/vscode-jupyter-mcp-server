@@ -9,8 +9,10 @@ import { executeLocalOperation } from './localOperations';
 import { listOpenNotebooks } from './notebookOps';
 import { registerNotebookTools } from './server';
 import { isNotebookRef, notebookRefFor } from './notebookRefs';
+import packageJson from '../package.json';
 
-const EXTENSION_VERSION = '0.3.0';
+// Derive the MCP handshake version from the packaged extension metadata.
+const EXTENSION_VERSION = packageJson.version;
 let coordinator: BrokerCoordinator | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let output: vscode.OutputChannel;

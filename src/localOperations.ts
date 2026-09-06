@@ -5,6 +5,7 @@ import {
     exportNotebook,
     getCells,
     getCellsOutput,
+    getExecution,
     getKernelInfo,
     configureKernel,
     getNotebooksSummary,
@@ -37,6 +38,7 @@ export type LocalOperation =
     | 'export_notebook'
     | 'edit_cells'
     | 'run_cells'
+    | 'get_execution'
     | 'restart_kernels'
     | 'interrupt_kernels'
     | 'move_cells'
@@ -86,8 +88,11 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
             );
         case 'read_notebook':
             return readNotebook(notebookRef(args), {
-                includeOutputs: args.includeOutputs === true,
+                view: args.view as 'outline' | 'source' | 'outputs' | 'all' | undefined,
                 cellIds: ids,
+                startLine: args.startLine as number | undefined,
+                endLine: args.endLine as number | undefined,
+                maxSourceChars: args.maxSourceChars as number | undefined,
                 outputMode: args.outputMode as OutputMode | undefined,
                 maxOutputChars: args.maxOutputChars as number | undefined
             });
@@ -97,9 +102,16 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
             return editNotebookCells(notebookRef(args), args.edits as Parameters<typeof editNotebookCells>[1]);
         case 'run_cells':
             return runNotebookCells(notebookRef(args), ids ?? [], {
-                timeoutMs: args.timeoutMs as number | undefined,
-                wait: args.wait as boolean | undefined,
+                waitMs: args.waitMs as number | undefined,
                 includeOutputs: args.includeOutputs as boolean | undefined,
+                mode: args.outputMode as OutputMode | undefined,
+                maxChars: args.maxOutputChars as number | undefined
+            });
+        case 'get_execution':
+            return getExecution(notebookRef(args), {
+                executionId: args.executionId as string | undefined,
+                waitMs: args.waitMs as number | undefined,
+                includeOutputs: args.includeOutputs === true,
                 mode: args.outputMode as OutputMode | undefined,
                 maxChars: args.maxOutputChars as number | undefined
             });
@@ -114,9 +126,9 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
         case 'save_notebooks':
             return saveNotebooks(args.notebookRefs as string[]);
         case 'upload_file':
-            return uploadFile({ notebookRef: notebookRef(args), localPath: args.localPath as string, kernelPath: args.kernelPath as string, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
+            return uploadFile({ notebookRef: notebookRef(args), hostPath: args.hostPath as string, kernelPath: args.kernelPath as string, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
         case 'download_file':
-            return downloadFile({ notebookRef: notebookRef(args), localPath: args.localPath as string, kernelPath: args.kernelPath as string, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
+            return downloadFile({ notebookRef: notebookRef(args), hostPath: args.hostPath as string, kernelPath: args.kernelPath as string, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
         default:
             throw new Error(`Unknown local notebook operation: ${String(operation)}`);
     }

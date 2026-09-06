@@ -4,148 +4,121 @@
 [![Marketplace installs](https://vsmarketplacebadges.dev/installs/Happypig375.vscode-jupyter-mcp-server.svg)](https://marketplace.visualstudio.com/items?itemName=Happypig375.vscode-jupyter-mcp-server)
 [![GitHub repository](https://img.shields.io/badge/GitHub-repo-blue.svg)](https://github.com/Happypig375/vscode-jupyter-mcp-server)
 
-A **notebook-specific MCP server** that runs inside VS Code and lets an **external agentic harness** (Command Code CLI/desktop, Claude, etc.) **run, edit, create, and manage the Jupyter notebook the user is actively editing** — headlessly, with no approval dialogs, and no Copilot/Cursor dependency.
+A notebook-specific MCP server that runs inside VS Code. An external MCP client can inspect, edit, execute, create, export, and manage notebooks open in the VS Code windows the user is working in. It has no dependency on Copilot Chat or Cursor. Notebook document operations use VS Code's native API; kernel operations require the installed `ms-toolsai.jupyter` extension.
 
-## The objective (and how it differs from similar projects)
+## Install and connect
 
-This extension is built for one specific workflow: **an outside agent drives the notebook the human is looking at.** The agent connects over MCP, operates on the same in-memory `NotebookDocument` the user sees in the editor, and every change appears instantly with full undo/redo.
+1. Install **Jupyter MCP Server** (publisher `Happypig375`) from the [Marketplace](https://marketplace.visualstudio.com/items?itemName=Happypig375.vscode-jupyter-mcp-server), or run `code --install-extension Happypig375.vscode-jupyter-mcp-server`.
+2. Check the `$(notebook) MCP` status item and copy its URL, or use the output channel. The default endpoint is `http://127.0.0.1:51303/mcp`.
+3. Configure the external client to use Streamable HTTP and that copied endpoint.
 
-That objective drives every design choice:
+The tool contract below describes 0.4.0; see the [changelog](CHANGELOG.md) for earlier versions. After an upgrade, refresh or reconnect the client's MCP tool catalog if it still advertises old parameters. The connected server's `tools/list` response is authoritative.
 
-- **External, harness-agnostic** — any MCP client works; nothing is tied to VS Code's Copilot Chat or Cursor agents. Document editing and cell execution use the VS Code notebook API directly. Only explicit kernel configuration (`configure_kernel`) invokes Jupyter's contributed configuration tool.
-- **User-editing notebook as the source of truth** — tools target open `NotebookDocument`s, not `.ipynb` files on disk, so tools operate on the live document. Saved outputs may remain stale until execution refreshes them.
-- **Jupyter-backed** — the packaged extension declares `ms-toolsai.jupyter` as an extension dependency. Kernel tools are exposed when its runtime APIs are available; document tools use VS Code's native notebook support.
-- **Deterministic, CI-friendly testing** — a shim-based MCP test suite with enforced coverage thresholds runs identically on every platform (no GUI, no VS Code download).
+## How this project differs
 
-### How this compares to similar projects
+The design is an in-extension broker over the user's live, shared in-memory `NotebookDocument`. Windows register as peers, duplicate URIs are disambiguated with short opaque `notebookRef` handles, and one broker port is taken over safely if its owner closes. The decisions below explain which documented ideas we adopted and which remain outside this project's boundary.
 
-| Extension | Approach | Objective | Notable features |
-|---|---|---|---|
-| [Notebook MCP for VS Code](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) | Daemon + per-window bridge workers, URI routing, operation-streaming | In-editor notebook agents (VS Code/Copilot ecosystem) | 19 tools; daemon routing; operation streaming; **source of the whole-notebook read, cell anchors, and export we adopted** |
-| [Native Jupyter Notebook MCP Server](https://marketplace.visualstudio.com/items?itemName=olavovieiradecarvalho.notebook-mcp-server) ([repo](https://github.com/olavocarvalho/vscode-runtime-notebook-mcp)) | In-extension MCP server, active-editor based | Same-space agents (Cursor/Claude) | 15 tools; output-capturing run; **source of our execution-wait + output-return pattern** |
-| [Agentic Jupyter (MCP)](https://marketplace.visualstudio.com/items?itemName=koyo922.agentic-jupyter-mcp) ([repo](https://github.com/koyo922/agentic-jupyter-mcp)) | In-extension MCP server, stdio transport, active-tab based | IDE-sidebar agents (Cursor/Windsurf/Antigravity) | 4 tools (list/edit/insert/delete/run cell); stdio-only; targets the IDE's built-in agent sidebar rather than external harnesses |
-| [mcp-jupyter-complete](https://github.com/tofunori/mcp-jupyter-complete) | File-based `.ipynb` editing + VS Code reload | File editing only | **Cannot execute** |
-| [Jupyter MCP Server](https://github.com/datalayer/jupyter-mcp-server) | Standalone Jupyter Server API | Remote JupyterLab/JupyterHub | Separate server; second source of truth |
-| **Jupyter MCP Server (this extension)** | In-extension single-port broker with per-window peers | **External agentic harness driving the user's live notebooks** | Automatic broker takeover; cross-window routing; duplicate-file disambiguation; bounded output-capturing run; deterministic coverage-gated CI |
+| Design or workflow | This project's decision, benefit, and tradeoff | Relevant comparison |
+|---|---|---|
+| Shared live notebook document | **Adopted.** Read and edit VS Code's current document, including unsaved changes. The agent and user share notebook state; the notebook must be open in VS Code. | [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) also supports live notebooks and external clients. [mcp-jupyter-complete](https://github.com/tofunori/mcp-jupyter-complete) uses file edits and reloads; [Datalayer](https://github.com/datalayer/jupyter-mcp-server) supports standalone Jupyter Server workflows. |
+| Window routing | **Implemented inside the extension host.** One window owns the broker, peers can take over its port, and short refs distinguish the same URI in different windows. This avoids a separate daemon process. | [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) uses a daemon with per-window bridge workers. |
+| Long-running execution | **Adopted for 0.4.0.** `run_cells` returns an `executionId`; `get_execution` follows that same run after a wait budget expires or `waitMs: 0` returns immediately. | The operation-ID and polling pattern comes from [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp). |
+| Pushed output streaming | **Not implemented.** Bounded polling serves request/response clients. Pushed events would add client notification support and event-history management that this workflow does not require. | [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) documents polling and streaming. |
+| Cell locking | **Not implemented.** The server checks explicit targets and execution freshness without imposing an edit-ownership policy on the user and agent. Locking would require a separate coordination policy. | [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) exposes cell-lock tools. |
+| Per-run interruption | **Not implemented as an isolated cancellation tool.** `interrupt_kernels` explicitly requests a kernel-wide interrupt; stopping observation of a run does not prove its code stopped. | This server's [interrupt implementation](src/notebookOps.ts) uses the notebook kernel command. |
+| Provider startup and administration | **Generic Jupyter integration; no dedicated Colab adapter.** Reuse registered controllers and normal provider setup. The checked Colab extension exposes no public connect/start API for an adapter to call. Dedicated provisioning, Drive, terminal, and resource-management tools are not implemented. | [Google Colab MCP](https://github.com/googlecolab/colab-mcp) bridges browser sessions; [Colab CLI](https://github.com/googlecolab/google-colab-cli) manages runtimes and files. The [Colab VS Code guide](https://github.com/googlecolab/colab-vscode/wiki/User-Guide) documents its own setup and administration. |
 
-We have deliberately **adopted the best ideas** from the closest projects — [output-capturing execution](https://github.com/olavocarvalho/vscode-runtime-notebook-mcp), [whole-notebook reads and stable `cell_id` anchors](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) — while keeping our distinct objective: serving an **external** harness against the **user's live notebook**, with **no Copilot/Cursor dependency** and **Jupyter-optional** operation.
+Whole-notebook reads, cell anchors, and export were inspired by [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp); the execution-wait and output-capture pattern came from [vscode-runtime-notebook-mcp](https://github.com/olavocarvalho/vscode-runtime-notebook-mcp).
 
-The VS Code Marketplace also lists generic "VS Code as an MCP server" extensions (e.g. [`juehang/vscode-mcp-server`](https://github.com/juehang/vscode-mcp-server), [`acomagu/vscode-as-mcp-server`](https://github.com/acomagu/vscode-as-mcp-server)) that expose file/shell/diagnostics tools for plain code editing. They are **not notebook-aware**: they treat `.ipynb` files as opaque JSON, have no cell/kernel/execution model, and cannot run or capture notebook cells — so they are out of scope for this comparison.
+Sources and repository documentation were checked on 2026-09-06. This is a bounded, documentation-scoped comparison; it does not claim competitor installation or behavioral testing.
 
 ## Tools
 
-Batch-oriented tools accept arrays and are grouped by owning window. Existing-notebook tools use `notebookRef` or `notebookRefs`, each accepting a URI or a short opaque `notebookRef` from `list_notebooks`. `open_notebooks` takes file URIs in `uris` plus an optional `windowId`; `create_notebook` takes `title`.
+Existing-notebook tools use `notebookRef`, or `notebookRefs` for a batch. Prefer the short ref from `list_notebooks`; a plain URI is also accepted when it identifies one open notebook. `open_notebooks` accepts file URIs in `uris` and an optional `windowId`; `create_notebook` accepts `title` and an optional `windowId`.
+
+Cell references accept zero-based indices or the `cell_id` returned by a read. Prefer real cell IDs; an `index:N` fallback can change after insertion, deletion, or movement. Notebook refs remain valid across cell edits and resolve only against currently open notebooks.
 
 | Tool | Category | Description |
 |---|---|---|
-| `create_notebook` | Create | Create a new notebook (file in a workspace, or **untitled in an empty window**) and open it |
-| `list_notebooks` | Read | List grouped connected windows with `windowId`, `windowLabel`, and notebooks containing `uri` plus routable `notebookRef` |
-| `read_notebook` | Read | **Whole-notebook read** in one call: cell index, stable `cell_id` anchor, kind, language, source, execution state, optional outputs |
-| `inspect_notebooks` | Read | Inspect cell metadata for one or more notebooks without returning source or output content |
-| `read_cells` | Read | Read cell source by index or cell anchor, with optional 1-based inclusive `startLine`/`endLine` and `maxSourceChars` |
-| `read_cell_outputs` | Read | Read bounded `summary`, preferred-`text`, or all-text `full` output; binary images are summarized, never decoded |
-| `search_cells` | Read | **Search** a notebook's cells (source + output text) for a query, with per-cell match locations; case-insensitive by default |
-| `get_kernel_info` | Read | Get observed active kernel runtime fields via the public Jupyter API; identity and file-transfer availability are reported explicitly when unavailable or unchecked |
-| `list_kernels` | Read | List exact available kernel/controller ids; never configures providers |
-| `configure_kernel` | Manage | Explicitly invoke provider configuration, which may require normal UI |
-| `edit_cells` | Write | Insert/edit/delete cells in order, plus unique exact-text `replace`; preserves existing metadata; optional explicit re-run (off by default) |
-| `move_cells` | Write | Move one or more cells to a new position (preserves content/outputs/metadata) |
-| `clear_cell_outputs` | Write | Clear saved outputs and execution state from one or more cells |
-| `run_cells` | Execute | Run cells headlessly; wait for bounded text results or set `wait=false` to dispatch immediately; dispatch does not guarantee queue admission; a wait timeout does not interrupt execution |
-| `select_kernel` | Manage | Select only an exact id from `list_kernels` |
-| `restart_kernels` | Manage | Restart the kernel of one or more notebooks |
-| `interrupt_kernels` | Manage | **Interrupt** (stop) running execution in one or more notebooks |
-| `open_notebooks` | Manage | Open file URIs; reveal and preserve the live model when already open |
-| `save_notebooks` | Manage | Force-persist file-backed notebooks, including remote execution state |
-| `upload_file` / `download_file` | Kernel transfer | Chunked, hashed transfer between the VS Code host and the current active idle Python kernel filesystem |
-| `export_notebook` | Manage | Export a notebook to **markdown / python / html** |
+| `create_notebook` | Create | Create a workspace file or an untitled notebook in an empty window and open it |
+| `list_notebooks` | Read | List grouped connected windows, including empty windows, with `windowId`, `windowLabel`, URI, and routable `notebookRef` |
+| `read_notebook` | Read | Read an `outline` by default, or select `source`, `outputs`, or `all`; optionally target `cellIds` |
+| `search_cells` | Read | Search cell source and output text with match locations |
+| `get_kernel_info` | Read | Report observed active runtime fields and explicit unavailable reasons |
+| `get_execution` | Read | Inspect a tracked `executionId`, or recover the notebook's latest run; optionally wait for its result |
+| `list_kernels` | Read | List exact registered kernel/controller IDs; read-only |
+| `configure_kernel` | Manage | Invoke Jupyter's provider configuration tool; normal picker/auth/consent UI may appear |
+| `edit_cells` | Write | Insert, edit, delete, or exact-text replace cells; optional explicit rerun |
+| `move_cells` | Write | Move cells while preserving content, outputs, and metadata |
+| `clear_cell_outputs` | Write | Clear outputs and execution state |
+| `run_cells` | Execute | Start a tracked, ordered run; `waitMs` bounds the caller's wait, and observation continues independently |
+| `select_kernel` | Manage | Select an exact ID from `list_kernels`; no fallback or start |
+| `restart_kernels` | Manage | Restart notebook kernels |
+| `interrupt_kernels` | Manage | Interrupt running execution |
+| `open_notebooks` | Manage | Open file URIs, preserving an existing live model |
+| `save_notebooks` | Manage | Persist file-backed notebooks, including remote execution state |
+| `upload_file` / `download_file` | Kernel transfer | Chunked, hashed transfer between `hostPath` on the VS Code host and `kernelPath` in the active idle Python kernel |
+| `export_notebook` | Manage | Export as markdown, Python, or HTML |
 
-### Jupyter-extension guard
+### Reading without excess output
 
-Tools that require a **kernel** — `list_kernels`, `configure_kernel`, `select_kernel`, `run_cells`, `restart_kernels`, `interrupt_kernels`, `upload_file`, and `download_file` — are only exposed when the **Jupyter extension** (`ms-toolsai.jupyter`) is installed. The remaining tools work with VS Code's native notebook support alone.
+`read_notebook` returns notebook and cell metadata in every view. `source` adds source text, `outputs` adds saved output, and `all` adds both within the requested limits. Source slicing uses 1-based inclusive `startLine` and `endLine`; `maxSourceChars` defaults to 12,000 per cell, with `0` requesting unbounded source explicitly. Truncation is reported.
 
-### Optional provider integrations
+For outputs, `outputMode` selects `summary`, preferred `text`, or `full` textual representations. `maxOutputChars` bounds each cell's returned output. Binary images are summarized rather than decoded. Saved output can be stale after an edit; saving does not refresh it.
 
-The optional Google Colab VS Code extension (for example, locally installed `google.colab` 0.9.3) can contribute controllers through Jupyter. `upload_file` and `download_file` use only the public Jupyter kernel API and the filesystem belonging to the currently active idle Python kernel; they do not infer a remote provider, start a kernel, select a kernel, or provide dedicated Colab APIs. The kernel API may display a one-time authorization UI. `configure_kernel` may open the provider's normal UI. On 6 September 2026, live checks in an existing Colab Python session verified targeted cell execution, clearing two nonadjacent cells while preserving their sources and stable IDs, and a 524,425-byte MCP upload/download round trip with matching SHA-256 hashes. Initial provider discovery still required the normal Colab picker after a window reload.
+### Jupyter and providers
 
-After an extension upgrade, reconnect or refresh the MCP client's tool catalog if it still shows obsolete tool names or parameters. The server's current `tools/list` response is authoritative.
+The package declares `ms-toolsai.jupyter` as a dependency. Kernel-backed tools (`list_kernels`, `configure_kernel`, `select_kernel`, `run_cells`, restart/interrupt, and file transfer) are registered when that extension is present; presence does not guarantee every runtime API is available. `get_kernel_info` and `get_execution` remain exposed for read-only diagnostics.
 
-### Adjacent projects (checked 2026-09-06)
+`list_kernels` lists currently registered controllers, including those contributed by other extensions; it does not discover every dormant provider. `configure_kernel` explicitly delegates setup to Jupyter and may display a picker, authentication, or consent UI. `select_kernel` requires an exact listed ID. Inspection, listing, and file transfer do not start or select a kernel. File transfer requires the public API of an active idle Python kernel; see Microsoft's [kernel execution and authorization sample](https://github.com/microsoft/vscode-extension-samples/tree/main/jupyter-kernel-execution-sample).
 
-This bounded source comparison records documented interfaces; no competitor was installed or behaviorally tested. The [Microsoft Jupyter Extension API](https://github.com/microsoft/vscode-jupyter/wiki/Extension-API) and [kernel execution sample](https://github.com/microsoft/vscode-extension-samples/tree/main/jupyter-kernel-execution-sample) document kernel execution and server-provider integration. The [Colab VS Code guide](https://github.com/googlecolab/colab-vscode/wiki/User-Guide) documents remote providers, server lifecycle, resources, Drive, and context upload; this project consumes controllers through Jupyter rather than implementing those Colab management APIs.
+The optional Colab VS Code extension contributes controllers through Jupyter. On 2026-09-06, MCP server 0.3.0 with `google.colab` 0.9.3 passed live checks for targeted execution, nonadjacent output clearing, and a 524,425-byte upload/download round trip with matching SHA-256 hashes in an existing Colab Python session. Initial discovery used the normal Colab picker. This is evidence for that tested integration, not a claim that every Colab feature is MCP-integrated.
 
-The closest in-editor comparison is [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp), which documents live multi-window URI routing, cell/range/all execution, and operation IDs with polling or streaming. [vscode-runtime-notebook-mcp](https://github.com/olavocarvalho/vscode-runtime-notebook-mcp) embeds a VS Code Jupyter runtime for cell edits, execution, and outputs. [Agentic Jupyter MCP](https://marketplace.visualstudio.com/items?itemName=koyo922.agentic-jupyter-mcp) documents live IDE IPython operations and per-window routing. [mcp-jupyter-complete](https://github.com/tofunori/mcp-jupyter-complete) documents position-based edits and VS Code reload integration. The separate [Datalayer Jupyter MCP server](https://github.com/datalayer/jupyter-mcp-server) targets standalone Python/Jupyter Server workflows, including documented optional Colab sandbox support.
+A bootstrap adapter was considered on the same date. The installed 0.9.3 command manifest has no connect/start command; current upstream [activation](https://github.com/googlecolab/colab-vscode/blob/main/src/extension.ts) returns no extension API, and Auto Connect is handled inside the [Jupyter provider](https://github.com/googlecolab/colab-vscode/blob/main/src/jupyter/provider.ts). The browser-focused Colab MCP server does not expose that VS Code provider.
 
-Adjacent Google projects take different boundaries: [Colab MCP](https://github.com/googlecolab/colab-mcp) targets browser Colab sessions and a local MCP client, while [Google Colab CLI](https://github.com/googlecolab/google-colab-cli) documents runtime, file, and execution CLI workflows. Generic [vscode-mcp-server](https://github.com/juehang/vscode-mcp-server) and [vscode-as-mcp-server](https://github.com/acomagu/vscode-as-mcp-server) document editor/file features; this comparison found no verified notebook/kernel contract for them. Future gaps here include operation IDs/polling/streaming and provider-specific management APIs.
+Jupyter's [public API](https://github.com/microsoft/vscode-jupyter/blob/main/src/api.d.ts) lets an extension register its own server collection, but does not expose other extensions' provider instances. Its `kernels.getKernel` returns already-started kernels for open notebooks. The internal [`jupyter.kernel.selectJupyterServerKernel`](https://github.com/microsoft/vscode-jupyter/blob/main/src/notebooks/controllers/kernelSource/kernelSourceCommandHandler.ts) command accepts an extension ID, provider ID, and notebook, then invokes the normal server/kernel selector; it has no argument for choosing a server or provider action. The older [`addRemoteJupyterServer`](https://github.com/microsoft/vscode-jupyter/blob/main/src/standalone/api/unstable/index.ts) API is deprecated and rejects callers outside Codespaces. These routes do not provide unattended Colab bootstrap.
+
+Providers can mark a sole setup command `canBeAutoSelected`, but the checked Colab provider does not use that option. A provider API for listing existing runtimes and connecting to an explicit runtime would justify an optional MCP adapter. Until such a route exists, initial Colab setup can still require user interaction; wrapping its picker would not remove that requirement.
 
 ## Recommended flow
 
-1. `list_notebooks` → pick the notebook URI; use its `notebookRef` if that URI appears in multiple windows
-2. `read_notebook` (or `inspect_notebooks`) → see the notebook's structure/state
-3. `edit_cells` → write/change cells
-4. `list_kernels` → enumerate exact ids read-only
-5. `configure_kernel` → explicitly configure a provider when needed; `select_kernel` → choose an exact listed kernel id
-6. `run_cells` → execute cells **headlessly**, get outputs back, and persist completed remote execution state
-7. `read_cell_outputs` (or `read_notebook` with outputs) → read results
-8. `save_notebooks` → persist file state; saved outputs can remain stale after edits until execution refreshes them; `export_notebook` → share
+1. Call `list_notebooks` and select a `notebookRef`.
+2. Read its outline, then request `view: "source"` for the cells needed. Edit cells and refresh indices or fallback anchors after structural changes.
+3. If a kernel must be chosen, list its registered controllers and select an exact ID. Configure the provider explicitly when necessary.
+4. Call `run_cells`. `waitMs` defaults to 1,000; zero returns immediately, and larger values can wait for long jobs. This is a request wait budget, not an execution time limit. A returned ID or dispatch status does not prove execution started.
+5. If the run is unfinished, call `get_execution` with that ID. Its `waitMs` defaults to zero and also supports long waits. A client may impose a shorter request timeout; neither that timeout nor an expired wait budget interrupts execution. Omit the ID to recover the latest tracked run after a lost response.
+6. Read results and save edits or export the notebook. Completed background runs persist file-backed outputs, including remote results; untitled notebooks are not force-saved.
 
-## Why a VS Code extension?
+Runs submit cells in order and stop after an observed failure. Only one tracked run is active per notebook, with at most 16 active runs per window and 256 cells per run. The registry retains at most 32 notebooks and eight runs per notebook; terminal records expire after one hour and can be evicted earlier at capacity. Active runs have no one-hour expiry. Returned execution output is capped at 12,000 characters per cell and 48,000 per receipt. `run_cells` includes output by default; `get_execution` includes it only with `includeOutputs: true`. Lookup requires an open notebook, and records do not survive an extension reload. `saveBeforeExecute` pre-saves dirty notebooks before edit, move, or run; use `save_notebooks` to persist subsequent edits.
 
-Notebook execution, kernels, and the Jupyter extension's tools exist only inside the VS Code extension host. A standalone MCP process can't reach them. This extension is the bridge that lives inside VS Code and exposes them over MCP.
+Tracking observes cell identity, source, execution summaries, and restart/interrupt requests made through MCP. Restarts initiated outside those tools are detected only when VS Code exposes corresponding cell or lifecycle changes. An `unavailable` result means completion could not be confirmed; it does not establish that the kernel stopped.
 
-## Why native tools instead of forwarding Copilot's?
+### Updating clients from 0.3.0
 
-The VS Code notebook API covers targeted cell execution (`notebook.cell.execute` with an explicit target editor and selected ranges), reading cells/outputs (`cell.outputs`, `executionSummary`), and kernel restart (`notebook.restartKernel`). Provider configuration delegates only the explicit `configure_kernel` call to Jupyter's contributed `configure_notebook` tool. Ambiguous targets fail closed.
-- **Tool-approval dialogs** for execution tools invoked outside a live chat session (`chat.tools.autoApprove` doesn't suppress these — [microsoft/vscode#319094](https://github.com/microsoft/vscode/issues/319094))
-- **Stream requirements** for interactive tools (edit/create need a chat stream)
-- **Coupling** to Copilot Chat's tool contributions and their schemas
+- Replace `inspect_notebooks`, `read_cells`, and `read_cell_outputs` with the appropriate `read_notebook` view.
+- Replace `run_cells.wait` and `timeoutMs` with the single `waitMs` budget, then follow `executionId` with `get_execution`.
+- Replace file transfer's `localPath` with `hostPath`, which names a path on the VS Code extension host.
 
-The native implementation is fully headless, self-contained, and works even if Copilot Chat's tools change.
+Obsolete keys and tools are rejected; refresh the client's tool catalog after upgrading.
 
-## Multi-window broker and takeover
+## Multi-window routing
 
-All VS Code windows on the machine share one externally visible HTTP URL. The first window to bind `jupyterMcp.port` becomes the broker; other windows register private loopback peer endpoints and send heartbeats. The broker aggregates their open notebooks and forwards operations to the owning extension host.
-
-When the broker window closes, the surviving peers race safely for the same configured port. One becomes the replacement broker and the others reconnect. The external URL remains unchanged, although an MCP client with an existing connection may need to reconnect after the listener changes.
-
-If the same notebook URI is open in two windows, `list_notebooks` returns two grouped entries with distinct short opaque `notebookRef` values. Passing the plain URI produces an explicit ambiguity error; passing a listed ref routes to the selected window. Refs resolve only against currently open notebooks. Multi-notebook operations are grouped into one internal batch per owning window.
-
-## Install & run
-
-1. **Install** the extension:
-   - **Marketplace:** search for **Jupyter MCP Server** (publisher `Happypig375`) in the Extensions view, or [open the marketplace page](https://marketplace.visualstudio.com/items?itemName=Happypig375.vscode-jupyter-mcp-server), or run `code --install-extension Happypig375.vscode-jupyter-mcp-server`. (Note: `datalayer` publishes a [similarly-named standalone Jupyter Server MCP](https://github.com/datalayer/jupyter-mcp-server) — this is the *VS Code in-extension* one.)
-   - **Local build:** press **F5** in this repo for an Extension Development Host (works alongside the Jupyter extension `ms-toolsai.jupyter`).
-2. **Check the `$(notebook) MCP` status item** (hover to see the URL; click to copy it) or the `Jupyter MCP Server` output channel, e.g. `MCP server listening on http://127.0.0.1:51303/mcp`.
-3. **Add to Command Code**:
-   ```bash
-   cmdc mcp add --transport http jupyter http://127.0.0.1:51303/mcp
-   ```
-   (or stdio: set `jupyterMcp.transport` to `stdio` and `cmdc mcp add jupyter -- node <extension>/dist/extension.js`)
+All windows share the configured loopback HTTP URL. The first window binds the broker; others register private loopback peers. If the broker closes, a peer can take over the same port. A URI that is ambiguous across windows fails; use the listed ref. Multi-notebook operations are grouped by owner.
 
 ## Configuration
 
 | Setting | Default | Description |
 |---|---|---|
-| `jupyterMcp.enabled` | `true` | Enable the MCP server |
-| `jupyterMcp.transport` | `http` | `http` (Streamable HTTP on 127.0.0.1) or `stdio` |
-| `jupyterMcp.port` | `51303` | Single loopback broker port shared by all local VS Code windows; machine-scoped and not synchronized by Settings Sync |
-| `jupyterMcp.saveBeforeExecute` | `true` | Save dirty notebooks before run/edit |
+| `jupyterMcp.enabled` | `true` | Enable the server |
+| `jupyterMcp.transport` | `http` | Streamable HTTP on loopback; `stdio` is scoped to the extension host and has no standalone Node launcher |
+| `jupyterMcp.port` | `51303` | Shared machine-scoped broker port |
+| `jupyterMcp.saveBeforeExecute` | `true` | Pre-save dirty notebooks before edit, move, or run |
 
-## Testing
+## Development and testing
 
-`npm test` runs two deterministic MCP integration suites plus a dedicated multi-window broker suite. The MCP suites exercise the exact public tool surface over real Streamable HTTP connections. The broker suite starts independent window coordinators and verifies grouped aggregation including empty windows, duplicate-file conflicts, opaque `notebookRef` routing, per-window batching, stale/disconnected rejection, and takeover of the same external port after the owner stops.
+Install dependencies with `npm ci`, then run `npm run typecheck` and `npm run compile`. Press **F5** to open an Extension Development Host.
 
-`npm run coverage` additionally measures coverage with **c8** (sourcemap-remapped to `src/**`, merged across both suites) and enforces thresholds (statements/lines ≥75%, branches ≥55%, functions ≥85%) via `src/test/checkCoverage.js`. Both are wired into **GitHub Actions CI** (`.github/workflows/ci.yml`, matrix: ubuntu/windows/macos).
-
-## Notes / limitations
-
-- Notebooks must be open in VS Code to be listed/read/edited (`list_notebooks` lists open ones).
-- Requires the **Jupyter extension** (`ms-toolsai.jupyter`) for kernel-backed execution; `run_cells` uses the notebook's current kernel.
-- `select_kernel.kernelId` requires an exact id returned by `list_kernels` and never falls back. `run_cells` has no kernel hint; select an exact id with `select_kernel` first.
-- `configure_kernel` may require provider UI for server picker, authentication, consent, or runtime allocation. `list_kernels` remains read-only and `select_kernel` requires an exact listed id.
-- Cell references use 0-based indices (`cellIds`) — after an edit, call `inspect_notebooks` for fresh indices.
-- The HTTP transport supports multi-window routing; stdio remains scoped to the extension host that owns its process.
-- Workspace-trust / tool-approval dialogs do **not** apply to these native tools (they use the VS Code notebook API, not `invokeTool`).
+`npm test` compiles the extension and runs the MCP boundary, Jupyter integration, broker, and kernel-file suites. `npm run coverage` merges their c8 coverage and enforces statements/lines >=75%, branches >=55%, and functions >=85%. The tests use shims without downloading VS Code; live provider checks are separate. CI runs on Ubuntu, Windows, and macOS.
 
 ## License
 

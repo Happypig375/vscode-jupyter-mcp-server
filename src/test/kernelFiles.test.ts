@@ -39,18 +39,18 @@ async function main() {
     const host = new Map<string, Buffer>(), kernel = new Kernel(), d = deps(kernel, host, true);
     const src = path.resolve('quoted α.bin'), dest = path.resolve('download α.bin');
     const payload = crypto.randomBytes(TRANSFER_CHUNK_BYTES + 17); host.set(src, payload);
-    const up = JSON.parse(await uploadFile({ notebookRef: 'file:///n', localPath: src, kernelPath: "/tmp/quoted-'α" }, undefined, d));
+    const up = JSON.parse(await uploadFile({ notebookRef: 'file:///n', hostPath: src, kernelPath: "/tmp/quoted-'α" }, undefined, d));
     assert.deepStrictEqual(kernel.files.get("/tmp/quoted-'α"), payload); assert.strictEqual(up.verified, true);
-    const down = JSON.parse(await downloadFile({ notebookRef: 'file:///n', localPath: dest, kernelPath: "/tmp/quoted-'α" }, undefined, d));
+    const down = JSON.parse(await downloadFile({ notebookRef: 'file:///n', hostPath: dest, kernelPath: "/tmp/quoted-'α" }, undefined, d));
     assert.deepStrictEqual(host.get(dest), payload); assert.strictEqual(down.sha256, up.sha256); assert.strictEqual(d.temps.size, 0);
     assert.ok(kernel.sources.every((s) => !s.includes('def __jupyter_mcp_transfer')));
-    const empty = path.resolve('empty'); host.set(empty, Buffer.alloc(0)); await uploadFile({ notebookRef: 'n', localPath: empty, kernelPath: '/tmp/empty' }, undefined, d);
-    kernel.missing = true; await assert.rejects(downloadFile({ notebookRef: 'n', localPath: path.resolve('missing'), kernelPath: '/tmp/empty' }, undefined, d), /failed before destination commit/); kernel.missing = false;
-    kernel.badHash = true; await assert.rejects(downloadFile({ notebookRef: 'n', localPath: path.resolve('hash'), kernelPath: '/tmp/empty' }, undefined, d), /failed before destination commit/); kernel.badHash = false;
-    const race = path.resolve('race'); host.set(race, Buffer.from('winner')); await assert.rejects(downloadFile({ notebookRef: 'n', localPath: race, kernelPath: '/tmp/empty' }, undefined, d), /failed before destination commit/); assert.strictEqual(host.get(race)!.toString(), 'winner');
-    await assert.rejects(uploadFile({ notebookRef: 'n', localPath: src, kernelPath: '/tmp/cancel' }, { isCancellationRequested: true } as any, d), /cancelled/);
+    const empty = path.resolve('empty'); host.set(empty, Buffer.alloc(0)); await uploadFile({ notebookRef: 'n', hostPath: empty, kernelPath: '/tmp/empty' }, undefined, d);
+    kernel.missing = true; await assert.rejects(downloadFile({ notebookRef: 'n', hostPath: path.resolve('missing'), kernelPath: '/tmp/empty' }, undefined, d), /failed before destination commit/); kernel.missing = false;
+    kernel.badHash = true; await assert.rejects(downloadFile({ notebookRef: 'n', hostPath: path.resolve('hash'), kernelPath: '/tmp/empty' }, undefined, d), /failed before destination commit/); kernel.badHash = false;
+    const race = path.resolve('race'); host.set(race, Buffer.from('winner')); await assert.rejects(downloadFile({ notebookRef: 'n', hostPath: race, kernelPath: '/tmp/empty' }, undefined, d), /failed before destination commit/); assert.strictEqual(host.get(race)!.toString(), 'winner');
+    await assert.rejects(uploadFile({ notebookRef: 'n', hostPath: src, kernelPath: '/tmp/cancel' }, { isCancellationRequested: true } as any, d), /cancelled/);
     const short = { ...d, openRead: async () => ({ size: 1, read: async () => ({ bytesRead: 0 }), close: async () => undefined }) };
-    await assert.rejects(uploadFile({ notebookRef: 'n', localPath: src, kernelPath: '/tmp/short' }, undefined, short), /failed before destination commit/);
+    await assert.rejects(uploadFile({ notebookRef: 'n', hostPath: src, kernelPath: '/tmp/short' }, undefined, short), /failed before destination commit/);
     console.log('kernelFiles tests passed');
 }
 if (require.main === module) void main().catch((e) => { console.error(e); process.exit(1); });

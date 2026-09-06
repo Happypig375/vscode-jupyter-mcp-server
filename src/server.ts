@@ -52,52 +52,6 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             return { content: [{ type: 'text' as const, text: JSON.stringify(await router.listNotebooks()) }] };
         }
     );
-    // ---- Get cells (metadata) ----
-    server.registerTool(
-        'inspect_notebooks',
-        {
-            description:
-                'Get METADATA for one or more notebooks: per cell, the index, kind, language, line count, ' +
-                'best available cell anchor, execution state, and output mime types. Does not include cell source or output content — ' +
-                'use read_cells for source and read_cell_outputs for outputs.',
-            inputSchema: jsonSchemaToZod({
-                type: 'object',
-                properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookRefs from list_notebooks.' } },
-                required: ['notebookRefs']
-            })
-        },
-        async (args) => {
-            const a = (args ?? {}) as { notebookRefs?: string[] };
-            if (!Array.isArray(a.notebookRefs) || a.notebookRefs.length === 0) throw new Error('notebookRefs must be a non-empty array');
-            const text = await invokeMany(router, 'inspect_notebooks', a.notebookRefs);
-            return { content: [{ type: 'text' as const, text }] };
-        }
-    );
-    // ---- Get cells source ----
-    server.registerTool(
-        'read_cells',
-        {
-            description:
-                'Read cell source by 0-based index or stable cell id (omit cellIds to read all cells). Optional source bounds are 1-based and inclusive. Returns index, stable id, kind, language, source text, and explicit truncation state.',
-            inputSchema: jsonSchemaToZod({
-                type: 'object',
-                properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
-                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices to read (omit for all).' },
-                    startLine: { type: 'number', description: 'Optional 1-based inclusive source start line per selected cell.' },
-                    endLine: { type: 'number', description: 'Optional 1-based inclusive source end line per selected cell.' },
-                    maxSourceChars: { type: 'number', description: 'Optional maximum source characters per cell; truncation is reported.' }
-                },
-                required: ['notebookRef']
-            })
-        },
-        async (args) => {
-            const a = (args ?? {}) as { notebookRef?: string; cellIds?: Array<string | number>; startLine?: number; endLine?: number; maxSourceChars?: number };
-            if (!a.notebookRef) throw new Error('notebookRef is required');
-            const text = await router.invokeNotebook('read_cells', a.notebookRef, a as Record<string, unknown>);
-            return { content: [{ type: 'text' as const, text }] };
-        }
-    );
     // ---- Clear outputs ----
     server.registerTool(
         'clear_cell_outputs',
@@ -171,7 +125,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         );
 
         server.registerTool('configure_kernel', {
-            description: 'Run the explicit Jupyter provider configuration workflow for a notebook. This may show provider UI and does not select or start a kernel.',
+            description: 'Run the Jupyter provider-owned setup workflow for a notebook. The provider may show picker, authentication, consent, selection, or startup UI and controls the resulting runtime state.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {
                 notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' }
             }, required: ['notebookRef'] })
@@ -206,33 +160,6 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             }
         );
     }
-    // ---- Get cells output ----
-    server.registerTool(
-        'read_cell_outputs',
-        {
-            description:
-                'Read the saved OUTPUT of cells in a notebook. Provide the notebook URI and an array of ' +
-                'cell indices/ids. Text mode returns one preferred text representation, never decodes binary images, ' +
-                'and bounds each cell response. Use summary for MIME types/sizes or full for all textual representations.',
-            inputSchema: jsonSchemaToZod({
-                type: 'object',
-                properties: {
-                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
-                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Cell indices/ids to read output from.' },
-                    outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail: summary, preferred text (default), or all text representations.' },
-                    maxOutputChars: { type: 'number', description: 'Maximum output characters per cell (default 12000; clamped to 1000..100000).' }
-                },
-                required: ['notebookRef', 'cellIds']
-            })
-        },
-        async (args) => {
-            const a = (args ?? {}) as { notebookRef?: string; cellIds?: Array<string | number>; outputMode?: OutputMode; maxOutputChars?: number };
-            if (!a.notebookRef) throw new Error('notebookRef is required');
-            if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
-            const text = await router.invokeNotebook('read_cell_outputs', a.notebookRef, a as Record<string, unknown>);
-            return { content: [{ type: 'text' as const, text }] };
-        }
-    );
     // ---- Search cells ----
     server.registerTool(
         'search_cells',
@@ -263,15 +190,16 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         'read_notebook',
         {
             description:
-                'Read a whole notebook in one call: per cell, the index, stable cell_id anchor, kind, language, ' +
-                'source, execution state, and (optionally) outputs. Provide the notebook URI; optionally restrict ' +
-                'to specific cell indices/ids and include outputs.',
+                'Read a notebook using the outline view by default, or select source, outputs, or all. Outline returns cell identity and metadata without source/output content; other views apply their explicit bounds.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
                     notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Optional cell indices/ids to read (default: all).' },
-                    includeOutputs: { type: 'boolean', description: 'Include compact cell outputs (default false).' },
+                    view: { type: 'string', enum: ['outline', 'source', 'outputs', 'all'], description: 'View to return (default outline).' },
+                    startLine: { type: 'number', description: '1-based inclusive source start line.' },
+                    endLine: { type: 'number', description: '1-based inclusive source end line.' },
+                    maxSourceChars: { type: 'number', description: 'Source bound; 0 opts into the full source.' },
                     outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail when included: summary, preferred text (default), or all text representations.' },
                     maxOutputChars: { type: 'number', description: 'Maximum output characters per cell (default 12000; clamped to 1000..100000).' }
                 },
@@ -279,7 +207,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             })
         },
         async (args) => {
-            const a = (args ?? {}) as { notebookRef?: string; cellIds?: Array<string | number>; includeOutputs?: boolean; outputMode?: OutputMode; maxOutputChars?: number };
+            const a = (args ?? {}) as { notebookRef?: string; cellIds?: Array<string | number>; view?: 'outline' | 'source' | 'outputs' | 'all'; startLine?: number; endLine?: number; maxSourceChars?: number; outputMode?: OutputMode; maxOutputChars?: number };
             if (!a.notebookRef) throw new Error('notebookRef is required');
             const text = await router.invokeNotebook('read_notebook', a.notebookRef, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
@@ -362,8 +290,7 @@ required: ['notebookRef', 'edits']
             'run_cells',
             {
                 description:
-                    'Run one or more cells headlessly. By default, run in order and wait for completion, returning bounded text outputs; ' +
-                    'a timeout reports a pending or unobserved execution status and does not interrupt the kernel. Set wait=false to dispatch all selected cells and return immediately; dispatch does not confirm queue admission. ' +
+                    'Run one or more cells headlessly. Creates a tracked execution and waits up to waitMs (default 1000) for a bounded receipt; the sequential background runner continues after the request returns. ' +
                     'Provide the notebook URI and an array of 0-based cell indices. Select a kernel separately with an exact id before running. ' +
                     'Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
@@ -371,24 +298,50 @@ required: ['notebookRef', 'edits']
                     properties: {
                         notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                         cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or cell ids) to run.' },
-                        timeoutMs: { type: 'number', description: 'Max ms to wait per cell (default 60000); does not interrupt on timeout.' },
-                        wait: { type: 'boolean', description: 'Wait for each result (default true). False dispatches all selected cells immediately without confirming queue admission.' },
+                    waitMs: { type: 'number', description: 'How long this request waits for the tracked receipt (default 1000); execution continues independently.' },
                         includeOutputs: { type: 'boolean', description: 'Include compact saved outputs for completed cells (default true).' },
                         outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail: summary, preferred text (default), or all text representations.' },
-                        maxOutputChars: { type: 'number', description: 'Maximum output characters per cell (default 12000; clamped to 1000..100000).' }
+                        maxOutputChars: { type: 'number', description: 'Requested output formatting bound; tracked receipts retain at most 12000 characters per cell.' }
                     },
                     required: ['notebookRef', 'cellIds']
                 })
             },
             async (args) => {
-                const a = (args ?? {}) as { notebookRef?: string; cellIds?: Array<string | number>; timeoutMs?: number; wait?: boolean; includeOutputs?: boolean; outputMode?: OutputMode; maxOutputChars?: number };
+                const a = (args ?? {}) as { notebookRef?: string; cellIds?: Array<string | number>; waitMs?: number; includeOutputs?: boolean; outputMode?: OutputMode; maxOutputChars?: number };
                 if (!a.notebookRef) throw new Error('notebookRef is required');
                 if (!Array.isArray(a.cellIds) || a.cellIds.length === 0) throw new Error('cellIds must be a non-empty array');
+                if (a.waitMs !== undefined && (!Number.isSafeInteger(a.waitMs) || a.waitMs < 0)) throw new Error('waitMs must be a non-negative safe integer');
                 const text = await router.invokeNotebook('run_cells', a.notebookRef, a as Record<string, unknown>);
                 return { content: [{ type: 'text' as const, text }] };
             }
         );
     }
+    // ---- Tracked execution status (read-only) ----
+    server.registerTool(
+        'get_execution',
+        {
+            description: 'Read a tracked run_cells execution. Omit executionId to recover the most recent run for this notebook; waitMs waits for completion or budget expiry and never dispatches or interrupts execution.',
+            inputSchema: jsonSchemaToZod({
+                type: 'object',
+                properties: {
+                    notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
+                    executionId: { type: 'string', description: 'Opaque execution id returned by run_cells.' },
+                    waitMs: { type: 'number', description: 'How long to wait for completion before returning the current receipt (default 0).' },
+                    includeOutputs: { type: 'boolean', description: 'Include bounded captured outputs (default false).' },
+                    outputMode: { type: 'string', enum: ['summary', 'text', 'full'] },
+                    maxOutputChars: { type: 'number', description: 'Requested output formatting bound; the immutable snapshot retains at most 12000 characters per cell.' }
+                },
+                required: ['notebookRef']
+            })
+        },
+        async (args) => {
+            const a = (args ?? {}) as { notebookRef?: string; executionId?: string; waitMs?: number; includeOutputs?: boolean; outputMode?: OutputMode; maxOutputChars?: number };
+            if (!a.notebookRef) throw new Error('notebookRef is required');
+            if (a.waitMs !== undefined && (!Number.isSafeInteger(a.waitMs) || a.waitMs < 0)) throw new Error('waitMs must be a non-negative safe integer');
+            const text = await router.invokeNotebook('get_execution', a.notebookRef, a as Record<string, unknown>);
+            return { content: [{ type: 'text' as const, text }] };
+        }
+    );
     // ---- Restart notebooks (kernel) (requires Jupyter) ----
     if (hasJupyter) {
         server.registerTool(
@@ -505,7 +458,7 @@ const a = (args ?? {}) as { notebookRefs?: string[] };
     if (hasJupyter) {
     const fileSchema = z.object({
         notebookRef: z.string().describe('Open notebook URI or notebookRef from list_notebooks.'),
-        localPath: z.string().describe('Explicit file path on the VS Code host.'),
+        hostPath: z.string().describe('Explicit file path on the VS Code extension host.'),
         kernelPath: z.string().describe('Explicit absolute path in the current active Python kernel filesystem.'),
         overwrite: z.boolean().optional().describe('Replace an existing destination (default false).'),
         maxBytes: z.number().int().positive().optional().describe('Positive transfer size limit in bytes (default 64 MiB).')
@@ -514,17 +467,17 @@ const a = (args ?? {}) as { notebookRefs?: string[] };
         description: 'Upload one host file to the filesystem of the current active idle Python kernel through the public Jupyter executeCode API. Does not start or select a kernel. Enforces maxBytes, verifies byte count and SHA-256 before atomic promotion, and defaults to no overwrite.',
         inputSchema: fileSchema
     }, async (args) => {
-        const a = (args ?? {}) as { notebookRef?: string; localPath?: string; kernelPath?: string; overwrite?: boolean; maxBytes?: number };
-        if (!a.notebookRef || !a.localPath || !a.kernelPath) throw new Error('notebookRef, localPath, and kernelPath are required');
+        const a = (args ?? {}) as { notebookRef?: string; hostPath?: string; kernelPath?: string; overwrite?: boolean; maxBytes?: number };
+        if (!a.notebookRef || !a.hostPath || !a.kernelPath) throw new Error('notebookRef, hostPath, and kernelPath are required');
         const text = await router.invokeNotebook('upload_file', a.notebookRef, a as Record<string, unknown>);
         return { content: [{ type: 'text' as const, text }] };
     });
     server.registerTool('download_file', {
-        description: 'Download one file from the current active idle Python kernel filesystem to the VS Code host through the public Jupyter executeCode API. Does not start or select a kernel. Enforces maxBytes before file output, verifies byte count and SHA-256 before atomic promotion, and defaults to no overwrite.',
+        description: 'Download one file from the current active idle Python kernel filesystem to the VS Code extension host through the public Jupyter executeCode API. Does not start or select a kernel. Enforces maxBytes before file output, verifies byte count and SHA-256 before atomic promotion, and defaults to no overwrite.',
         inputSchema: fileSchema
     }, async (args) => {
-        const a = (args ?? {}) as { notebookRef?: string; localPath?: string; kernelPath?: string; overwrite?: boolean; maxBytes?: number };
-        if (!a.notebookRef || !a.localPath || !a.kernelPath) throw new Error('notebookRef, localPath, and kernelPath are required');
+        const a = (args ?? {}) as { notebookRef?: string; hostPath?: string; kernelPath?: string; overwrite?: boolean; maxBytes?: number };
+        if (!a.notebookRef || !a.hostPath || !a.kernelPath) throw new Error('notebookRef, hostPath, and kernelPath are required');
         const text = await router.invokeNotebook('download_file', a.notebookRef, a as Record<string, unknown>);
         return { content: [{ type: 'text' as const, text }] };
     });

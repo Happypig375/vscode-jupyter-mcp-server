@@ -50,6 +50,9 @@ async function main(): Promise<void> {
         listLocalNotebooks: () => uris,
         invokeLocal: async (operation, args) => {
             invocations.get(id)!.push({ operation, args });
+            if (id === 'window-b' && operation === 'get_execution' && args.waitMs === 3_600_000) {
+                await new Promise((resolve) => setTimeout(resolve, 1_650));
+            }
             return `${id}:${operation}`;
         },
         handleMcpRequest: async (_req, res) => {
@@ -88,6 +91,13 @@ async function main(): Promise<void> {
             'window-b:read_notebook'
         );
         assert.strictEqual(invocations.get('window-b')!.at(-1)!.args.notebookRef, shared);
+
+        const longWaitStarted = Date.now();
+        assert.strictEqual(
+            await originalBroker.invokeNotebook('get_execution', routed.notebookRef, { waitMs: 3_600_000 }),
+            'window-b:get_execution'
+        );
+        assert.ok(Date.now() - longWaitStarted >= 1_500, 'operation RPC must outlive the short control-plane deadline');
 
         for (const calls of invocations.values()) calls.length = 0;
         await originalBroker.invokeNotebooks('save_notebooks', [

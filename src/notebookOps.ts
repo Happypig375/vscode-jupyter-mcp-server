@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 
 /**
  * Notebook operations for the Jupyter MCP server.
@@ -32,9 +33,8 @@ export interface OutputOptions {
 export interface RunCellsOptions extends OutputOptions {
     /** Legacy best-effort kernel label/id hint. Use select_kernel for exact selection. */
     kernel?: string;
-    timeoutMs?: number;
-    /** Return immediately after queueing all selected cells. */
-    wait?: boolean;
+    /** Bound this request's wait; the tracked runner continues independently. */
+    waitMs?: number;
     /** Include compact saved outputs in completed-cell results (default true). */
     includeOutputs?: boolean;
 }
@@ -268,6 +268,42 @@ function executionState(cell: vscode.NotebookCell): string {
     return 'not-run';
 }
 
+export interface GetExecutionOptions extends OutputOptions {
+    executionId?: string;
+    waitMs?: number;
+    includeOutputs?: boolean;
+}
+
+type TrackedCell = { requestedIndex: number; currentIndex?: number; id: string; sourceHash: string; state: string; reason?: string; executionOrder?: number; success?: boolean; outputs?: Partial<Record<OutputMode, string>> };
+type TrackedRun = { executionId: string; notebook: string; generation: number; cells: TrackedCell[]; state: string; reason?: string; startedAt: number; finishedAt?: number; outputChars: Record<OutputMode, number>; promise: Promise<void> };
+const executionRuns = new Map<string, TrackedRun[]>();
+const executionGenerations = new Map<string, number>();
+const MAX_EXECUTIONS = 8;
+const MAX_OUTPUT_CHARS = 12000;
+const MAX_TOTAL_OUTPUT_CHARS = 48_000;
+const MAX_EXECUTION_NOTEBOOKS = 32;
+const MAX_ACTIVE_EXECUTIONS = 16;
+const MAX_CELLS_PER_EXECUTION = 256;
+const TERMINAL_RETENTION_MS = 60 * 60 * 1000;
+const TERMINAL_STATES = new Set(['completed', 'failed', 'unavailable']);
+function textHash(value: string): string { return crypto.createHash('sha256').update(value).digest('hex'); }
+function pruneExecutionRuns(): void {
+    const cutoff = Date.now() - TERMINAL_RETENTION_MS;
+    for (const [key, runs] of executionRuns) {
+        const kept = runs.filter((run) => !run.finishedAt || run.finishedAt >= cutoff).slice(0, MAX_EXECUTIONS);
+        if (kept.length) executionRuns.set(key, kept); else executionRuns.delete(key);
+    }
+    while (executionRuns.size > MAX_EXECUTION_NOTEBOOKS) {
+        const oldest = [...executionRuns.entries()]
+            .filter(([, runs]) => runs.every((run) => TERMINAL_STATES.has(run.state)))
+            .sort((a, b) => (a[1][0]?.startedAt ?? 0) - (b[1][0]?.startedAt ?? 0))[0];
+        if (oldest) executionRuns.delete(oldest[0]); else break;
+    }
+    for (const key of [...executionGenerations.keys()]) if (!executionRuns.has(key)) executionGenerations.delete(key);
+}
+function executionGeneration(uri: string): number { return executionGenerations.get(uri) ?? 0; }
+function invalidateExecutionGeneration(uri: string): void { executionGenerations.set(uri, executionGeneration(uri) + 1); }
+
 /** Native summary: cells, types, languages, line counts, execution state, output mime types. */
 export async function getNotebookSummary(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
@@ -438,6 +474,7 @@ export async function restartKernel(filePath: string): Promise<string> {
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
+    invalidateExecutionGeneration(nb.uri.toString());
     await vscode.commands.executeCommand('notebook.restartKernel', nb.uri);
     return `Restarted kernel for ${nb.uri.toString()}.`;
 }
@@ -453,6 +490,7 @@ export async function interruptKernels(filePaths: string[]): Promise<string> {
         if (!nb) {
             throw new Error(`No open notebook matches '${fp}'. Use list_notebooks to list them.`);
         }
+        invalidateExecutionGeneration(nb.uri.toString());
         await vscode.commands.executeCommand('notebook.interruptKernel', nb.uri);
         lines.push(`Interrupted kernel for ${nb.uri.toString()}.`);
     }
@@ -832,7 +870,13 @@ export async function getNotebooksSummary(filePaths: string[]): Promise<string> 
 
 /** Signature of a cell's outputs (used to detect a fresh execution result). */
 function outputSignature(cell: vscode.NotebookCell): string {
-    return cell.outputs.map((o) => o.items.map((i) => `${i.mime}:${i.data.byteLength}`).join(',')).join('|');
+    const hash = crypto.createHash('sha256');
+    for (const output of cell.outputs) for (const item of output.items) {
+        hash.update(item.mime); hash.update(':');
+        const data = item.data instanceof Uint8Array ? Buffer.from(item.data) : Buffer.from(String(item.data));
+        hash.update(data); hash.update('|');
+    }
+    return hash.digest('hex');
 }
 
 /** Baseline before executing a cell, to detect when the execution actually completes. */
@@ -861,15 +905,23 @@ function isFreshExecution(cell: vscode.NotebookCell, baseline: { order?: number;
     if (s.executionOrder !== undefined && s.executionOrder !== baseline.order) {
         return true;
     }
-    return outputSignature(cell) !== baseline.signature;
+    // Output growth alone is not completion: streaming output can arrive while
+    // the previous execution is still running. Require a new execution summary.
+    return false;
 }
 
 /** Wait until a cell completes. A timeout is a non-error because the kernel may still be running. */
-async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, baseline: { order?: number; startTime?: number; endTime?: number; signature: string; hadSummary: boolean }, requestedAt: number, timeoutMs: number): Promise<{ cell?: vscode.NotebookCell; observed: boolean }> {
-    const deadline = requestedAt + (timeoutMs > 0 ? timeoutMs : 24 * 60 * 60 * 1000);
+async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, expectedId: string, expectedSourceHash: string, generation: number, baseline: { order?: number; startTime?: number; endTime?: number; signature: string; hadSummary: boolean }, requestedAt: number, control: { cancelled: boolean }, onObserved: () => void): Promise<{ cell?: vscode.NotebookCell; observed: boolean }> {
     let observed = false;
-    while (Date.now() < deadline) {
-        const cell = notebook.cellAt(index);
+    // The request wait budget must never cancel an execution. Continue observing
+    // until the owning notebook closes or a fresh result is visible.
+    while (true) {
+        if (control.cancelled) return { observed };
+        if (!notebook || !vscode.workspace.notebookDocuments.includes(notebook)) return { observed: false };
+        if (executionGeneration(notebook.uri.toString()) !== generation) return { observed };
+        let cell: vscode.NotebookCell;
+        try { cell = notebook.cellAt(index); } catch { return { observed, }; }
+        if (cellIdentifier(cell, index) !== expectedId || textHash(cell.document.getText()) !== expectedSourceHash) return { observed: false };
         if (isFreshExecution(cell, baseline, requestedAt)) {
             return { cell, observed: true };
         }
@@ -877,8 +929,9 @@ async function waitForCellExecution(notebook: vscode.NotebookDocument, index: nu
         observed ||= Boolean(summary && (
             (summary.timing?.startTime !== undefined && summary.timing.startTime >= requestedAt && summary.timing.startTime !== baseline.startTime) ||
             (summary.executionOrder !== undefined && summary.executionOrder !== baseline.order) ||
-            outputSignature(cell) !== baseline.signature
+            false
         ));
+        if (observed) onObserved();
         await new Promise((r) => setTimeout(r, 100));
     }
     return { observed };
@@ -909,8 +962,10 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     if (options.kernel) {
         throw new Error('The kernel option is unsupported. Call select_kernel with an exact kernelId before run_cells.');
     }
-    await saveDirtyNotebook(filePath);
-
+    if (options.waitMs !== undefined && (!Number.isSafeInteger(options.waitMs) || options.waitMs < 0)) {
+        throw new Error('waitMs must be a non-negative safe integer');
+    }
+    if (cellIds.length > MAX_CELLS_PER_EXECUTION) throw new Error(`cellIds must contain at most ${MAX_CELLS_PER_EXECUTION} cells`);
     const indices = cellIds.map((c) => resolveCellIndex(nb, c));
     for (const idx of indices) {
         if (nb.cellAt(idx).kind !== vscode.NotebookCellKind.Code) {
@@ -918,57 +973,131 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
         }
     }
 
-    await revealNotebookForExecution(nb);
-
-    if (options.wait === false) {
-        const dispatch = vscode.commands.executeCommand('notebook.cell.execute', {
-            document: nb.uri,
-            ranges: indices.map((idx) => ({ start: idx, end: idx + 1 }))
-        });
-        void Promise.resolve(dispatch).catch(() => undefined);
-        return `Dispatched ${indices.length} cell(s) in ${nb.uri.toString()}: ${indices.join(', ')}. Queue admission is unconfirmed; use inspect_notebooks or read_cell_outputs to inspect progress.`;
+    const key = nb.uri.toString();
+    pruneExecutionRuns(); const history = executionRuns.get(key) ?? [];
+    const active = history.find((r) => !TERMINAL_STATES.has(r.state));
+    if (active) throw new Error(`Notebook already has an active execution: ${active.executionId}`);
+    const activeCount = [...executionRuns.values()].flat().filter((r) => !TERMINAL_STATES.has(r.state)).length;
+    if (activeCount >= MAX_ACTIVE_EXECUTIONS) throw new Error(`At most ${MAX_ACTIVE_EXECUTIONS} notebook executions may be active in this VS Code window`);
+    if (!executionRuns.has(key) && executionRuns.size >= MAX_EXECUTION_NOTEBOOKS) {
+        const evictable = [...executionRuns.entries()]
+            .filter(([, runs]) => runs.every((run) => TERMINAL_STATES.has(run.state)))
+            .sort((a, b) => (a[1][0]?.startedAt ?? 0) - (b[1][0]?.startedAt ?? 0))[0];
+        if (evictable) executionRuns.delete(evictable[0]);
+        else throw new Error(`Tracked execution registry is full (${MAX_EXECUTION_NOTEBOOKS} notebooks)`);
     }
-
-    const results: string[] = [];
-    for (const idx of indices) {
-        const baseline = executionBaseline(nb.cellAt(idx));
-        const requestedAt = Date.now();
-        const command = Promise.resolve(vscode.commands.executeCommand('notebook.cell.execute', {
-            document: nb.uri,
-            ranges: [{ start: idx, end: idx + 1 }]
-        }));
-        const commandOutcome = command.then(
-            () => ({ kind: 'resolved' as const }),
-            (error: unknown) => ({ kind: 'rejected' as const, error })
-        );
-        const observationPromise = waitForCellExecution(nb, idx, baseline, requestedAt, options.timeoutMs ?? 60_000);
-        const first = await Promise.race([
-            commandOutcome,
-            observationPromise.then((observation) => ({ kind: 'observed' as const, observation }))
-        ]);
-        if (first.kind === 'rejected') throw first.error;
-        const observation = first.kind === 'observed' ? first.observation : await observationPromise;
-        if (!observation.cell) {
-            results.push(observation.observed
-                ? `[cell ${idx}] execution observed but did not complete within ${options.timeoutMs ?? 60_000} ms. Execution was not interrupted.`
-                : `[cell ${idx}] execution was not observed to start within ${options.timeoutMs ?? 60_000} ms. The request was not cancelled and may still start after the timeout.`);
-            break;
+    const id = `exec_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const run: TrackedRun = { executionId: id, notebook: key, generation: executionGeneration(key), state: 'requested', startedAt: Date.now(), outputChars: { summary: 0, text: 0, full: 0 }, cells: indices.map((idx) => ({ requestedIndex: idx, id: cellIdentifier(nb.cellAt(idx), idx), sourceHash: textHash(nb.cellAt(idx).document.getText()), state: 'requested' })), promise: Promise.resolve() };
+    const receiptOptions = { ...options, includeOutputs: options.includeOutputs !== false };
+    history.unshift(run); executionRuns.set(key, history.slice(0, MAX_EXECUTIONS));
+    run.promise = executeTrackedRun(nb, run, receiptOptions).catch((error: unknown) => {
+        run.state = 'failed'; run.reason = sanitizeExecutionError(error); run.finishedAt = Date.now();
+        for (const cell of run.cells) {
+            if (cell.state === 'dispatched') {
+                cell.state = 'failed'; cell.reason = run.reason;
+            }
         }
-        const cell = observation.cell;
-        const status = cell.executionSummary?.success === true ? 'success' : 'error';
-        const output = options.includeOutputs === false ? '' : `\n${formatCellOutputs(cell, options)}`;
-        results.push(
-            `[cell ${idx}] ${status}${cell.executionSummary?.executionOrder !== undefined ? ` (execution #${cell.executionSummary.executionOrder})` : ''}\n` +
-            output.trimStart()
-        );
-        if (status === 'error') break;
+    }).finally(() => {
+        if (TERMINAL_STATES.has(run.state)) {
+            for (const cell of run.cells) if (cell.state === 'requested') {
+                cell.state = 'not-run';
+                cell.reason = `Not dispatched because the tracked execution ended with status ${run.state}.`;
+            }
+            if (!run.finishedAt) run.finishedAt = Date.now();
+        }
+    });
+    return await waitForExecutionReceipt(run, options.waitMs ?? 1_000, receiptOptions);
+}
+
+function sanitizeExecutionError(error: unknown): string {
+    const name = error instanceof Error && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(error.name) ? error.name : 'Error';
+    return `Execution failed in the VS Code extension host (${name}).`;
+}
+function executionReceipt(run: TrackedRun, options: RunCellsOptions | GetExecutionOptions = {}, waitTimedOut = false): string {
+    let remainingOutputChars = MAX_TOTAL_OUTPUT_CHARS;
+    const requestedOutputChars = Math.min(MAX_OUTPUT_CHARS, clampMaxChars(options.maxChars));
+    const cells = run.cells.map((c) => {
+        const output = options.includeOutputs && c.outputs ? c.outputs[options.mode ?? 'text']?.slice(0, Math.min(requestedOutputChars, remainingOutputChars)) : undefined;
+        remainingOutputChars -= output?.length ?? 0;
+        return { cellId: c.id, requestedIndex: c.requestedIndex, ...(c.currentIndex !== undefined ? { currentIndex: c.currentIndex } : {}), state: c.state, ...(c.reason ? { reason: c.reason } : {}), ...(c.executionOrder !== undefined ? { executionOrder: c.executionOrder } : {}), ...(output ? { output } : {}) };
+    });
+    return JSON.stringify({ executionId: run.executionId, notebookRef: run.notebook, status: run.state, cells, ...(run.reason ? { reason: run.reason } : {}), ...(waitTimedOut ? { waitTimedOut: true } : {}) });
+}
+async function waitForExecutionReceipt(run: TrackedRun, waitMs: number, options: RunCellsOptions | GetExecutionOptions): Promise<string> {
+    if (run.state === 'completed' || run.state === 'failed' || run.state === 'unavailable') return executionReceipt(run, options);
+    let timed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+    const waitBudget = new Promise<void>((resolve) => {
+        const deadline = Date.now() + waitMs;
+        const schedule = () => {
+            if (cancelled) return;
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) { timed = true; resolve(); return; }
+            timer = setTimeout(schedule, Math.min(remaining, 2_147_000_000));
+        };
+        schedule();
+    });
+    await Promise.race([run.promise, waitBudget]);
+    cancelled = true;
+    if (timer !== undefined) clearTimeout(timer);
+    return executionReceipt(run, options, timed && !['completed', 'failed', 'unavailable'].includes(run.state));
+}
+async function executeTrackedRun(nb: vscode.NotebookDocument, run: TrackedRun, options: RunCellsOptions): Promise<void> {
+    await saveDirtyNotebook(run.notebook);
+    await revealNotebookForExecution(nb);
+    for (const tracked of run.cells) {
+        if (executionGeneration(run.notebook) !== run.generation) { tracked.state = 'unavailable'; tracked.reason = 'Kernel lifecycle changed; execution was invalidated.'; run.state = 'unavailable'; return; }
+        const current = findNotebook(run.notebook);
+        if (!current || current !== nb || tracked.requestedIndex >= current.cellCount) { tracked.state = 'unavailable'; tracked.reason = 'Notebook closed or cell disappeared.'; run.state = 'unavailable'; return; }
+        const cell = current.cellAt(tracked.requestedIndex);
+        if (cellIdentifier(cell, tracked.requestedIndex) !== tracked.id || textHash(cell.document.getText()) !== tracked.sourceHash) { tracked.state = 'unavailable'; tracked.reason = 'Cell changed or moved; execution stopped safely.'; run.state = 'unavailable'; return; }
+        tracked.currentIndex = tracked.requestedIndex; tracked.state = 'dispatched';
+        const baseline = executionBaseline(cell); const requestedAt = Date.now();
+        const dispatch = Promise.resolve(vscode.commands.executeCommand('notebook.cell.execute', { document: nb.uri, ranges: [{ start: tracked.requestedIndex, end: tracked.requestedIndex + 1 }] }));
+        const dispatchFailure = dispatch.then(() => new Promise<never>(() => undefined), (error: unknown) => Promise.reject(error));
+        const observerControl = { cancelled: false };
+        let observed: { cell?: vscode.NotebookCell; observed: boolean };
+        try {
+            observed = await Promise.race([
+                waitForCellExecution(nb, tracked.requestedIndex, tracked.id, tracked.sourceHash, run.generation, baseline, requestedAt, observerControl, () => { run.state = 'running'; }),
+                dispatchFailure
+            ]);
+        } catch (error) {
+            tracked.state = 'failed'; tracked.reason = sanitizeExecutionError(error); run.state = 'failed'; run.reason = tracked.reason; run.finishedAt = Date.now(); return;
+        } finally {
+            observerControl.cancelled = true;
+        }
+        if (!observed.cell) { tracked.state = 'unavailable'; tracked.reason = observed.observed ? 'Execution completion could not be observed.' : 'Execution was not observed.'; run.state = 'unavailable'; return; }
+        const result = observed.cell; tracked.executionOrder = result.executionSummary?.executionOrder; tracked.success = result.executionSummary?.success === true; tracked.state = tracked.success ? 'completed' : 'failed';
+        tracked.outputs = {};
+        for (const mode of ['summary', 'text', 'full'] as const) {
+            const remaining = Math.max(0, MAX_TOTAL_OUTPUT_CHARS - run.outputChars[mode]);
+            const output = formatCellOutputs(result, { mode, maxChars: options.maxChars }).slice(0, Math.min(MAX_OUTPUT_CHARS, remaining));
+            tracked.outputs[mode] = output;
+            run.outputChars[mode] += output.length;
+        }
+        if (!tracked.success) {
+            run.state = 'failed'; run.reason = `Cell ${tracked.requestedIndex} reported failure.`;
+            if (!nb.isUntitled) await forceSaveNotebook(nb);
+            run.finishedAt = Date.now(); return;
+        }
     }
-    // Do not trust isDirty here. Some remote providers update outputs and execution
-    // summaries in the live notebook model without marking the document dirty.
-    if (!nb.isUntitled) {
-        await forceSaveNotebook(nb);
-    }
-    return results.join('\n');
+    if (!nb.isUntitled) await forceSaveNotebook(nb);
+    run.state = 'completed'; run.finishedAt = Date.now();
+}
+
+/** Read a tracked execution without dispatching or requiring Jupyter availability. */
+export async function getExecution(filePath: string, options: GetExecutionOptions = {}): Promise<string> {
+    const nb = findNotebook(filePath);
+    if (!nb) throw new Error(`No open notebook matches '${filePath}'. Tracked executions are available only while the owning notebook remains open in this VS Code window.`);
+    const key = nb.uri.toString();
+    pruneExecutionRuns(); const history = executionRuns.get(key) ?? []; const run = options.executionId ? history.find((r) => r.executionId === options.executionId) : history[0];
+    if (!run) throw new Error(options.executionId ? `Unknown executionId '${options.executionId}' for this notebook.` : `No tracked execution exists for '${filePath}'.`);
+    if (options.executionId && run.notebook !== key) throw new Error(`executionId '${options.executionId}' belongs to another notebook.`);
+    const waitMs = options.waitMs ?? 0;
+    if (!Number.isSafeInteger(waitMs) || waitMs < 0) throw new Error('waitMs must be a non-negative safe integer');
+    return waitForExecutionReceipt(run, waitMs, options);
 }
 
 /** Apply several edits to a notebook, in order. Each edit omits filePath (added internally). */
@@ -992,34 +1121,40 @@ export async function editNotebookCells(filePath: string, edits: Array<Omit<Edit
  * language, source, line count, execution state, and compact outputs.
  * Adapted from the whole-notebook read in vscode-inmemory-notebook-mcp.
  */
-export async function readNotebook(filePath: string, opts: { includeOutputs?: boolean; cellIds?: Array<string | number>; outputMode?: OutputMode; maxOutputChars?: number } = {}): Promise<string> {
+export async function readNotebook(filePath: string, opts: { view?: 'outline' | 'source' | 'outputs' | 'all'; cellIds?: Array<string | number>; startLine?: number; endLine?: number; maxSourceChars?: number; outputMode?: OutputMode; maxOutputChars?: number } = {}): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
+    const view = opts.view ?? 'outline';
+    if (opts.startLine !== undefined && (!Number.isInteger(opts.startLine) || opts.startLine < 1)) throw new Error('startLine must be a positive integer');
+    if (opts.endLine !== undefined && (!Number.isInteger(opts.endLine) || opts.endLine < 1)) throw new Error('endLine must be a positive integer');
+    if (opts.startLine !== undefined && opts.endLine !== undefined && opts.endLine < opts.startLine) throw new Error('endLine must be greater than or equal to startLine');
+    if (opts.maxSourceChars !== undefined && (!Number.isInteger(opts.maxSourceChars) || opts.maxSourceChars < 0)) throw new Error('maxSourceChars must be a non-negative integer');
     const selected = opts.cellIds && opts.cellIds.length
         ? opts.cellIds.map((c) => resolveCellIndex(nb, c))
         : nb.getCells().map((_, i) => i);
 
-    const blocks: string[] = [`Notebook: ${nb.uri.toString()}`, `Cells: ${nb.cellCount}`];
+    const cells: Array<Record<string, unknown>> = [];
     for (const idx of selected) {
         const cell = nb.cellAt(idx);
         const exec = cell.executionSummary;
         const id = cellIdentifier(cell, idx);
-        blocks.push(
-            `[cell ${idx} | id:${id} | ${cell.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown'} | ${cell.document.languageId} | ` +
-            `state:${executionState(cell)}${exec?.executionOrder !== undefined ? ` (#${exec.executionOrder})` : ''}]`
-        );
-        blocks.push(cell.document.getText());
-        if (opts.includeOutputs) {
-            if (cell.outputs.length) {
-                blocks.push('[output]');
-                blocks.push(formatCellOutputs(cell, { mode: opts.outputMode, maxChars: opts.maxOutputChars }));
-            }
+        const entry: Record<string, unknown> = { index: idx, cell_id: id, kind: cell.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown', language: cell.document.languageId, lineCount: cell.document.getText().split('\n').length, executionState: executionState(cell) };
+        if (view === 'source' || view === 'all') {
+            const allLines = cell.document.getText().split('\n');
+            const start = opts.startLine ?? 1;
+            const end = opts.endLine ?? allLines.length;
+            if (start > allLines.length || end > allLines.length) throw new Error(`Requested source lines ${start}-${end} exceed cell ${idx} line count ${allLines.length}`);
+            const source = allLines.slice(start - 1, end).join('\n');
+            const max = opts.maxSourceChars ?? 12000;
+            entry.source = max === 0 ? source : source.slice(0, max);
+            entry.sourceTruncated = max !== 0 && source.length > max;
         }
-        blocks.push('');
+        if (view === 'outputs' || view === 'all') entry.outputs = cell.outputs.length ? formatCellOutputs(cell, { mode: opts.outputMode, maxChars: opts.maxOutputChars }) : '';
+        cells.push(entry);
     }
-    return blocks.join('\n');
+    return JSON.stringify({ notebook: nb.uri.toString(), cellCount: nb.cellCount, cells });
 }
 
 /**

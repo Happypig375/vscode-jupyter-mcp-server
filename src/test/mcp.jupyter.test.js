@@ -246,36 +246,46 @@ async function main() {
 
     // 1. With Jupyter present, kernel tools ARE exposed.
     await check('kernel tools exposed when Jupyter present', async () => {
-        const expected = ['create_notebook', 'list_notebooks', 'inspect_notebooks', 'read_cells', 'read_cell_outputs', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'read_notebook', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
+        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
     });
 
     // 2. run_cells waits and returns outputs.
     await check('run_cells returns captured outputs', async () => {
         const savesBefore = saveCalls;
-        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 5000 } });
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 5000 } });
         assert.ok(!res.isError, JSON.stringify(res));
+        const receipt = JSON.parse(res.content[0].text);
         assert.strictEqual(saveCalls, savesBefore + 1, 'completed execution must persist even when isDirty is false');
-        assert.match(res.content[0].text, /success/, 'expected success status');
+        assert.strictEqual(receipt.status, 'completed', 'expected completed status');
         assert.match(res.content[0].text, /hello/, 'expected captured output text');
         assert.match(res.content[0].text, /stream-line/, 'expected stdout stream output');
         assert.doesNotMatch(res.content[0].text, /duplicated-rich-output/, 'should not duplicate rich HTML when plain text exists');
         assert.match(res.content[0].text, /image\/png \| 6 bytes omitted/, 'expected binary image summary');
+        const summary = JSON.parse((await client.callTool({ name: 'get_execution', arguments: {
+            notebookRef: 'file:///C:/nb.ipynb', executionId: receipt.executionId, includeOutputs: true, outputMode: 'summary', maxOutputChars: 1000
+        } })).content[0].text);
+        assert.match(summary.cells[0].output, /text\/plain \d+ bytes/);
+        assert.doesNotMatch(summary.cells[0].output, /hello/);
+        const boundedFull = JSON.parse((await client.callTool({ name: 'get_execution', arguments: {
+            notebookRef: 'file:///C:/nb.ipynb', executionId: receipt.executionId, includeOutputs: true, outputMode: 'full', maxOutputChars: 1000
+        } })).content[0].text);
+        assert.ok(boundedFull.cells[0].output.length <= 1000, 'get_execution must honor its own output bound');
     });
 
     // 3. read_notebook returns whole notebook with anchors + source.
     await check('read_notebook reads whole notebook', async () => {
-        const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: 'file:///C:/nb.ipynb', includeOutputs: true } });
+        const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: 'file:///C:/nb.ipynb', view: 'all' } });
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /id:cell-abc/, 'expected cell id anchor');
-        assert.match(res.content[0].text, /print\("hello"\)/, 'expected source');
+        assert.match(res.content[0].text, /cell-abc/, 'expected cell id anchor');
+        assert.match(JSON.parse(res.content[0].text).cells[0].source, /print\("hello"\)/, 'expected source');
         assert.match(res.content[0].text, /hello/, 'expected outputs');
-        assert.match(res.content[0].text, /state:n\/a/, 'markdown cells must not be reported as execution errors');
+        assert.match(res.content[0].text, /"executionState":"n\/a"/, 'markdown cells must not be reported as execution errors');
     });
 
     await check('read_cell_outputs supports bounded summary mode', async () => {
-        const res = await client.callTool({ name: 'read_cell_outputs', arguments: {
-            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], outputMode: 'summary', maxOutputChars: 1000
+        const res = await client.callTool({ name: 'read_notebook', arguments: {
+            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], view: 'outputs', outputMode: 'summary', maxOutputChars: 1000
         } });
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(res.content[0].text, /text\/html \d+ bytes/);
@@ -294,10 +304,9 @@ async function main() {
             fixture._cells[0].outputs = [{ items: [{ mime: 'text/plain', data: Buffer.from('saved') }] }];
             fixture._cells[2].executionSummary = { executionOrder: 9 };
             fixture._cells[2].outputs = [];
-            const res = await client.callTool({ name: 'inspect_notebooks', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
+            const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
             assert.ok(!res.isError, JSON.stringify(res));
-            assert.match(res.content[0].text, /state=unknown.*outputs=\[text\/plain\]/);
-            assert.match(res.content[0].text, /state=unknown.*outputs=\[\]/);
+            assert.match(res.content[0].text, /"executionState":"unknown"/);
         } finally {
             fixture._cells[0].executionSummary = savedSummary;
             fixture._cells[0].outputs = savedOutput;
@@ -312,16 +321,19 @@ async function main() {
         executionDeferred = {};
         executionDeferred.promise = new Promise((resolve, reject) => { executionDeferred.resolve = resolve; executionDeferred.reject = reject; });
         const call = client.callTool({ name: 'run_cells', arguments: {
-            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], wait: false
+            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 0
         } });
         const res = await Promise.race([call, new Promise((_, reject) => setTimeout(() => reject(new Error('wait=false blocked on command promise')), 250))]);
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /Dispatched 1 cell/);
-        assert.match(res.content[0].text, /Queue admission is unconfirmed/);
+        assert.match(res.content[0].text, /"executionId":"exec_/);
+        assert.strictEqual(JSON.parse(res.content[0].text).status, 'requested', 'dispatch alone must not claim running execution');
         assert.strictEqual(executionCalls.length, callsBefore + 1);
         assert.deepStrictEqual(executionCalls.at(-1).ranges, [{ start: 0, end: 1 }]);
         assert.strictEqual(executionCalls.at(-1).document.toString(), 'file:///C:/nb.ipynb');
+        openNotebooks[0]._cells[0].executionSummary = { success: true, executionOrder: 99, timing: { startTime: Date.now() - 1, endTime: Date.now() } };
         executionDeferred.resolve();
+        await client.callTool({ name: 'interrupt_kernels', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
+        await new Promise((resolve) => setTimeout(resolve, 300));
         executionMode = 'complete';
     });
 
@@ -344,19 +356,20 @@ async function main() {
         assert.strictEqual(inactive._cells[3].executionSummary, undefined);
         const before = executionCalls.length;
         const queued = await client.callTool({ name: 'run_cells', arguments: {
-            notebookRef: 'file:///C:/target-inactive.ipynb', cellIds: [0, 2], wait: false
+            notebookRef: 'file:///C:/target-inactive.ipynb', cellIds: [0, 2], waitMs: 0
         } });
         assert.ok(!queued.isError, JSON.stringify(queued));
-        assert.strictEqual(executionCalls.length, before + 1);
-        assert.deepStrictEqual(executionCalls.at(-1).ranges, [{ start: 0, end: 1 }, { start: 2, end: 3 }]);
+        assert.strictEqual(executionCalls.length, before + 2);
+        assert.deepStrictEqual(executionCalls.slice(before).map((call) => call.ranges), [[{ start: 0, end: 1 }], [{ start: 2, end: 3 }]]);
         assert.strictEqual(executionCalls.at(-1).document.toString(), 'file:///C:/target-inactive.ipynb');
+        await new Promise((resolve) => setTimeout(resolve, 50));
         assert.strictEqual(inactive._cells[1].executionSummary, undefined, 'unselected markdown cell must remain untouched');
         assert.deepStrictEqual({ summary: inactive._cells[3].executionSummary, outputs: inactive._cells[3].outputs }, inactiveSentinelSnapshot, 'unselected code cell must remain untouched');
         assert.deepStrictEqual(snapshot(active), activeSnapshot, 'targeting another notebook must not alter active notebook cells');
 
         const waitedBefore = executionCalls.length;
         const waited = await client.callTool({ name: 'run_cells', arguments: {
-            notebookRef: 'file:///C:/target-active.ipynb', cellIds: ['cell-tail', 0], timeoutMs: 5000
+            notebookRef: 'file:///C:/target-active.ipynb', cellIds: ['cell-tail', 0], waitMs: 5000
         } });
         assert.ok(!waited.isError, JSON.stringify(waited));
         assert.deepStrictEqual(executionCalls.slice(waitedBefore).map((call) => call.ranges), [
@@ -367,10 +380,14 @@ async function main() {
         const failedRevealCalls = executionCalls.length;
         showNotebookMismatch = true;
         const failedReveal = await client.callTool({ name: 'run_cells', arguments: {
-            notebookRef: 'file:///C:/target-inactive.ipynb', cellIds: [0], wait: false
+            notebookRef: 'file:///C:/target-inactive.ipynb', cellIds: [0], waitMs: 0
         } });
         showNotebookMismatch = false;
-        assert.ok(failedReveal.isError, 'mismatched editor reveal must fail closed');
+        assert.ok(!failedReveal.isError, JSON.stringify(failedReveal));
+        const failedReceipt = JSON.parse((await client.callTool({ name: 'get_execution', arguments: {
+            notebookRef: 'file:///C:/target-inactive.ipynb', executionId: JSON.parse(failedReveal.content[0].text).executionId, waitMs: 100
+        } })).content[0].text);
+        assert.strictEqual(failedReceipt.status, 'failed', 'mismatched editor reveal must fail closed');
         assert.strictEqual(executionCalls.length, failedRevealCalls, 'failed reveal must not dispatch execution');
     });
 
@@ -380,31 +397,34 @@ async function main() {
         executionDeferred.promise = new Promise((resolve) => { executionDeferred.resolve = resolve; });
         const started = Date.now();
         const res = await client.callTool({ name: 'run_cells', arguments: {
-            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 5
+            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 5
         } });
         assert.ok(Date.now() - started < 1000, 'timeout must not await the command promise');
+        openNotebooks[0]._cells[0].executionSummary = { success: true, executionOrder: 100, timing: { startTime: Date.now() - 1, endTime: Date.now() } };
         executionDeferred.resolve();
+        await new Promise((resolve) => setTimeout(resolve, 150));
         executionMode = 'complete';
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /not observed to start/);
-        assert.match(res.content[0].text, /request was not cancelled and may still start/i);
-        assert.match(res.content[0].text, /request was not cancelled and may still start/i);
+        assert.match(res.content[0].text, /"executionId":"exec_/);
+        assert.match(res.content[0].text, /"waitTimedOut":true/);
         executionMode = 'observed-hang';
         const observed = await client.callTool({ name: 'run_cells', arguments: {
-            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 5
+            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 5
         } });
         executionMode = 'complete';
         assert.ok(!observed.isError, JSON.stringify(observed));
-        assert.match(observed.content[0].text, /execution observed but did not complete/);
+        assert.match(observed.content[0].text, /"waitTimedOut":true/);
+        await client.callTool({ name: 'interrupt_kernels', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
+        await new Promise((resolve) => setTimeout(resolve, 150));
     });
 
     await check('run_cells observes completion while command promise remains pending', async () => {
         executionMode = 'deferred-complete';
         executionDeferred = {};
         executionDeferred.promise = new Promise((resolve) => { executionDeferred.resolve = resolve; });
-        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 500 } });
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 500 } });
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /success/);
+        assert.strictEqual(JSON.parse(res.content[0].text).status, 'completed');
         executionDeferred.resolve();
         executionMode = 'complete';
     });
@@ -412,25 +432,30 @@ async function main() {
     await check('run_cells stops ordered dispatch after a completed cell error', async () => {
         executionMode = 'error';
         const before = executionCalls.length;
-        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], timeoutMs: 500 } });
+        const savesBefore = saveCalls;
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], waitMs: 500 } });
         executionMode = 'complete';
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /\[cell 0\] error/);
+        assert.match(res.content[0].text, /"status":"failed"/);
+        assert.strictEqual(saveCalls, savesBefore + 1, 'failed execution outputs must be persisted');
+        assert.strictEqual(JSON.parse(res.content[0].text).cells[1].state, 'not-run');
         assert.strictEqual(executionCalls.length, before + 1, 'later cells must not dispatch after a completed error');
         assert.deepStrictEqual(executionCalls.at(-1).ranges, [{ start: 0, end: 1 }]);
     });
 
     await check('run_cells reports immediate command rejection and consumes detached rejection', async () => {
         executionMode = 'reject';
-        const failed = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], timeoutMs: 500 } });
-        assert.ok(failed.isError);
+        const failed = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 500 } });
+        assert.ok(!failed.isError, JSON.stringify(failed));
+        assert.match(failed.content[0].text, /"status":"failed"/);
+        assert.doesNotMatch(failed.content[0].text, /dispatch rejected/, 'raw command errors must be sanitized');
         const unhandled = [];
         const listener = (error) => unhandled.push(error);
         process.on('unhandledRejection', listener);
         executionMode = 'deferred-hang';
         executionDeferred = {};
         executionDeferred.promise = new Promise((resolve, reject) => { executionDeferred.resolve = resolve; executionDeferred.reject = reject; });
-        const detached = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], wait: false } });
+        const detached = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 0 } });
         assert.ok(!detached.isError, JSON.stringify(detached));
         executionDeferred.reject(new Error('late rejection'));
         await new Promise((resolve) => setImmediate(resolve));
@@ -441,19 +466,20 @@ async function main() {
 
     // 4. Cell-id anchors resolve in read_cells.
     await check('read_cells resolves by cell id anchor', async () => {
-        const res = await client.callTool({ name: 'read_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: ['cell-abc'] } });
+        const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: ['cell-abc'], view: 'source' } });
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /print\("hello"\)/);
+        assert.match(JSON.parse(res.content[0].text).cells[0].source, /print\("hello"\)/);
     });
 
     await check('read_cells applies bounded 1-based source ranges and truncates long single lines', async () => {
-        const ranged = await client.callTool({ name: 'read_cells', arguments: {
-            notebookRef: 'file:///C:/long-source.ipynb', cellIds: [0], startLine: 1, endLine: 1, maxSourceChars: 32
+        const ranged = await client.callTool({ name: 'read_notebook', arguments: {
+            notebookRef: 'file:///C:/long-source.ipynb', cellIds: [0], view: 'source', startLine: 1, endLine: 1, maxSourceChars: 32
         } });
         assert.ok(!ranged.isError, JSON.stringify(ranged));
-        assert.match(ranged.content[0].text, /truncated at 32 characters/);
-        assert.ok(ranged.content[0].text.includes('x'.repeat(32)));
-        const invalid = await client.callTool({ name: 'read_cells', arguments: {
+        const rangedValue = JSON.parse(ranged.content[0].text);
+        assert.strictEqual(rangedValue.cells[0].sourceTruncated, true);
+        assert.strictEqual(rangedValue.cells[0].source, 'x'.repeat(32));
+        const invalid = await client.callTool({ name: 'read_notebook', arguments: {
             notebookRef: 'file:///C:/long-source.ipynb', cellIds: [0], startLine: 2, endLine: 1
         } });
         assert.ok(invalid.isError);
@@ -638,7 +664,7 @@ async function main() {
         const callsBefore = executionCalls.length;
         const savesBefore = saveCalls;
         const legacy = await client.callTool({ name: 'run_cells', arguments: {
-            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], kernel: 'Python 3.12.2', wait: false
+            notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], kernel: 'Python 3.12.2', waitMs: 0
         } });
         assert.ok(legacy.isError);
         assert.strictEqual(selectedKernels.length, selectedBefore);
@@ -659,16 +685,17 @@ async function main() {
         assert.deepStrictEqual(openNotebooks[0]._cells[2].metadata, before[1].metadata);
         assert.strictEqual(openNotebooks[0]._cells[1].value, middleBefore.value);
         assert.strictEqual(openNotebooks[1]._cells[0].value, inactiveBefore.value);
-        const out = await client.callTool({ name: 'read_cell_outputs', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2] } });
-        assert.match(out.content[0].text, /no saved output/);
+        const out = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], view: 'outputs' } });
+        assert.strictEqual(JSON.parse(out.content[0].text).cells[0].outputs, '');
     });
 
     // 10. interrupt_kernels stops running execution.
     await check('interrupt_kernels works', async () => {
+        const before = interrupted.length;
         const res = await client.callTool({ name: 'interrupt_kernels', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(res.content[0].text, /Interrupted kernel/);
-        assert.strictEqual(interrupted.length, 1);
+        assert.strictEqual(interrupted.length, before + 1);
     });
 
     await client.close();

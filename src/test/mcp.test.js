@@ -167,6 +167,7 @@ async function main() {
     await bundle.activate(context);
     if (PORT === 0) PORT = Number(String(statusBar.tooltip).match(/127\.0\.0\.1:(\d+)/)[1]);
     const client = await waitForServer();
+    assert.strictEqual(client.getServerVersion().version, require('../../package.json').version, 'MCP handshake version must match package metadata');
 
     assert.strictEqual(statusBar.text, '$(notebook) MCP');
     assert.match(String(statusBar.tooltip), new RegExp(`http://127\\.0\\.0\\.1:${PORT}/mcp`));
@@ -180,7 +181,7 @@ async function main() {
 
     // 1. No Jupyter -> kernel tools absent, document tools present.
     await check('tool set (no Jupyter)', async () => {
-        const expected = ['create_notebook', 'list_notebooks', 'inspect_notebooks', 'read_cells', 'read_cell_outputs', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'read_notebook', 'export_notebook', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks'];
+        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
     });
 
@@ -206,23 +207,23 @@ async function main() {
 
     // 4. read_cells.
     await check('read_cells reads cells', async () => {
-        const res = await client.callTool({ name: 'read_cells', arguments: { notebookRef: createdUri, cellIds: [0, 1] } });
+        const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri, cellIds: [0, 1], view: 'source' } });
         assert.match(res.content[0].text, /Test notebook/);
         assert.match(res.content[0].text, /Add your code here/);
     });
 
     // 5. inspect_notebooks metadata.
     await check('inspect_notebooks returns metadata', async () => {
-        const res = await client.callTool({ name: 'inspect_notebooks', arguments: { notebookRefs: [createdUri] } });
-        assert.match(res.content[0].text, /Cells: 2/);
-        assert.match(res.content[0].text, /markdown/);
+        const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri } });
+        assert.match(res.content[0].text, /"cellCount":2/);
+        assert.match(res.content[0].text, /"kind":"markdown"/);
     });
 
     // 6. edit_cells (no re-run without Jupyter).
     await check('edit_cells edits a cell', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [{ cellId: 1, editType: 'edit', newCode: 'print("edited")' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const src = await client.callTool({ name: 'read_cells', arguments: { notebookRef: createdUri, cellIds: [1] } });
+        const src = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri, cellIds: [1], view: 'source' } });
         assert.match(src.content[0].text, /edited/);
     });
 
@@ -234,7 +235,7 @@ async function main() {
 
     // 8. read_cell_outputs graceful.
     await check('read_cell_outputs handles empty output', async () => {
-        const res = await client.callTool({ name: 'read_cell_outputs', arguments: { notebookRef: createdUri, cellIds: [0] } });
+        const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri, cellIds: [0], view: 'outputs' } });
         assert.ok(!res.isError, JSON.stringify(res));
     });
 
@@ -275,29 +276,28 @@ async function main() {
     });
     await expectError('edit_cells rejects missing edits', 'edit_cells', { notebookRef: 'x' });
     await expectError('edit_cells rejects bad editType', 'edit_cells', { notebookRef: 'x', edits: [{ cellId: 0, editType: 'bogus' }] });
-    await expectError('read_cell_outputs rejects empty cellIds', 'read_cell_outputs', { notebookRef: 'x', cellIds: [] });
-    await expectError('inspect_notebooks rejects missing notebookRef', 'inspect_notebooks', {});
-    await expectError('inspect_notebooks rejects empty notebookRefs', 'inspect_notebooks', { notebookRefs: [] });
+    await expectError('obsolete output tool is removed', 'read_cell_outputs', { notebookRef: 'x', cellIds: [] });
+    await expectError('obsolete metadata tool is removed', 'inspect_notebooks', {});
     await expectError('move_cells rejects empty cellIds', 'move_cells', { notebookRef: 'x', cellIds: [], toIndex: 0 });
     await expectError('move_cells rejects bad toIndex', 'move_cells', { notebookRef: 'x', cellIds: [0], toIndex: 'a' });
     await expectError('save_notebooks rejects empty notebookRefs', 'save_notebooks', { notebookRefs: [] });
-    await expectError('legacy filePath is rejected', 'read_cells', { filePath: createdUri });
+    await expectError('obsolete source tool is removed', 'read_cells', { filePath: createdUri });
     await expectError('unknown run_cells kernel is rejected', 'run_cells', { notebookRef: createdUri, cellIds: [0], kernel: 'python' });
 
     // --- edit_cells insert / delete / metadata on the created notebook ---
     await check('edit_cells inserts a cell', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [{ cellId: 0, editType: 'insert', newCode: 'print("inserted")' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const meta = await client.callTool({ name: 'inspect_notebooks', arguments: { notebookRefs: [createdUri] } });
-        assert.match(meta.content[0].text, /Cells: 3/);
+        const meta = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri } });
+        assert.match(meta.content[0].text, /"cellCount":3/);
     });
     await check('edit_cells TOP and BOTTOM insertion positions are exact', async () => {
         let res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [{ cellId: 'TOP', editType: 'insert', newCode: 'top_marker' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
         res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [{ cellId: 'BOTTOM', editType: 'insert', newCode: 'bottom_marker' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const first = await client.callTool({ name: 'read_cells', arguments: { notebookRef: createdUri, cellIds: [0] } });
-        const last = await client.callTool({ name: 'read_cells', arguments: { notebookRef: createdUri, cellIds: [4] } });
+        const first = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri, cellIds: [0], view: 'source' } });
+        const last = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri, cellIds: [4], view: 'source' } });
         assert.match(first.content[0].text, /top_marker/);
         assert.match(last.content[0].text, /bottom_marker/);
         res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [
@@ -309,8 +309,8 @@ async function main() {
     await check('edit_cells deletes a cell', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [{ cellId: 0, editType: 'delete' }] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        const meta = await client.callTool({ name: 'inspect_notebooks', arguments: { notebookRefs: [createdUri] } });
-        assert.match(meta.content[0].text, /Cells: 2/);
+        const meta = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri } });
+        assert.match(meta.content[0].text, /"cellCount":2/);
     });
     await check('edit_cells with metadata (updateCellMetadata path)', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [{ cellId: 0, editType: 'edit', newCode: 'x=1', metadata: { tags: ['parameters'] } }] } });
@@ -325,13 +325,13 @@ async function main() {
         assert.ok(res.isError);
     });
     await check('read_cells defaults to all cells', async () => {
-        const res = await client.callTool({ name: 'read_cells', arguments: { notebookRef: createdUri } });
+        const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri } });
         assert.ok(!res.isError, JSON.stringify(res));
     });
     await check('read_cells with explicit indices', async () => {
-        const res = await client.callTool({ name: 'read_cells', arguments: { notebookRef: createdUri, cellIds: [0, 1] } });
+        const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri, cellIds: [0, 1] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /cell 0/);
+        assert.match(res.content[0].text, /"index":0/);
     });
 
     // --- search_cells ---

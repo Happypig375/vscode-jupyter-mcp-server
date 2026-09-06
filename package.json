@@ -1,8 +1,8 @@
 {
   "name": "vscode-jupyter-mcp-server",
   "displayName": "Jupyter MCP Server",
-  "description": "A notebook-specific MCP server: run, edit, create, and manage Jupyter notebooks from any MCP client (Command Code CLI/desktop, Claude, etc.).",
-  "version": "0.3.0",
+  "description": "A notebook-specific MCP server for running, editing, creating, and managing Jupyter notebooks from MCP clients.",
+  "version": "0.4.0",
   "publisher": "Happypig375",
   "license": "MIT",
   "icon": "icon.png",
@@ -53,7 +53,7 @@
             "stdio"
           ],
           "default": "http",
-          "description": "MCP transport. 'http' starts a Streamable HTTP server on 127.0.0.1; 'stdio' speaks MCP over stdin/stdout (for clients that spawn a process)."
+          "description": "MCP transport. 'http' starts a Streamable HTTP server on 127.0.0.1; 'stdio' speaks MCP over stdin/stdout within the VS Code extension host."
         },
         "jupyterMcp.port": {
           "type": "number",

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 (Unreleased)
+
+- Added tracked `run_cells` executions with opaque execution IDs, bounded receipts, sequential background observation, duplicate protection, and safe recovery through the read-only `get_execution` tool.
+- Execution status is tied to captured cell identity and source; edits, moves, closure, or unavailable observation stop safely without attributing stale outputs.
+- Breaking: `read_notebook` is the sole public notebook reader, with outline/source/outputs/all views; the former inspect/source/output read tools were removed.
+- Breaking: kernel file transfer calls the VS Code extension-host path `hostPath` and rejects the obsolete `localPath` field.
+- Breaking: `run_cells` replaces `wait`/`timeoutMs` with a caller-only `waitMs` budget; `get_execution` provides read-only recovery, and cross-window operation transport supports hour-scale waits.
+
 ## 0.3.0
 
 - Breaking: `list_notebooks` now returns grouped connected windows (including empty windows), with each notebook represented once by its URI and a short opaque deterministic `nb_...` `notebookRef`; the legacy composite `windowId::uri` `notebookId` contract is removed.
