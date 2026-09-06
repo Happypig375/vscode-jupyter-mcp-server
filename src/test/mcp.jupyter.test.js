@@ -15,6 +15,7 @@ const lines = [];
 const statusBar = { text: '', tooltip: '', command: '', show() {}, dispose() {} };
 const disposables = [];
 const interrupted = [];
+const restarted = [];
 const selectedKernels = [];
 const startedKernels = [];
 const legacyKernelHints = [];
@@ -168,7 +169,14 @@ const vscodeShim = {
                     cell.executionSummary = undefined;
                 }
             }
-            if (cmd === 'notebook.interruptKernel') interrupted.push(uri);
+            if (cmd === 'jupyter.restartkernel') {
+                assert.ok(uri && typeof uri.toString === 'function', 'restart must receive the notebook URI');
+                restarted.push(uri);
+            }
+            if (cmd === 'jupyter.interruptkernel') {
+                assert.ok(uri && uri.notebookEditor && uri.notebookEditor.notebookUri, 'interrupt must receive notebook editor options');
+                interrupted.push(uri.notebookEditor.notebookUri);
+            }
         }
     },
     lm: {
@@ -694,8 +702,35 @@ async function main() {
         const before = interrupted.length;
         const res = await client.callTool({ name: 'interrupt_kernels', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /Interrupted kernel/);
+        assert.match(res.content[0].text, /Kernel interrupt requested/);
         assert.strictEqual(interrupted.length, before + 1);
+        assert.strictEqual(interrupted[interrupted.length - 1].toString(), 'file:///C:/nb.ipynb');
+    });
+
+    await check('restart_kernels uses Jupyter command and targets every requested URI', async () => {
+        const before = restarted.length;
+        const res = await client.callTool({ name: 'restart_kernels', arguments: {
+            notebookRefs: ['file:///C:/nb.ipynb', 'file:///C:/inactive.ipynb']
+        } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.strictEqual(restarted.length, before + 2);
+        assert.deepStrictEqual(restarted.slice(-2).map((uri) => uri.toString()), [
+            'file:///C:/nb.ipynb',
+            'file:///C:/inactive.ipynb'
+        ]);
+    });
+
+    await check('interrupt_kernels uses Jupyter command and targets every requested URI', async () => {
+        const before = interrupted.length;
+        const res = await client.callTool({ name: 'interrupt_kernels', arguments: {
+            notebookRefs: ['file:///C:/nb.ipynb', 'file:///C:/inactive.ipynb']
+        } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.deepStrictEqual(interrupted.slice(-2).map((uri) => uri.toString()), [
+            'file:///C:/nb.ipynb',
+            'file:///C:/inactive.ipynb'
+        ]);
+        assert.strictEqual(interrupted.length, before + 2);
     });
 
     await client.close();

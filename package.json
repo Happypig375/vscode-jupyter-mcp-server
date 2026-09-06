@@ -2,7 +2,7 @@
   "name": "vscode-jupyter-mcp-server",
   "displayName": "Jupyter MCP Server",
   "description": "A notebook-specific MCP server for running, editing, creating, and managing Jupyter notebooks from MCP clients.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "Happypig375",
   "license": "MIT",
   "icon": "icon.png",

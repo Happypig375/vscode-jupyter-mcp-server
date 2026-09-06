@@ -468,20 +468,21 @@ export async function saveNotebooks(filePaths: string[]): Promise<string> {
     return `Saved: ${saved.join(', ') || '(none)'}${skipped.length ? `\nSkipped: ${skipped.join(', ')}` : ''}`;
 }
 
-/** Native kernel restart via the notebook command. */
+/** Request a kernel restart through Jupyter's provider command. Completion of the command does not prove the kernel has changed state. */
 export async function restartKernel(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
     invalidateExecutionGeneration(nb.uri.toString());
-    await vscode.commands.executeCommand('notebook.restartKernel', nb.uri);
-    return `Restarted kernel for ${nb.uri.toString()}.`;
+    await vscode.commands.executeCommand('jupyter.restartkernel', nb.uri);
+    return `Kernel restart requested for ${nb.uri.toString()}. The provider may require confirmation, and completion cannot be confirmed here.`;
 }
 
 /**
  * Interrupt the kernel(s) of one or more open notebooks (stops running execution).
- * Uses the notebook's interrupt command; requires the Jupyter extension.
+ * Uses the notebook's interrupt command; requires the Jupyter extension. The
+ * provider may acknowledge before the kernel state changes.
  */
 export async function interruptKernels(filePaths: string[]): Promise<string> {
     const lines: string[] = [];
@@ -491,8 +492,8 @@ export async function interruptKernels(filePaths: string[]): Promise<string> {
             throw new Error(`No open notebook matches '${fp}'. Use list_notebooks to list them.`);
         }
         invalidateExecutionGeneration(nb.uri.toString());
-        await vscode.commands.executeCommand('notebook.interruptKernel', nb.uri);
-        lines.push(`Interrupted kernel for ${nb.uri.toString()}.`);
+        await vscode.commands.executeCommand('jupyter.interruptkernel', { notebookEditor: { notebookUri: nb.uri } });
+        lines.push(`Kernel interrupt requested for ${nb.uri.toString()}. Completion cannot be confirmed here.`);
     }
     return lines.join('\n');
 }

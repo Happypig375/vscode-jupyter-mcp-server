@@ -53,8 +53,8 @@ Cell references accept zero-based indices or the `cell_id` returned by a read. P
 | `clear_cell_outputs` | Write | Clear outputs and execution state |
 | `run_cells` | Execute | Start a tracked, ordered run; `waitMs` bounds the caller's wait, and observation continues independently |
 | `select_kernel` | Manage | Select an exact ID from `list_kernels`; no fallback or start |
-| `restart_kernels` | Manage | Restart notebook kernels |
-| `interrupt_kernels` | Manage | Interrupt running execution |
+| `restart_kernels` | Manage | Request notebook-kernel restarts; provider confirmation may be required |
+| `interrupt_kernels` | Manage | Request kernel interrupts; completion cannot be confirmed |
 | `open_notebooks` | Manage | Open file URIs, preserving an existing live model |
 | `save_notebooks` | Manage | Persist file-backed notebooks, including remote execution state |
 | `upload_file` / `download_file` | Kernel transfer | Chunked, hashed transfer between `hostPath` on the VS Code host and `kernelPath` in the active idle Python kernel |
@@ -71,6 +71,8 @@ For outputs, `outputMode` selects `summary`, preferred `text`, or `full` textual
 The package declares `ms-toolsai.jupyter` as a dependency. Kernel-backed tools (`list_kernels`, `configure_kernel`, `select_kernel`, `run_cells`, restart/interrupt, and file transfer) are registered when that extension is present; presence does not guarantee every runtime API is available. `get_kernel_info` and `get_execution` remain exposed for read-only diagnostics.
 
 `list_kernels` lists currently registered controllers, including those contributed by other extensions; it does not discover every dormant provider. `configure_kernel` explicitly delegates setup to Jupyter and may display a picker, authentication, or consent UI. `select_kernel` requires an exact listed ID. Inspection, listing, and file transfer do not start or select a kernel. File transfer requires the public API of an active idle Python kernel; see Microsoft's [kernel execution and authorization sample](https://github.com/microsoft/vscode-extension-samples/tree/main/jupyter-kernel-execution-sample).
+
+`restart_kernels` and `interrupt_kernels` request state changes through Jupyter's provider commands. A provider can display confirmation UI or acknowledge the command before the kernel state changes, so their responses report requests rather than confirmed completion. Use `get_kernel_info`, `get_execution`, or notebook inspection to observe subsequent state where available.
 
 The optional Colab VS Code extension contributes controllers through Jupyter. On 2026-09-06, MCP server 0.3.0 with `google.colab` 0.9.3 passed live checks for targeted execution, nonadjacent output clearing, and a 524,425-byte upload/download round trip with matching SHA-256 hashes in an existing Colab Python session. Initial discovery used the normal Colab picker. This is evidence for that tested integration, not a claim that every Colab feature is MCP-integrated.
 

@@ -347,7 +347,7 @@ required: ['notebookRef', 'edits']
         server.registerTool(
             'restart_kernels',
             {
-                description: 'Restart the kernel of one or more open notebooks. Provide an array of notebook URIs. Requires the Jupyter extension.',
+                description: 'Request a kernel restart for one or more open notebooks. The provider may require confirmation and completion cannot be confirmed by this tool. Provide an array of notebook URIs. Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookRefs from list_notebooks.' } },
@@ -366,7 +366,7 @@ const a = (args ?? {}) as { notebookRefs?: string[] };
         server.registerTool(
             'interrupt_kernels',
             {
-                description: 'Interrupt (stop) the running execution of one or more open notebooks. Provide an array of notebook URIs. Requires the Jupyter extension.',
+                description: 'Request an interrupt for one or more open notebooks. The provider may acknowledge before execution stops, so completion cannot be confirmed by this tool. Provide an array of notebook URIs. Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookRefs from list_notebooks.' } },

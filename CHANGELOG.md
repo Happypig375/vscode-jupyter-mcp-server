@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Fixed `restart_kernels` and `interrupt_kernels` to use the Jupyter extension's current command ids and explicit notebook targets; responses now describe requests because provider confirmation or completion may not be observable.
+
 ## 0.4.0 (Unreleased)
 
 - Added tracked `run_cells` executions with opaque execution IDs, bounded receipts, sequential background observation, duplicate protection, and safe recovery through the read-only `get_execution` tool.
