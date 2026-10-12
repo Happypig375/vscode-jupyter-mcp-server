@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2
 
 - Fixed `edit_cells` metadata persistence: nbformat cell metadata is written inside VS Code's native metadata envelope so presentation fields, tags, and source-hiding settings survive notebook serialization. Existing cell IDs, attachments, and execution counts remain separate.
 
