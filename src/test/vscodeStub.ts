@@ -7,7 +7,7 @@ export class CancellationTokenSource {
         get isCancellationRequested() { return cancelledSources.has(this as unknown as object); },
         onCancellationRequested: (listener) => { this.listeners.add(listener); return { dispose: () => this.listeners.delete(listener) }; }
     };
-    cancel(): void { cancelledSources.add(this.token as unknown as object); for (const listener of this.listeners) listener(); }
-    dispose(): void { this.listeners.clear(); cancelledSources.delete(this.token as unknown as object); }
+    cancel(): void { if (this.token.isCancellationRequested) return; cancelledSources.add(this.token as unknown as object); for (const listener of this.listeners) listener(); }
+    dispose(): void { this.listeners.clear(); }
 }
 const cancelledSources = new WeakSet<object>();

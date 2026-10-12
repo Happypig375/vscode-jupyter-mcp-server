@@ -5,11 +5,14 @@ import * as vscode from 'vscode';
 
 export const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 export const TRANSFER_CHUNK_BYTES = 256 * 1024;
+export const TRANSFER_EXECUTION_TIMEOUT_MS = 60_000;
+export const TRANSFER_CLEANUP_TIMEOUT_MS = 5_000;
+const MAX_RECEIPT_CHARS = 2 * TRANSFER_CHUNK_BYTES + 4096;
 const RECEIPT = '__JUPYTER_MCP_FILE_RECEIPT__';
 
 export interface KernelOutputItem { mime?: string; data?: unknown; }
 export interface KernelOutput { items?: KernelOutputItem[]; text?: unknown; value?: unknown; data?: unknown; }
-export interface ActiveKernelLike { language?: string; status?: string; executeCode(code: string, token: vscode.CancellationToken): AsyncIterable<KernelOutput> | Promise<AsyncIterable<KernelOutput>>; }
+export interface ActiveKernelLike { language?: string; status?: string; onDidChangeStatus?: (listener: (status: string) => void) => { dispose(): void }; executeCode(code: string, token: vscode.CancellationToken): AsyncIterable<KernelOutput> | Promise<AsyncIterable<KernelOutput>>; }
 interface ReadHandle { size: number; read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>; close(): Promise<void>; }
 interface WriteHandle { write(data: Buffer, offset: number, length: number): Promise<{ bytesWritten: number }>; close(): Promise<void>; }
 export interface KernelFileDeps {
@@ -20,6 +23,15 @@ export interface KernelFileDeps {
     link(from: string, to: string): Promise<void>;
     unlink(filePath: string): Promise<void>;
     stat(filePath: string): Promise<{ size: number }>;
+    /** Local test seam; not an MCP tool parameter. */
+    executionTimeoutMs?: number;
+    cleanupTimeoutMs?: number;
+}
+const activeTargets = new Set<string>();
+const activeKernels = new WeakSet<ActiveKernelLike>();
+const unsettledKernels = new WeakSet<ActiveKernelLike>();
+class TransferFailure extends Error {
+    constructor(message: string, readonly unsettled = false) { super(message); }
 }
 
 const fsDeps: KernelFileDeps = {
@@ -52,16 +64,64 @@ function transferCode(command: string, args: Record<string, unknown>, nonce: str
     return `exec(compile(__import__('base64').b64decode(${JSON.stringify(encoded)}),'<jupyter-mcp-transfer>','exec'),{'__builtins__':__builtins__})`;
 }
 function outputText(value: unknown): string { if (typeof value === 'string') return value; if (value instanceof Uint8Array) return Buffer.from(value).toString('utf8'); return ''; }
-async function receipt(kernel: ActiveKernelLike, code: string, nonce: string, token?: vscode.CancellationToken): Promise<Record<string, unknown>> {
+async function receipt(kernel: ActiveKernelLike, code: string, nonce: string, assertCurrent: () => Promise<void>, timeoutMs: number, token?: vscode.CancellationToken, onDispatch?: () => void): Promise<Record<string, unknown>> {
     let combined = '';
     const source = new vscode.CancellationTokenSource();
-    const cancellation = token?.onCancellationRequested(() => source.cancel());
-    if (token?.isCancellationRequested) source.cancel();
+    let iterator: AsyncIterator<KernelOutput> | undefined;
+    let pending: Promise<unknown> | undefined;
+    let dispatched = false;
+    let rejectAbort!: (error: Error) => void;
+    const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+    const abort = (reason: string) => { rejectAbort(new TransferFailure(reason, true)); source.cancel(); };
+    const cancellation = token?.onCancellationRequested(() => abort('cancelled'));
+    const timer = setTimeout(() => abort('kernel execution timed out'), timeoutMs);
+    const status = kernel.onDidChangeStatus?.((value) => { if (value !== 'idle' && value !== 'busy') abort('kernel became unavailable'); });
+    if (token?.isCancellationRequested) abort('cancelled');
+    let complete = false;
     try {
-        const stream = await kernel.executeCode(code, source.token);
-        for await (const output of stream) for (const value of [...(output.items ?? []).map((item) => item.data), output.text, output.value, output.data]) combined += outputText(value);
+        await Promise.race([assertCurrent(), aborted]);
+        ensureNotCancelled(token);
+        ensureNotCancelled(source.token);
+        onDispatch?.();
+        dispatched = true;
+        const execution = Promise.resolve(kernel.executeCode(code, source.token));
+        pending = execution;
+        const stream = await Promise.race([execution, aborted]);
+        iterator = stream[Symbol.asyncIterator]();
+        while (true) {
+            const output = iterator.next();
+            pending = Promise.resolve(output);
+            const next = await Promise.race([output, aborted]);
+            if (next.done) { complete = true; break; }
+            const valueOutput = next.value;
+            for (const value of [...(valueOutput.items ?? []).map((item) => item.data), valueOutput.text, valueOutput.value, valueOutput.data]) {
+                const text = outputText(value);
+                if (combined.length + text.length > MAX_RECEIPT_CHARS) throw new TransferFailure('kernel receipt exceeded output limit', true);
+                combined += text;
+            }
+        }
     } finally {
+        clearTimeout(timer);
         cancellation?.dispose();
+        status?.dispose();
+        if (!complete) {
+            source.cancel();
+            if (dispatched && pending) {
+                unsettledKernels.add(kernel);
+                // Observe completion without waiting on an iterator that ignores cancellation.
+                const close = async () => {
+                    if (!iterator && pending) {
+                        const stream = await pending as AsyncIterable<KernelOutput>;
+                        iterator = stream[Symbol.asyncIterator]();
+                    }
+                    if (!iterator?.return) return false;
+                    await iterator.return();
+                    await pending?.catch(() => undefined);
+                    return true;
+                };
+                void close().then((settled) => { if (settled) unsettledKernels.delete(kernel); }, () => undefined);
+            }
+        }
         source.dispose();
     }
     const marker = `${RECEIPT}${nonce}:`;
@@ -73,6 +133,41 @@ async function receipt(kernel: ActiveKernelLike, code: string, nonce: string, to
         return value as Record<string, unknown>;
     } catch { throw new Error('invalid receipt'); }
 }
+async function boundedKernel(ref: string, deps: KernelFileDeps, token?: vscode.CancellationToken): Promise<ActiveKernelLike> {
+    ensureNotCancelled(token);
+    let rejectAbort!: (error: Error) => void;
+    const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+    const timer = setTimeout(() => rejectAbort(new TransferFailure('kernel lookup timed out')), deps.executionTimeoutMs ?? TRANSFER_EXECUTION_TIMEOUT_MS);
+    const cancellation = token?.onCancellationRequested(() => rejectAbort(new TransferFailure('cancelled')));
+    try { ensureNotCancelled(token); return await Promise.race([kernelFor(ref, deps), aborted]); }
+    finally { clearTimeout(timer); cancellation?.dispose(); }
+}
+async function withTransfer<T>(ref: string, deps: KernelFileDeps, work: (kernel: ActiveKernelLike, current: () => Promise<void>) => Promise<T>, token?: vscode.CancellationToken): Promise<T> {
+    if (activeTargets.has(ref)) throw new Error('A file transfer is already active for this notebook.');
+    activeTargets.add(ref);
+    let kernel: ActiveKernelLike | undefined;
+    let ownsKernel = false;
+    let invalidated = false;
+    let status: { dispose(): void } | undefined;
+    try {
+        kernel = await boundedKernel(ref, deps, token);
+        if (activeKernels.has(kernel)) throw new Error('A file transfer is already active for this kernel.');
+        if (unsettledKernels.has(kernel)) throw new Error('A prior file transfer execution has not settled in this kernel; transfer was not attempted.');
+        activeKernels.add(kernel); ownsKernel = true;
+        status = kernel.onDidChangeStatus?.((value) => { if (value !== 'idle' && value !== 'busy') invalidated = true; });
+        const original = kernel;
+        const current = async () => {
+            const active = await kernelFor(ref, deps);
+            if (invalidated || active !== original) throw new TransferFailure('active kernel changed or became unavailable');
+        };
+        return await work(original, current);
+    } finally {
+        status?.dispose();
+        if (kernel && ownsKernel) activeKernels.delete(kernel);
+        activeTargets.delete(ref);
+    }
+}
+function failureReason(error: unknown): string { return error instanceof TransferFailure ? error.message : 'kernel execution or receipt validation failed'; }
 function validate(a: { notebookRef: string; hostPath: string; kernelPath: string; maxBytes: number }): void {
     if (!a.notebookRef || !a.hostPath || !a.kernelPath) throw new Error('notebookRef, hostPath, and kernelPath are required.');
     if (!path.isAbsolute(a.hostPath)) throw new Error('hostPath must be an absolute path on the VS Code extension host.');
@@ -105,98 +200,102 @@ export async function uploadFile(a: { notebookRef: string; hostPath: string; ker
     const maxBytes = a.maxBytes ?? DEFAULT_MAX_BYTES;
     validate({ ...a, maxBytes });
     const hostPath = path.resolve(a.hostPath);
-    const kernel = await kernelFor(a.notebookRef, deps);
-    ensureNotCancelled(token);
-    const input = await deps.openRead(hostPath);
-    const nonce = crypto.randomUUID();
-    const temporaryPath = `${a.kernelPath}.jupyter-mcp-${nonce}.part`;
-    let closed = false;
-    let finalAttempted = false;
-    let phase = 'validate source';
-    try {
-        if (input.size > maxBytes) throw new Error('too large');
-        phase = 'initialize remote temporary file';
-        const initialized = await receipt(kernel, transferCode("open(a['tmp'],'xb').close()\nresult={'kind':'init'}", { tmp: temporaryPath }, nonce), nonce, token);
-        if (initialized.kind !== 'init') throw new Error('invalid init');
-        const hash = crypto.createHash('sha256');
-        const buffer = Buffer.allocUnsafe(TRANSFER_CHUNK_BYTES);
-        let bytes = 0;
-        while (bytes < input.size) {
-            phase = 'transfer chunk';
-            ensureNotCancelled(token);
-            const requested = Math.min(buffer.length, input.size - bytes);
-            const { bytesRead } = await input.read(buffer, 0, requested, bytes);
-            if (bytesRead !== requested) throw new Error('short read');
-            const chunk = buffer.subarray(0, bytesRead);
-            const appended = await receipt(kernel, transferCode("d=base64.b64decode(a['chunk'])\nf=open(a['tmp'],'r+b')\nf.seek(0,2)\nif f.tell()!=a['offset']: f.close(); raise RuntimeError('offset')\nn=f.write(d); f.flush(); os.fsync(f.fileno()); f.close()\nif n!=len(d): raise RuntimeError('write')\nresult={'kind':'chunk','offset':a['offset'],'bytes':n}", { tmp: temporaryPath, chunk: chunk.toString('base64'), offset: bytes }, nonce), nonce, token);
-            if (appended.kind !== 'chunk' || exactNumber(appended.offset, bytes) !== bytes) throw new Error('invalid chunk');
-            exactNumber(appended.bytes, bytesRead);
-            hash.update(chunk);
-            bytes += bytesRead;
+    return withTransfer(a.notebookRef, deps, async (kernel, current) => {
+        const receive = (code: string, nonce: string, cleanup = false, onDispatch?: () => void) => receipt(kernel, code, nonce, current, cleanup ? deps.cleanupTimeoutMs ?? TRANSFER_CLEANUP_TIMEOUT_MS : deps.executionTimeoutMs ?? TRANSFER_EXECUTION_TIMEOUT_MS, cleanup ? undefined : token, onDispatch);
+        ensureNotCancelled(token);
+        const input = await deps.openRead(hostPath);
+        const nonce = crypto.randomUUID();
+        const temporaryPath = `${a.kernelPath}.jupyter-mcp-${nonce}.part`;
+        let closed = false;
+        let remoteAttempted = false;
+        let finalAttempted = false;
+        let phase = 'validate source';
+        try {
+            if (input.size > maxBytes) throw new Error('too large');
+            phase = 'initialize remote temporary file';
+            const initialized = await receive(transferCode("open(a['tmp'],'xb').close()\nresult={'kind':'init'}", { tmp: temporaryPath }, nonce), nonce, false, () => { remoteAttempted = true; });
+            if (initialized.kind !== 'init') throw new Error('invalid init');
+            const hash = crypto.createHash('sha256');
+            const buffer = Buffer.allocUnsafe(TRANSFER_CHUNK_BYTES);
+            let bytes = 0;
+            while (bytes < input.size) {
+                phase = 'transfer chunk';
+                ensureNotCancelled(token);
+                const requested = Math.min(buffer.length, input.size - bytes);
+                const { bytesRead } = await input.read(buffer, 0, requested, bytes);
+                if (bytesRead !== requested) throw new Error('short read');
+                const chunk = buffer.subarray(0, bytesRead);
+                const appended = await receive(transferCode("d=base64.b64decode(a['chunk'])\nf=open(a['tmp'],'r+b')\nf.seek(0,2)\nif f.tell()!=a['offset']: f.close(); raise RuntimeError('offset')\nn=f.write(d); f.flush(); os.fsync(f.fileno()); f.close()\nif n!=len(d): raise RuntimeError('write')\nresult={'kind':'chunk','offset':a['offset'],'bytes':n}", { tmp: temporaryPath, chunk: chunk.toString('base64'), offset: bytes }, nonce), nonce);
+                if (appended.kind !== 'chunk' || exactNumber(appended.offset, bytes) !== bytes) throw new Error('invalid chunk');
+                exactNumber(appended.bytes, bytesRead);
+                hash.update(chunk);
+                bytes += bytesRead;
+            }
+            await input.close(); closed = true; ensureNotCancelled(token);
+            const digest = hash.digest('hex');
+            phase = 'verify and promote destination';
+            const completed = await receive(transferCode("h=hashlib.sha256()\nf=open(a['tmp'],'rb')\nwhile True:\n d=f.read(262144)\n if not d: break\n h.update(d)\nf.close()\nsize=os.path.getsize(a['tmp'])\nif size!=a['bytes'] or h.hexdigest()!=a['sha256']: raise RuntimeError('verification')\nif a['overwrite']: os.replace(a['tmp'],a['dest'])\nelse: os.link(a['tmp'],a['dest']); os.unlink(a['tmp'])\nresult={'kind':'done','bytes':size,'sha256':h.hexdigest()}", { tmp: temporaryPath, dest: a.kernelPath, overwrite: a.overwrite === true, bytes, sha256: digest }, nonce), nonce, false, () => { finalAttempted = true; });
+            if (completed.kind !== 'done') throw new Error('invalid final');
+            exactNumber(completed.bytes, bytes);
+            if (completed.sha256 !== digest) throw new Error('invalid hash');
+            return JSON.stringify({ operation: 'upload_file', bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
+        } catch (error) {
+            if (!closed) await input.close().catch(() => undefined);
+            if (remoteAttempted && !unsettledKernels.has(kernel) && !(error instanceof TransferFailure && error.unsettled)) try { await receive(transferCode("try:\n os.unlink(a['tmp'])\nexcept FileNotFoundError:\n pass\nresult={'kind':'clean'}", { tmp: temporaryPath }, nonce), nonce, true); } catch { /* Cleanup is limited to this operation's random temporary path. */ }
+            if (finalAttempted) throw new Error(`Upload outcome is uncertain because kernel confirmation was not received (phase: ${phase}; ${failureReason(error)}).`);
+            throw new Error(token?.isCancellationRequested ? `File upload cancelled before destination commit (phase: ${phase}).` : `File upload failed before destination commit (phase: ${phase}; ${failureReason(error)}).`);
         }
-        await input.close(); closed = true; ensureNotCancelled(token);
-        const digest = hash.digest('hex');
-        finalAttempted = true;
-        phase = 'verify and promote destination';
-        const completed = await receipt(kernel, transferCode("h=hashlib.sha256()\nf=open(a['tmp'],'rb')\nwhile True:\n d=f.read(262144)\n if not d: break\n h.update(d)\nf.close()\nsize=os.path.getsize(a['tmp'])\nif size!=a['bytes'] or h.hexdigest()!=a['sha256']: raise RuntimeError('verification')\nif a['overwrite']: os.replace(a['tmp'],a['dest'])\nelse: os.link(a['tmp'],a['dest']); os.unlink(a['tmp'])\nresult={'kind':'done','bytes':size,'sha256':h.hexdigest()}", { tmp: temporaryPath, dest: a.kernelPath, overwrite: a.overwrite === true, bytes, sha256: digest }, nonce), nonce, token);
-        if (completed.kind !== 'done') throw new Error('invalid final');
-        exactNumber(completed.bytes, bytes);
-        if (completed.sha256 !== digest) throw new Error('invalid hash');
-        return JSON.stringify({ operation: 'upload_file', bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
-    } catch {
-        if (!closed) await input.close().catch(() => undefined);
-        try { await receipt(kernel, transferCode("try:\n os.unlink(a['tmp'])\nexcept FileNotFoundError:\n pass\nresult={'kind':'clean'}", { tmp: temporaryPath }, nonce), nonce, undefined); } catch { /* Cleanup is limited to this operation's random temporary path. */ }
-        if (finalAttempted) throw new Error(`Upload outcome is uncertain because kernel confirmation was not received (phase: ${phase}).`);
-        throw new Error(token?.isCancellationRequested ? `File upload cancelled before destination commit (phase: ${phase}).` : `File upload failed before destination commit (phase: ${phase}; kernel execution or receipt validation failed).`);
-    }
+    }, token);
 }
 
 export async function downloadFile(a: { notebookRef: string; hostPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number }, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
     const maxBytes = a.maxBytes ?? DEFAULT_MAX_BYTES;
     validate({ ...a, maxBytes });
-    const kernel = await kernelFor(a.notebookRef, deps);
-    ensureNotCancelled(token);
-    const hostPath = path.resolve(a.hostPath);
-    const nonce = crypto.randomUUID();
-    const temporaryPath = `${hostPath}.jupyter-mcp-${nonce}.part`;
-    const output = await deps.openWrite(temporaryPath);
-    let closed = false;
-    let committed = false;
-    let phase = 'inspect remote source';
-    try {
-        const metadata = await receipt(kernel, transferCode("s=os.stat(a['path'])\nif not os.path.isfile(a['path']): raise RuntimeError('not-file')\nresult={'kind':'meta','bytes':s.st_size}", { path: a.kernelPath }, nonce), nonce, token);
-        if (metadata.kind !== 'meta') throw new Error('invalid metadata');
-        const remoteSize = exactNumber(metadata.bytes);
-        if (remoteSize > maxBytes) throw new Error('too large');
-        const hash = crypto.createHash('sha256');
-        let bytes = 0;
-        while (bytes < remoteSize) {
-            phase = 'transfer chunk';
-            ensureNotCancelled(token);
-            const requested = Math.min(TRANSFER_CHUNK_BYTES, remoteSize - bytes);
-            const part = await receipt(kernel, transferCode("f=open(a['path'],'rb'); f.seek(a['offset']); d=f.read(a['length']); f.close()\nresult={'kind':'chunk','offset':a['offset'],'bytes':len(d),'chunk':base64.b64encode(d).decode('ascii')}", { path: a.kernelPath, offset: bytes, length: requested }, nonce), nonce, token);
-            if (part.kind !== 'chunk' || exactNumber(part.offset, bytes) !== bytes) throw new Error('invalid chunk');
-            const chunk = Buffer.from(typeof part.chunk === 'string' ? part.chunk : '', 'base64');
-            exactNumber(part.bytes, requested);
-            if (chunk.length !== requested) throw new Error('invalid chunk');
-            await writeAll(output, chunk); hash.update(chunk); bytes += chunk.length;
+    return withTransfer(a.notebookRef, deps, async (kernel, current) => {
+        const receive = (code: string, nonce: string) => receipt(kernel, code, nonce, current, deps.executionTimeoutMs ?? TRANSFER_EXECUTION_TIMEOUT_MS, token);
+        ensureNotCancelled(token);
+        const hostPath = path.resolve(a.hostPath);
+        const nonce = crypto.randomUUID();
+        const temporaryPath = `${hostPath}.jupyter-mcp-${nonce}.part`;
+        const output = await deps.openWrite(temporaryPath);
+        let closed = false;
+        let committed = false;
+        let phase = 'inspect remote source';
+        try {
+            const metadata = await receive(transferCode("s=os.stat(a['path'])\nif not os.path.isfile(a['path']): raise RuntimeError('not-file')\nresult={'kind':'meta','bytes':s.st_size}", { path: a.kernelPath }, nonce), nonce);
+            if (metadata.kind !== 'meta') throw new Error('invalid metadata');
+            const remoteSize = exactNumber(metadata.bytes);
+            if (remoteSize > maxBytes) throw new Error('too large');
+            const hash = crypto.createHash('sha256');
+            let bytes = 0;
+            while (bytes < remoteSize) {
+                phase = 'transfer chunk';
+                ensureNotCancelled(token);
+                const requested = Math.min(TRANSFER_CHUNK_BYTES, remoteSize - bytes);
+                const part = await receive(transferCode("f=open(a['path'],'rb'); f.seek(a['offset']); d=f.read(a['length']); f.close()\nresult={'kind':'chunk','offset':a['offset'],'bytes':len(d),'chunk':base64.b64encode(d).decode('ascii')}", { path: a.kernelPath, offset: bytes, length: requested }, nonce), nonce);
+                if (part.kind !== 'chunk' || exactNumber(part.offset, bytes) !== bytes) throw new Error('invalid chunk');
+                const chunk = Buffer.from(typeof part.chunk === 'string' ? part.chunk : '', 'base64');
+                exactNumber(part.bytes, requested);
+                if (chunk.length !== requested) throw new Error('invalid chunk');
+                await writeAll(output, chunk); hash.update(chunk); bytes += chunk.length;
+            }
+            const digest = hash.digest('hex');
+            phase = 'verify remote source';
+            const completed = await receive(transferCode("h=hashlib.sha256()\nf=open(a['path'],'rb')\nwhile True:\n d=f.read(262144)\n if not d: break\n h.update(d)\nf.close()\nresult={'kind':'done','bytes':os.path.getsize(a['path']),'sha256':h.hexdigest()}", { path: a.kernelPath }, nonce), nonce);
+            if (completed.kind !== 'done') throw new Error('invalid final');
+            exactNumber(completed.bytes, bytes);
+            if (completed.sha256 !== digest) throw new Error('invalid hash');
+            await output.close(); closed = true; ensureNotCancelled(token);
+            phase = 'promote destination';
+            if (a.overwrite) await deps.rename(temporaryPath, hostPath);
+            else { await deps.link(temporaryPath, hostPath); committed = true; await deps.unlink(temporaryPath); }
+            committed = true;
+            return JSON.stringify({ operation: 'download_file', bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
+        } catch (error) {
+            if (!closed) await output.close().catch(() => undefined);
+            if (!committed) await deps.unlink(temporaryPath).catch(() => undefined);
+            if (committed) throw new Error('Download committed, but temporary-file cleanup could not be confirmed.');
+            throw new Error(token?.isCancellationRequested ? `File download cancelled before destination commit (phase: ${phase}).` : `File download failed before destination commit (phase: ${phase}; ${failureReason(error)}; destination promotion may also fail).`);
         }
-        const digest = hash.digest('hex');
-        phase = 'verify remote source';
-        const completed = await receipt(kernel, transferCode("h=hashlib.sha256()\nf=open(a['path'],'rb')\nwhile True:\n d=f.read(262144)\n if not d: break\n h.update(d)\nf.close()\nresult={'kind':'done','bytes':os.path.getsize(a['path']),'sha256':h.hexdigest()}", { path: a.kernelPath }, nonce), nonce, token);
-        if (completed.kind !== 'done') throw new Error('invalid final');
-        exactNumber(completed.bytes, bytes);
-        if (completed.sha256 !== digest) throw new Error('invalid hash');
-        await output.close(); closed = true; ensureNotCancelled(token);
-        phase = 'promote destination';
-        if (a.overwrite) await deps.rename(temporaryPath, hostPath);
-        else { await deps.link(temporaryPath, hostPath); committed = true; await deps.unlink(temporaryPath); }
-        committed = true;
-        return JSON.stringify({ operation: 'download_file', bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
-    } catch {
-        if (!closed) await output.close().catch(() => undefined);
-        if (!committed) await deps.unlink(temporaryPath).catch(() => undefined);
-        if (committed) throw new Error('Download committed, but temporary-file cleanup could not be confirmed.');
-        throw new Error(token?.isCancellationRequested ? `File download cancelled before destination commit (phase: ${phase}).` : `File download failed before destination commit (phase: ${phase}; kernel execution, receipt validation, or destination promotion failed).`);
-    }
+    }, token);
 }

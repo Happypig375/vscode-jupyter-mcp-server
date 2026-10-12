@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Bound file-transfer kernel lookups/executions to 60 seconds and remote cleanup to five seconds; stalled iterators no longer keep the tool request pending indefinitely.
+- Revalidate the original active idle kernel before every transfer execution, reject competing transfers, cap receipt output, and quarantine unfinished kernel executions until their iterators close.
+- Preserve uncertain upload outcomes and skip remote cleanup when execution has not settled. MCP client cancellation forwarding remains a separate routing limitation.
+
 ## 0.4.1
 
 - Fixed `restart_kernels` and `interrupt_kernels` to use the Jupyter extension's current command ids and explicit notebook targets; responses now describe requests because provider confirmation or completion may not be observable.
