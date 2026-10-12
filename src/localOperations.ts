@@ -126,9 +126,9 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
         case 'save_notebooks':
             return saveNotebooks(args.notebookRefs as string[]);
         case 'upload_file':
-            return uploadFile({ notebookRef: notebookRef(args), hostPath: args.hostPath as string, kernelPath: args.kernelPath as string, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
+            return uploadFile({ notebookRef: notebookRef(args), hostPath: args.hostPath as string, kernelPath: args.kernelPath as string, colabFileUri: args.colabFileUri as string | undefined, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
         case 'download_file':
-            return downloadFile({ notebookRef: notebookRef(args), hostPath: args.hostPath as string, kernelPath: args.kernelPath as string, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
+            return downloadFile({ notebookRef: notebookRef(args), hostPath: args.hostPath as string, kernelPath: args.kernelPath as string, colabFileUri: args.colabFileUri as string | undefined, overwrite: args.overwrite as boolean | undefined, maxBytes: args.maxBytes as number | undefined });
         default:
             throw new Error(`Unknown local notebook operation: ${String(operation)}`);
     }

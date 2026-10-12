@@ -1,3 +1,4 @@
+export { CancellationTokenSource } from './vscodeStub';
 export const NotebookCellKind = { Markup: 1, Code: 2 };
 export class Disposable { constructor(private cleanup: () => void = () => undefined) {} dispose() { this.cleanup(); } }
 export class NotebookCellData {

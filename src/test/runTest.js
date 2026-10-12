@@ -50,6 +50,12 @@ async function main() {
         timeout: 60000
     });
     if (metadata.status !== 0) process.exit(metadata.status || 1);
+    const nativePython = spawnSync('node', [path.join(root, '.vscode-test', 'kernelFiles.python.test.cjs')], {
+        cwd: root,
+        stdio: 'inherit',
+        timeout: 60000
+    });
+    if (nativePython.status !== 0) process.exit(nativePython.status || 1);
     process.exit(0);
 }
 

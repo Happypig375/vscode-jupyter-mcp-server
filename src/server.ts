@@ -460,23 +460,24 @@ const a = (args ?? {}) as { notebookRefs?: string[] };
         notebookRef: z.string().describe('Open notebook URI or notebookRef from list_notebooks.'),
         hostPath: z.string().describe('Explicit file path on the VS Code extension host.'),
         kernelPath: z.string().describe('Explicit absolute path in the current active Python kernel filesystem.'),
+        colabFileUri: z.string().optional().describe('Optional exact colab://server/absolute/path URI matching kernelPath. Selects native Contents API transfer; the server must pass a nonce check against the selected kernel. Large transfers otherwise discover mounted/open Colab roots.'),
         overwrite: z.boolean().optional().describe('Replace an existing destination (default false).'),
         maxBytes: z.number().int().positive().optional().describe('Positive transfer size limit in bytes (default 64 MiB).')
     }).strict();
     server.registerTool('upload_file', {
-        description: 'Upload one host file to the filesystem of the current active idle Python kernel through the public Jupyter executeCode API. Does not start or select a kernel. Enforces maxBytes, verifies byte count and SHA-256 before atomic promotion, and defaults to no overwrite.',
+        description: 'Upload one host file to the current active idle Python kernel filesystem. Files above 4 MiB require the native Colab Contents filesystem (64 MiB cap); smaller files use bounded kernel chunks unless colabFileUri is supplied. Native routes must match a kernel nonce before payload transfer. Does not start/select a kernel. Verifies size and SHA-256 before atomic promotion; no overwrite by default.',
         inputSchema: fileSchema
     }, async (args) => {
-        const a = (args ?? {}) as { notebookRef?: string; hostPath?: string; kernelPath?: string; overwrite?: boolean; maxBytes?: number };
+        const a = (args ?? {}) as { notebookRef?: string; hostPath?: string; kernelPath?: string; colabFileUri?: string; overwrite?: boolean; maxBytes?: number };
         if (!a.notebookRef || !a.hostPath || !a.kernelPath) throw new Error('notebookRef, hostPath, and kernelPath are required');
         const text = await router.invokeNotebook('upload_file', a.notebookRef, a as Record<string, unknown>);
         return { content: [{ type: 'text' as const, text }] };
     });
     server.registerTool('download_file', {
-        description: 'Download one file from the current active idle Python kernel filesystem to the VS Code extension host through the public Jupyter executeCode API. Does not start or select a kernel. Enforces maxBytes before file output, verifies byte count and SHA-256 before atomic promotion, and defaults to no overwrite.',
+        description: 'Download one file from the current active idle Python kernel filesystem. Files above 4 MiB require the native Colab Contents filesystem (64 MiB cap); smaller files use bounded kernel chunks unless colabFileUri is supplied. Native routes must match a kernel nonce before payload transfer. Does not start/select a kernel. Verifies size and SHA-256 before atomic promotion; no overwrite by default.',
         inputSchema: fileSchema
     }, async (args) => {
-        const a = (args ?? {}) as { notebookRef?: string; hostPath?: string; kernelPath?: string; overwrite?: boolean; maxBytes?: number };
+        const a = (args ?? {}) as { notebookRef?: string; hostPath?: string; kernelPath?: string; colabFileUri?: string; overwrite?: boolean; maxBytes?: number };
         if (!a.notebookRef || !a.hostPath || !a.kernelPath) throw new Error('notebookRef, hostPath, and kernelPath are required');
         const text = await router.invokeNotebook('download_file', a.notebookRef, a as Record<string, unknown>);
         return { content: [{ type: 'text' as const, text }] };

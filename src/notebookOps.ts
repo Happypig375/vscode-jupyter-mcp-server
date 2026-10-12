@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
+import { getColabFileRoots } from './kernelFiles';
 
 /**
  * Notebook operations for the Jupyter MCP server.
@@ -549,7 +550,14 @@ export async function getKernelInfo(filePath: string): Promise<string> {
         capabilities: {
             selectedController: { availability: 'not-exposed', reason: 'The public Jupyter API does not expose the selected controller identity.' },
             provider: { availability: 'not-exposed', reason: 'The public Jupyter API does not expose the provider identity.' },
-            kernelFileTransfer: { availability: 'not-checked', reason: 'File-transfer access was not checked; this tool does not execute code or start/select a kernel.' }
+            kernelFileTransfer: {
+                availability: 'not-checked',
+                reason: 'File-transfer access was not checked; this tool does not execute code or start/select a kernel.',
+                kernelChunkLimitBytes: 4 * 1024 * 1024,
+                nativeColabLimitBytes: 64 * 1024 * 1024,
+                colabRootCandidates: getColabFileRoots(),
+                rootIdentity: 'Unverified candidates; each native transfer must match a nonce created in the selected kernel.'
+            }
         }
     }, null, 2);
 }

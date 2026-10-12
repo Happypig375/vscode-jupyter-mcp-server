@@ -7,6 +7,9 @@ export const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 export const TRANSFER_CHUNK_BYTES = 256 * 1024;
 export const TRANSFER_EXECUTION_TIMEOUT_MS = 60_000;
 export const TRANSFER_CLEANUP_TIMEOUT_MS = 5_000;
+// Large payloads must use a file service, not hundreds of kernel executions.
+export const MAX_KERNEL_TRANSFER_BYTES = 4 * 1024 * 1024;
+export const NATIVE_TRANSFER_TIMEOUT_MS = 120_000;
 const MAX_RECEIPT_CHARS = 2 * TRANSFER_CHUNK_BYTES + 4096;
 const RECEIPT = '__JUPYTER_MCP_FILE_RECEIPT__';
 
@@ -15,6 +18,12 @@ export interface KernelOutput { items?: KernelOutputItem[]; text?: unknown; valu
 export interface ActiveKernelLike { language?: string; status?: string; onDidChangeStatus?: (listener: (status: string) => void) => { dispose(): void }; executeCode(code: string, token: vscode.CancellationToken): AsyncIterable<KernelOutput> | Promise<AsyncIterable<KernelOutput>>; }
 interface ReadHandle { size: number; read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>; close(): Promise<void>; }
 interface WriteHandle { write(data: Buffer, offset: number, length: number): Promise<{ bytesWritten: number }>; close(): Promise<void>; }
+export interface ColabFileSystem {
+    stat(kernelPath: string): Promise<{ size: number }>;
+    readFile(kernelPath: string): Promise<Uint8Array>;
+    writeFile(kernelPath: string, content: Uint8Array): Promise<void>;
+}
+export interface FileTransferArgs { notebookRef: string; hostPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number; colabFileUri?: string; }
 export interface KernelFileDeps {
     getKernel(notebookRef: string): Promise<ActiveKernelLike | undefined>;
     openRead(filePath: string): Promise<ReadHandle>;
@@ -23,9 +32,12 @@ export interface KernelFileDeps {
     link(from: string, to: string): Promise<void>;
     unlink(filePath: string): Promise<void>;
     stat(filePath: string): Promise<{ size: number }>;
+    colabFileSystems?(args: FileTransferArgs): ColabFileSystem[];
     /** Local test seam; not an MCP tool parameter. */
     executionTimeoutMs?: number;
     cleanupTimeoutMs?: number;
+    nativeTimeoutMs?: number;
+    bindingTimeoutMs?: number;
 }
 const activeTargets = new Set<string>();
 const activeKernels = new WeakSet<ActiveKernelLike>();
@@ -55,8 +67,92 @@ const fsDeps: KernelFileDeps = {
     rename: (from, to) => fs.promises.rename(from, to),
     link: (from, to) => fs.promises.link(from, to),
     unlink: (filePath) => fs.promises.unlink(filePath),
-    stat: async (filePath) => fs.promises.stat(filePath)
+    stat: async (filePath) => fs.promises.stat(filePath),
+    colabFileSystems: colabFileSystems
 };
+
+/** Exposed workspace/document roots are candidates, not proof of kernel identity. */
+export function getColabFileRoots(): string[] {
+    const uris = [
+        ...(vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri),
+        ...(vscode.workspace.textDocuments ?? []).map((doc) => doc.uri),
+        ...(vscode.workspace.notebookDocuments ?? []).map((doc) => doc.uri)
+    ];
+    return [...new Set(uris.filter((uri) => uri.scheme === 'colab' && uri.authority && !uri.query && !uri.fragment)
+        .map((uri) => uri.with({ path: '/', query: '', fragment: '' }).toString()))];
+}
+function colabFileSystems(args: FileTransferArgs): ColabFileSystem[] {
+    const explicit = args.colabFileUri ? vscode.Uri.parse(args.colabFileUri, true) : undefined;
+    if (explicit && (explicit.scheme !== 'colab' || !explicit.authority || explicit.query || explicit.fragment || explicit.path !== args.kernelPath)) {
+        throw new TransferFailure('colabFileUri must be an exact colab://server/absolute/path URI matching kernelPath, without a query or fragment');
+    }
+    if (!vscode.extensions.getExtension('google.colab')?.isActive) return [];
+    const roots = explicit ? [explicit] : getColabFileRoots().map((root) => vscode.Uri.parse(root));
+    return roots.map((root) => ({
+        stat: async (p) => vscode.workspace.fs.stat(root.with({ path: p })),
+        readFile: async (p) => vscode.workspace.fs.readFile(root.with({ path: p })),
+        writeFile: async (p, bytes) => vscode.workspace.fs.writeFile(root.with({ path: p }), bytes)
+    }));
+}
+
+function nativeCandidates(args: FileTransferArgs, bytes: number, deps: KernelFileDeps): ColabFileSystem[] | undefined {
+    if (!args.colabFileUri && bytes <= MAX_KERNEL_TRANSFER_BYTES) return undefined;
+    if (bytes > DEFAULT_MAX_BYTES) throw new TransferFailure('Native Colab transfers are limited to 64 MiB because the provider buffers a whole file');
+    const candidates = deps.colabFileSystems?.(args) ?? [];
+    if (!candidates.length) throw new TransferFailure('The native Colab file service is unavailable. Transfers above 4 MiB require it. Use Colab: Mount Server to Workspace and get_kernel_info to discover its root, or provide colabFileUri from the Colab contents view. No large kernel transfer was attempted');
+    if (candidates.length > 1) throw new TransferFailure('Multiple Colab filesystem roots are exposed. Provide colabFileUri to choose one explicitly; no native transfer was attempted');
+    return candidates;
+}
+
+/** workspace.fs cannot cancel in-flight I/O. Quarantine it until it actually settles. */
+async function nativeStep<T>(kernel: ActiveKernelLike, current: () => Promise<void>, work: () => Promise<T>, deps: KernelFileDeps, token?: vscode.CancellationToken, binding = false): Promise<T> {
+    let rejectAbort!: (error: Error) => void;
+    const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+    let abortedReason: TransferFailure | undefined;
+    const abort = (reason: string) => { abortedReason = new TransferFailure(reason, !binding); rejectAbort(abortedReason); };
+    const timeoutMs = binding ? deps.bindingTimeoutMs ?? 15_000 : deps.nativeTimeoutMs ?? NATIVE_TRANSFER_TIMEOUT_MS;
+    const timer = setTimeout(() => abort(binding ? 'native filesystem binding timed out; no payload was transferred' : 'native file service timed out; an in-flight request may still finish'), timeoutMs);
+    const cancellation = token?.onCancellationRequested(() => abort('cancelled'));
+    const status = kernel.onDidChangeStatus?.((value) => { if (value !== 'idle' && value !== 'busy') abort('kernel became unavailable during native file transfer'); });
+    let pending: Promise<T> | undefined;
+    let settled = false;
+    try {
+        ensureNotCancelled(token);
+        await Promise.race([current(), aborted]);
+        ensureNotCancelled(token);
+        if (abortedReason) throw abortedReason;
+        pending = Promise.resolve().then(() => { if (abortedReason) throw abortedReason; ensureNotCancelled(token); return work(); });
+        void pending.then(() => { settled = true; }, () => { settled = true; });
+        const result = await Promise.race([pending, aborted]);
+        await Promise.race([current(), aborted]);
+        ensureNotCancelled(token);
+        return result;
+    } finally {
+        clearTimeout(timer); cancellation?.dispose(); status?.dispose();
+        // A pending nonce read is small and read-only, potentially on a stale root.
+        // It must not quarantine the selected kernel or block a corrected explicit URI.
+        if (!binding && pending && !settled) {
+            unsettledKernels.add(kernel);
+            void pending.then(() => unsettledKernels.delete(kernel), () => unsettledKernels.delete(kernel));
+        }
+    }
+}
+
+async function bindColab(candidates: ColabFileSystem[], bindingPath: string, nonce: string, kernel: ActiveKernelLike, current: () => Promise<void>, deps: KernelFileDeps, token?: vscode.CancellationToken): Promise<ColabFileSystem> {
+    const matches: ColabFileSystem[] = [];
+    for (const candidate of candidates) {
+        try {
+            const matchesNonce = await nativeStep(kernel, current, async () => {
+                const info = await candidate.stat(bindingPath);
+                if (info.size !== Buffer.byteLength(nonce)) return false;
+                return Buffer.from(await candidate.readFile(bindingPath)).equals(Buffer.from(nonce));
+            }, deps, token, true);
+            if (matchesNonce) matches.push(candidate);
+        } catch (error) { if (error instanceof TransferFailure || token?.isCancellationRequested) throw error; }
+    }
+    if (matches.length !== 1) throw new TransferFailure('Native Colab filesystem did not uniquely match the selected kernel; no file payload was transferred');
+    return matches[0];
+}
 
 function transferCode(command: string, args: Record<string, unknown>, nonce: string): string {
     const source = [`import base64, hashlib, json, os`, `a=json.loads(base64.b64decode(${JSON.stringify(Buffer.from(JSON.stringify(args), 'utf8').toString('base64'))}).decode('utf-8'))`, command, `print(${JSON.stringify(RECEIPT + nonce + ':')}+json.dumps(result,separators=(',',':')))`].join('\n');
@@ -157,7 +253,9 @@ async function withTransfer<T>(ref: string, deps: KernelFileDeps, work: (kernel:
         status = kernel.onDidChangeStatus?.((value) => { if (value !== 'idle' && value !== 'busy') invalidated = true; });
         const original = kernel;
         const current = async () => {
-            const active = await kernelFor(ref, deps);
+            let active: ActiveKernelLike;
+            try { active = await kernelFor(ref, deps); }
+            catch { throw new TransferFailure('active kernel is busy or unavailable'); }
             if (invalidated || active !== original) throw new TransferFailure('active kernel changed or became unavailable');
         };
         return await work(original, current);
@@ -196,7 +294,7 @@ function exactNumber(value: unknown, expected?: number): number {
     return value as number;
 }
 
-export async function uploadFile(a: { notebookRef: string; hostPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number }, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
+export async function uploadFile(a: FileTransferArgs, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
     const maxBytes = a.maxBytes ?? DEFAULT_MAX_BYTES;
     validate({ ...a, maxBytes });
     const hostPath = path.resolve(a.hostPath);
@@ -206,49 +304,70 @@ export async function uploadFile(a: { notebookRef: string; hostPath: string; ker
         const input = await deps.openRead(hostPath);
         const nonce = crypto.randomUUID();
         const temporaryPath = `${a.kernelPath}.jupyter-mcp-${nonce}.part`;
+        const bindingPath = `/content/jupyter-mcp-bind-${nonce}`;
+        let bindingAttempted = false;
+        let transport = 'kernel-execute';
         let closed = false;
         let remoteAttempted = false;
         let finalAttempted = false;
         let phase = 'validate source';
         try {
             if (input.size > maxBytes) throw new Error('too large');
+            const candidates = nativeCandidates(a, input.size, deps);
             phase = 'initialize remote temporary file';
-            const initialized = await receive(transferCode("open(a['tmp'],'xb').close()\nresult={'kind':'init'}", { tmp: temporaryPath }, nonce), nonce, false, () => { remoteAttempted = true; });
+            const initialized = await receive(transferCode("open(a['tmp'],'xb').close()\nif a.get('binding'):\n f=open(a['binding'],'xb'); f.write(a['nonce'].encode('ascii')); f.close()\nresult={'kind':'init'}", { tmp: temporaryPath, binding: candidates ? bindingPath : undefined, nonce }, nonce), nonce, false, () => { remoteAttempted = true; bindingAttempted = Boolean(candidates); });
             if (initialized.kind !== 'init') throw new Error('invalid init');
             const hash = crypto.createHash('sha256');
-            const buffer = Buffer.allocUnsafe(TRANSFER_CHUNK_BYTES);
             let bytes = 0;
-            while (bytes < input.size) {
-                phase = 'transfer chunk';
-                ensureNotCancelled(token);
-                const requested = Math.min(buffer.length, input.size - bytes);
-                const { bytesRead } = await input.read(buffer, 0, requested, bytes);
-                if (bytesRead !== requested) throw new Error('short read');
-                const chunk = buffer.subarray(0, bytesRead);
-                const appended = await receive(transferCode("d=base64.b64decode(a['chunk'])\nf=open(a['tmp'],'r+b')\nf.seek(0,2)\nif f.tell()!=a['offset']: f.close(); raise RuntimeError('offset')\nn=f.write(d); f.flush(); os.fsync(f.fileno()); f.close()\nif n!=len(d): raise RuntimeError('write')\nresult={'kind':'chunk','offset':a['offset'],'bytes':n}", { tmp: temporaryPath, chunk: chunk.toString('base64'), offset: bytes }, nonce), nonce);
-                if (appended.kind !== 'chunk' || exactNumber(appended.offset, bytes) !== bytes) throw new Error('invalid chunk');
-                exactNumber(appended.bytes, bytesRead);
-                hash.update(chunk);
-                bytes += bytesRead;
+            if (candidates) {
+                phase = 'bind native filesystem to selected kernel';
+                const native = await bindColab(candidates, bindingPath, nonce, kernel, current, deps, token);
+                transport = 'colab-contents';
+                const data = Buffer.allocUnsafe(input.size);
+                while (bytes < input.size) {
+                    ensureNotCancelled(token);
+                    const requested = Math.min(TRANSFER_CHUNK_BYTES, input.size - bytes);
+                    const { bytesRead } = await input.read(data, bytes, requested, bytes);
+                    if (bytesRead !== requested) throw new Error('short read');
+                    bytes += bytesRead;
+                }
+                hash.update(data);
+                phase = 'native contents upload';
+                await nativeStep(kernel, current, () => native.writeFile(temporaryPath, data), deps, token);
+            } else {
+                const buffer = Buffer.allocUnsafe(TRANSFER_CHUNK_BYTES);
+                while (bytes < input.size) {
+                    phase = 'transfer chunk';
+                    ensureNotCancelled(token);
+                    const requested = Math.min(buffer.length, input.size - bytes);
+                    const { bytesRead } = await input.read(buffer, 0, requested, bytes);
+                    if (bytesRead !== requested) throw new Error('short read');
+                    const chunk = buffer.subarray(0, bytesRead);
+                    const appended = await receive(transferCode("d=base64.b64decode(a['chunk'])\nf=open(a['tmp'],'r+b')\nf.seek(0,2)\nif f.tell()!=a['offset']: f.close(); raise RuntimeError('offset')\nn=f.write(d); f.flush(); os.fsync(f.fileno()); f.close()\nif n!=len(d): raise RuntimeError('write')\nresult={'kind':'chunk','offset':a['offset'],'bytes':n}", { tmp: temporaryPath, chunk: chunk.toString('base64'), offset: bytes }, nonce), nonce);
+                    if (appended.kind !== 'chunk' || exactNumber(appended.offset, bytes) !== bytes) throw new Error('invalid chunk');
+                    exactNumber(appended.bytes, bytesRead);
+                    hash.update(chunk);
+                    bytes += bytesRead;
+                }
             }
             await input.close(); closed = true; ensureNotCancelled(token);
             const digest = hash.digest('hex');
             phase = 'verify and promote destination';
-            const completed = await receive(transferCode("h=hashlib.sha256()\nf=open(a['tmp'],'rb')\nwhile True:\n d=f.read(262144)\n if not d: break\n h.update(d)\nf.close()\nsize=os.path.getsize(a['tmp'])\nif size!=a['bytes'] or h.hexdigest()!=a['sha256']: raise RuntimeError('verification')\nif a['overwrite']: os.replace(a['tmp'],a['dest'])\nelse: os.link(a['tmp'],a['dest']); os.unlink(a['tmp'])\nresult={'kind':'done','bytes':size,'sha256':h.hexdigest()}", { tmp: temporaryPath, dest: a.kernelPath, overwrite: a.overwrite === true, bytes, sha256: digest }, nonce), nonce, false, () => { finalAttempted = true; });
+            const completed = await receive(transferCode("h=hashlib.sha256()\nf=open(a['tmp'],'rb')\nwhile True:\n d=f.read(262144)\n if not d: break\n h.update(d)\nf.close()\nsize=os.path.getsize(a['tmp'])\nif size!=a['bytes'] or h.hexdigest()!=a['sha256']: raise RuntimeError('verification')\nif a.get('binding'): os.unlink(a['binding'])\nif a['overwrite']: os.replace(a['tmp'],a['dest'])\nelse: os.link(a['tmp'],a['dest']); os.unlink(a['tmp'])\nresult={'kind':'done','bytes':size,'sha256':h.hexdigest()}", { tmp: temporaryPath, dest: a.kernelPath, overwrite: a.overwrite === true, bytes, sha256: digest, binding: bindingAttempted ? bindingPath : undefined }, nonce), nonce, false, () => { finalAttempted = true; });
             if (completed.kind !== 'done') throw new Error('invalid final');
             exactNumber(completed.bytes, bytes);
             if (completed.sha256 !== digest) throw new Error('invalid hash');
-            return JSON.stringify({ operation: 'upload_file', bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
+            return JSON.stringify({ operation: 'upload_file', transport, bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
         } catch (error) {
             if (!closed) await input.close().catch(() => undefined);
-            if (remoteAttempted && !unsettledKernels.has(kernel) && !(error instanceof TransferFailure && error.unsettled)) try { await receive(transferCode("try:\n os.unlink(a['tmp'])\nexcept FileNotFoundError:\n pass\nresult={'kind':'clean'}", { tmp: temporaryPath }, nonce), nonce, true); } catch { /* Cleanup is limited to this operation's random temporary path. */ }
+            if (remoteAttempted && !unsettledKernels.has(kernel) && !(error instanceof TransferFailure && error.unsettled)) try { await receive(transferCode("for p in a['paths']:\n try: os.unlink(p)\n except FileNotFoundError: pass\nresult={'kind':'clean'}", { tmp: temporaryPath, paths: [temporaryPath, ...(bindingAttempted ? [bindingPath] : [])] }, nonce), nonce, true); } catch { /* Only this operation's random temporary paths, on the original kernel. */ }
             if (finalAttempted) throw new Error(`Upload outcome is uncertain because kernel confirmation was not received (phase: ${phase}; ${failureReason(error)}).`);
             throw new Error(token?.isCancellationRequested ? `File upload cancelled before destination commit (phase: ${phase}).` : `File upload failed before destination commit (phase: ${phase}; ${failureReason(error)}).`);
         }
     }, token);
 }
 
-export async function downloadFile(a: { notebookRef: string; hostPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number }, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
+export async function downloadFile(a: FileTransferArgs, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
     const maxBytes = a.maxBytes ?? DEFAULT_MAX_BYTES;
     validate({ ...a, maxBytes });
     return withTransfer(a.notebookRef, deps, async (kernel, current) => {
@@ -257,6 +376,9 @@ export async function downloadFile(a: { notebookRef: string; hostPath: string; k
         const hostPath = path.resolve(a.hostPath);
         const nonce = crypto.randomUUID();
         const temporaryPath = `${hostPath}.jupyter-mcp-${nonce}.part`;
+        const bindingPath = `/content/jupyter-mcp-bind-${nonce}`;
+        let bindingAttempted = false;
+        let transport = 'kernel-execute';
         const output = await deps.openWrite(temporaryPath);
         let closed = false;
         let committed = false;
@@ -266,22 +388,41 @@ export async function downloadFile(a: { notebookRef: string; hostPath: string; k
             if (metadata.kind !== 'meta') throw new Error('invalid metadata');
             const remoteSize = exactNumber(metadata.bytes);
             if (remoteSize > maxBytes) throw new Error('too large');
+            const candidates = nativeCandidates(a, remoteSize, deps);
             const hash = crypto.createHash('sha256');
             let bytes = 0;
-            while (bytes < remoteSize) {
-                phase = 'transfer chunk';
-                ensureNotCancelled(token);
-                const requested = Math.min(TRANSFER_CHUNK_BYTES, remoteSize - bytes);
-                const part = await receive(transferCode("f=open(a['path'],'rb'); f.seek(a['offset']); d=f.read(a['length']); f.close()\nresult={'kind':'chunk','offset':a['offset'],'bytes':len(d),'chunk':base64.b64encode(d).decode('ascii')}", { path: a.kernelPath, offset: bytes, length: requested }, nonce), nonce);
-                if (part.kind !== 'chunk' || exactNumber(part.offset, bytes) !== bytes) throw new Error('invalid chunk');
-                const chunk = Buffer.from(typeof part.chunk === 'string' ? part.chunk : '', 'base64');
-                exactNumber(part.bytes, requested);
-                if (chunk.length !== requested) throw new Error('invalid chunk');
-                await writeAll(output, chunk); hash.update(chunk); bytes += chunk.length;
+            if (candidates) {
+                phase = 'bind native filesystem to selected kernel';
+                bindingAttempted = true;
+                const bound = await receive(transferCode("f=open(a['binding'],'xb'); f.write(a['nonce'].encode('ascii')); f.close()\nresult={'kind':'bind'}", { binding: bindingPath, nonce }, nonce), nonce);
+                if (bound.kind !== 'bind') throw new Error('invalid binding');
+                const native = await bindColab(candidates, bindingPath, nonce, kernel, current, deps, token);
+                transport = 'colab-contents';
+                phase = 'native contents download';
+                const data = await nativeStep(kernel, current, async () => {
+                    const info = await native.stat(a.kernelPath);
+                    if (info.size !== remoteSize) throw new TransferFailure('Native source size changed before download');
+                    return native.readFile(a.kernelPath);
+                }, deps, token);
+                if (data.byteLength !== remoteSize) throw new Error('invalid native file size');
+                const buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+                await writeAll(output, buffer); hash.update(buffer); bytes = buffer.byteLength;
+            } else {
+                while (bytes < remoteSize) {
+                    phase = 'transfer chunk';
+                    ensureNotCancelled(token);
+                    const requested = Math.min(TRANSFER_CHUNK_BYTES, remoteSize - bytes);
+                    const part = await receive(transferCode("f=open(a['path'],'rb'); f.seek(a['offset']); d=f.read(a['length']); f.close()\nresult={'kind':'chunk','offset':a['offset'],'bytes':len(d),'chunk':base64.b64encode(d).decode('ascii')}", { path: a.kernelPath, offset: bytes, length: requested }, nonce), nonce);
+                    if (part.kind !== 'chunk' || exactNumber(part.offset, bytes) !== bytes) throw new Error('invalid chunk');
+                    const chunk = Buffer.from(typeof part.chunk === 'string' ? part.chunk : '', 'base64');
+                    exactNumber(part.bytes, requested);
+                    if (chunk.length !== requested) throw new Error('invalid chunk');
+                    await writeAll(output, chunk); hash.update(chunk); bytes += chunk.length;
+                }
             }
             const digest = hash.digest('hex');
             phase = 'verify remote source';
-            const completed = await receive(transferCode("h=hashlib.sha256()\nf=open(a['path'],'rb')\nwhile True:\n d=f.read(262144)\n if not d: break\n h.update(d)\nf.close()\nresult={'kind':'done','bytes':os.path.getsize(a['path']),'sha256':h.hexdigest()}", { path: a.kernelPath }, nonce), nonce);
+            const completed = await receive(transferCode("h=hashlib.sha256()\nf=open(a['path'],'rb')\nwhile True:\n d=f.read(262144)\n if not d: break\n h.update(d)\nf.close()\nif a.get('binding'): os.unlink(a['binding'])\nresult={'kind':'done','bytes':os.path.getsize(a['path']),'sha256':h.hexdigest()}", { path: a.kernelPath, binding: bindingAttempted ? bindingPath : undefined }, nonce), nonce);
             if (completed.kind !== 'done') throw new Error('invalid final');
             exactNumber(completed.bytes, bytes);
             if (completed.sha256 !== digest) throw new Error('invalid hash');
@@ -290,8 +431,11 @@ export async function downloadFile(a: { notebookRef: string; hostPath: string; k
             if (a.overwrite) await deps.rename(temporaryPath, hostPath);
             else { await deps.link(temporaryPath, hostPath); committed = true; await deps.unlink(temporaryPath); }
             committed = true;
-            return JSON.stringify({ operation: 'download_file', bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
+            return JSON.stringify({ operation: 'download_file', transport, bytes, sha256: digest, hostPath, kernelPath: a.kernelPath, verified: true });
         } catch (error) {
+            if (bindingAttempted && !unsettledKernels.has(kernel) && !(error instanceof TransferFailure && error.unsettled)) try {
+                await receipt(kernel, transferCode("try: os.unlink(a['binding'])\nexcept FileNotFoundError: pass\nresult={'kind':'clean'}", { binding: bindingPath }, nonce), nonce, current, deps.cleanupTimeoutMs ?? TRANSFER_CLEANUP_TIMEOUT_MS);
+            } catch { /* No cleanup against a replacement or unsettled runtime. */ }
             if (!closed) await output.close().catch(() => undefined);
             if (!committed) await deps.unlink(temporaryPath).catch(() => undefined);
             if (committed) throw new Error('Download committed, but temporary-file cleanup could not be confirmed.');
