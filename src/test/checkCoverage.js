@@ -17,7 +17,8 @@ function main() {
     execFileSync(c8Bin, ['node', path.join(__dirname, 'mcp.test.js')], opts);
     execFileSync(c8Bin, ['--clean=false', 'node', path.join(__dirname, 'mcp.jupyter.test.js')], opts);
     execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'broker.test.cjs')], opts);
-    const out = execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'kernelFiles.test.cjs')], opts);
+    execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'kernelFiles.test.cjs')], opts);
+    const out = execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'notebookMetadata.test.cjs')], opts);
     console.log(out);
 
     // Find the "All files" row (with excludeAfterRemap this is src-only).

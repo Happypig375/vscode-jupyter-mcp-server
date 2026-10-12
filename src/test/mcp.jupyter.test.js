@@ -76,7 +76,7 @@ makeDoc('file:///C:/nb.ipynb');
 makeDoc('file:///C:/inactive.ipynb', 'C:/inactive.ipynb');
 const editFixture = makeDoc('file:///C:/edit-fixture.ipynb', 'C:/edit-fixture.ipynb');
 editFixture._cells[0].value = 'payload-BEGIN-unique-token-END';
-editFixture._cells[0].metadata = { id: 'cell-abc', tags: ['keep'] };
+editFixture._cells[0].metadata = { id: 'cell-abc', metadata: { tags: ['keep'] } };
 editFixture._cells[0].outputs = [{ items: [{ mime: 'text/plain', data: Buffer.from('preserve-me') }] }];
 const longSourceFixture = makeDoc('file:///C:/long-source.ipynb', 'C:/long-source.ipynb');
 longSourceFixture._cells[0].value = 'x'.repeat(70000);
@@ -500,7 +500,7 @@ async function main() {
         } });
         assert.ok(!res.isError, JSON.stringify(res));
         assert.strictEqual(editFixture._cells[0].value, 'payload-BEGIN-replaced-token-END');
-        assert.deepStrictEqual(editFixture._cells[0].metadata, { id: 'cell-abc', tags: ['keep'] });
+        assert.deepStrictEqual(editFixture._cells[0].metadata, { id: 'cell-abc', metadata: { tags: ['keep'] } });
         assert.strictEqual(JSON.stringify(editFixture._cells[0].outputs), before);
     });
 

@@ -44,6 +44,12 @@ async function main() {
         timeout: 60000
     });
     if (transfer.status !== 0) process.exit(transfer.status || 1);
+    const metadata = spawnSync('node', [path.join(root, '.vscode-test', 'notebookMetadata.test.cjs')], {
+        cwd: root,
+        stdio: 'inherit',
+        timeout: 60000
+    });
+    if (metadata.status !== 0) process.exit(metadata.status || 1);
     process.exit(0);
 }
 

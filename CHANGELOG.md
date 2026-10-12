@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed `edit_cells` metadata persistence: nbformat cell metadata is written inside VS Code's native metadata envelope so presentation fields, tags, and source-hiding settings survive notebook serialization. Existing cell IDs, attachments, and execution counts remain separate.
+
 - Bound file-transfer kernel lookups/executions to 60 seconds and remote cleanup to five seconds; stalled iterators no longer keep the tool request pending indefinitely.
 - Revalidate the original active idle kernel before every transfer execution, reject competing transfers, cap receipt output, and quarantine unfinished kernel executions until their iterators close.
 - Preserve uncertain upload outcomes and skip remote cleanup when execution has not settled. MCP client cancellation forwarding remains a separate routing limitation.

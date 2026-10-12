@@ -60,6 +60,12 @@ Cell references accept zero-based indices or the `cell_id` returned by a read. P
 | `upload_file` / `download_file` | Kernel transfer | Chunked, hashed transfer between `hostPath` on the VS Code host and `kernelPath` in the active idle Python kernel |
 | `export_notebook` | Manage | Export as markdown, Python, or HTML |
 
+### Editing cell metadata
+
+`edit_cells.edits[].metadata` represents the cell's nbformat metadata, such as `tags`, `jupyter.source_hidden`, or presentation fields. Inserted cells store that map; `edit` and `replace` shallow-merge it with existing nbformat metadata. Omitting it preserves existing metadata. VS Code's native cell ID, attachments, and execution-count fields remain separate and are preserved. The saved `.ipynb` receives the supplied fields inside each cell's `metadata` object.
+
+This follows the ipynb extension's [serializer](https://github.com/microsoft/vscode/blob/main/extensions/ipynb/src/serializers.ts) and [native cell envelope](https://github.com/microsoft/vscode/blob/main/extensions/ipynb/src/common.ts), checked on 2026-10-12. Standalone metadata regressions exercise serialized fields and reopening with a bounded serializer fixture. Setting `NOTEBOOK_SERIALIZER_BUNDLE` to an installed ipynb bundle additionally checks its pure conversion function without activating that extension; this is a serialization check, not a live editor/save integration test.
+
 ### Reading without excess output
 
 `read_notebook` returns notebook and cell metadata in every view. `source` adds source text, `outputs` adds saved output, and `all` adds both within the requested limits. Source slicing uses 1-based inclusive `startLine` and `endLine`; `maxSourceChars` defaults to 12,000 per cell, with `0` requesting unbounded source explicitly. Truncation is reported.

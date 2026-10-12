@@ -15,7 +15,7 @@ export interface EditNotebookArgs {
     newCode?: string;
     oldText?: string;
     language?: string;
-    /** Optional cell metadata to set (e.g. { tags: ["parameters"] }) — applied via NotebookEdit.updateCellMetadata. */
+    /** Optional nbformat cell metadata to merge, e.g. { tags: ["parameters"] }. */
     metadata?: Record<string, unknown>;
     /** Whether to re-run the edited cell after applying (default false). */
     run?: boolean;
@@ -121,7 +121,7 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
                 args.language ?? 'python'
             );
             if (args.metadata) {
-                cell.metadata = args.metadata;
+                cell.metadata = { metadata: { ...args.metadata } };
             }
             edit.set(nb.uri, [vscode.NotebookEdit.insertCells(at, [cell])]);
             break;
@@ -136,7 +136,7 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
                 args.newCode,
                 args.language ?? existing.document.languageId
             );
-            cell.metadata = { ...(existing.metadata ?? {}), ...(args.metadata ?? {}) };
+            cell.metadata = editedCellMetadata(existing.metadata, args.metadata);
             edit.set(nb.uri, [vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(idx, idx + 1), [cell])]);
             break;
         }
@@ -151,7 +151,7 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
             const replacement = existing.document.getText().replace(args.oldText!, args.newCode ?? '');
             affectedIndex = idx;
             const cell = new vscode.NotebookCellData(existing.kind, replacement, args.language ?? existing.document.languageId);
-            cell.metadata = { ...(existing.metadata ?? {}), ...(args.metadata ?? {}) };
+            cell.metadata = editedCellMetadata(existing.metadata, args.metadata);
             cell.outputs = [...existing.outputs];
             edit.set(nb.uri, [vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(idx, idx + 1), [cell])]);
             break;
@@ -178,6 +178,12 @@ export async function editNotebook(args: EditNotebookArgs): Promise<string> {
     }
 
     return `Applied ${args.editType} on ${nb.uri.toString()}. Cells now: ${nb.cellCount}.`;
+}
+
+/** VS Code's ipynb serializer keeps nbformat metadata inside its native cell envelope. */
+function editedCellMetadata(existing: Record<string, unknown>, incoming?: Record<string, unknown>): Record<string, unknown> {
+    if (incoming === undefined) return { ...existing };
+    return { ...existing, metadata: { ...(existing.metadata as Record<string, unknown> | undefined), ...incoming } };
 }
 
 /** Create a new notebook. With a workspace folder, writes a .ipynb file; without one (empty window), creates an untitled notebook. */

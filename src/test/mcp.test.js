@@ -312,9 +312,10 @@ async function main() {
         const meta = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri } });
         assert.match(meta.content[0].text, /"cellCount":2/);
     });
-    await check('edit_cells with metadata (updateCellMetadata path)', async () => {
+    await check('edit_cells maps nbformat metadata inside the native cell envelope', async () => {
         const res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [{ cellId: 0, editType: 'edit', newCode: 'x=1', metadata: { tags: ['parameters'] } }] } });
         assert.ok(!res.isError, JSON.stringify(res));
+        assert.deepStrictEqual(openNotebooks.find((doc) => doc.uri.toString() === createdUri)._cells[0].metadata.metadata, { tags: ['parameters'] });
     });
     await check('move_cells rejects duplicate cellIds', async () => {
         const res = await client.callTool({ name: 'move_cells', arguments: { notebookRef: createdUri, cellIds: [0, 0], toIndex: 1 } });

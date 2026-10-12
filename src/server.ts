@@ -260,7 +260,7 @@ required: ['notebookRef', 'format']
                                 newCode: { type: 'string', description: 'New cell content (required for insert/edit/replace).' },
                                 oldText: { type: 'string', description: 'For replace, exact non-empty text to replace once.' },
                                 language: { type: 'string', description: 'Cell language, e.g. python or markdown.' },
-                                metadata: { type: 'object', additionalProperties: true, description: 'Optional cell metadata to set (e.g. { "tags": ["parameters"] }).' },
+                                metadata: { type: 'object', additionalProperties: true, description: 'Optional nbformat cell metadata to merge (e.g. { "tags": ["parameters"] }); preserves native cell identity and attachments.' },
                                 run: { type: 'boolean', description: 'Re-run the edited cell (default false).' }
                             },
                             required: ['cellId', 'editType']

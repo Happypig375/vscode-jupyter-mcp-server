@@ -12,6 +12,8 @@ Existing-notebook tools use `notebookRef` for one target and `notebookRefs` for 
 
 Tool schemas are strict. Unknown or obsolete keys fail validation. `list_kernels` is read-only; provider setup is explicit through `configure_kernel`; `select_kernel` accepts only an exact listed id. `run_cells` has no kernel hint. User supplied runtime selection takes precedence over defaults.
 
+`edit_cells.edits[].metadata` is nbformat cell metadata. Inserts store it inside VS Code's native `cell.metadata.metadata`; edits/replacements shallow-merge that nested map while preserving the native envelope's cell ID, attachments, execution count, and other fields. Metadata tests must verify serialized `.ipynb` fields, not only successful edits or in-memory values.
+
 Source line bounds are 1-based and inclusive, and explicit source truncation is reported. Saved outputs can remain stale after edits; execution refreshes observed output state. File transfer uses only the public API of the current active idle Python kernel, is bounded and chunked, and never starts or selects a kernel.
 
 The `notebook.cell.execute` command is invoked with an explicit target editor and selected cell ranges. Runtime selection supplied by the user takes precedence; missing or ambiguous targets fail closed rather than opening or transferring another notebook.
