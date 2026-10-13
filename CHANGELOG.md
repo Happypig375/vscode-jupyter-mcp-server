@@ -5,7 +5,7 @@
 - Route files above 4 MiB through Colab's registered Contents filesystem, with a 64 MiB cap, instead of encoding their payload into repeated kernel executions. Both upload and download support the optional exact `colabFileUri`; otherwise large transfers discover mounted/open Colab roots.
 - Prove each native route against a random file created in the selected kernel before transferring payloads. Keep kernel-side SHA-256 verification, atomic promotion, no-overwrite defaults and kernel replacement checks.
 - Bound native filesystem waits to two minutes and quarantine unfinished I/O. Failed native binding never falls back to large kernel execution. `get_kernel_info` exposes unverified Colab root candidates without connecting or executing.
-- Add a 65,568,700-byte synthetic round trip and real-Python/local-filesystem regression covering checksum rejection, destination preservation and URI mismatch. Live Colab large-file reliability remains unverified; this release does not establish the cause of the earlier runtime loss.
+- Add a 65,568,700-byte synthetic round trip and real-Python/local-filesystem regression covering checksum rejection, destination preservation and URI mismatch. Subsequent 14 October live Colab validation passed at this size in both directions, plus a 62,572,000-byte upload, with the same process remaining responsive. These checks do not establish the cause of the earlier runtime loss or reliability across every runtime/network.
 
 ## 0.4.2
 
