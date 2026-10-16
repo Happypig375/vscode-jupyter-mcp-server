@@ -1,18 +1,21 @@
 import * as assert from 'assert';
 import * as crypto from 'crypto';
 import * as path from 'path';
+import * as zlib from 'zlib';
 import { CancellationTokenSource } from './vscodeStub';
-import { ActiveKernelLike, ColabFileSystem, downloadFile, KernelFileDeps, MAX_KERNEL_TRANSFER_BYTES, TRANSFER_CHUNK_BYTES, uploadFile } from '../kernelFiles';
+import { ActiveKernelLike, ColabFileSystem, downloadFile, KernelFileDeps, MAX_KERNEL_TRANSFER_BYTES, TRANSFER_CHUNK_BYTES, TRANSFER_TAG, uploadFile } from '../kernelFiles';
 
 function decode(code: string) {
     const outer = code.match(/b64decode\("([A-Za-z0-9+/=]+)"\)/)!;
     const source = Buffer.from(outer[1], 'base64').toString();
     const encodedArgs = source.match(/b64decode\("([A-Za-z0-9+/=]+)"\)/)!;
     const marker = source.match(/print\("([^\"]+:)"\+json/)!;
-    return { source, args: JSON.parse(Buffer.from(encodedArgs[1], 'base64').toString()), marker: marker[1] };
+    const payload = code.match(/'_mcp_payload':"([A-Za-z0-9+/=]*)"\}\)$/)!;
+    return { source, args: JSON.parse(Buffer.from(encodedArgs[1], 'base64').toString()), marker: marker[1], payload: payload[1] };
 }
 class Kernel implements ActiveKernelLike {
-    language = 'python'; status = 'idle'; files = new Map<string, Buffer>(); missing = false; badHash = false; sources: string[] = [];
+    language = 'python'; status = 'idle'; files = new Map<string, Buffer>(); missing = false; badHash = false; sources: string[] = []; codes: string[] = [];
+    failWith?: string;
     afterExecution?: (source: string) => void;
     hang?: (source: string) => boolean;
     flooded = false;
@@ -25,16 +28,21 @@ class Kernel implements ActiveKernelLike {
         assert.strictEqual(typeof token?.isCancellationRequested, 'boolean');
         assert.strictEqual(typeof token?.onCancellationRequested, 'function');
         token.onCancellationRequested(() => { this.cancelledExecutions++; });
-        const { source, args: a, marker } = decode(code); this.sources.push(source); let r: any;
+        const { source, args: a, marker, payload } = decode(code); this.sources.push(source); this.codes.push(code); let r: any;
         if (this.hang?.(source)) {
             const self = this;
             return { [Symbol.asyncIterator]() { return { next: () => new Promise<IteratorResult<any>>(() => undefined), return: () => { self.returned++; return new Promise<IteratorResult<any>>(() => undefined); } }; } };
         }
         if (this.flooded) return (async function* () { yield { text: 'x'.repeat(3 * TRANSFER_CHUNK_BYTES) }; })();
-        if (source.includes("kind':'init")) { this.files.set(a.tmp, Buffer.alloc(0)); if (a.binding) this.files.set(a.binding, Buffer.from(a.nonce)); r = { kind: 'init' }; }
+        if (this.failWith && source.includes("kind':'init")) r = { kind: 'error', error: this.failWith };
+        else if (source.includes("kind':'init")) { this.files.set(a.tmp, Buffer.alloc(0)); if (a.binding) this.files.set(a.binding, Buffer.from(a.nonce)); r = { kind: 'init' }; }
         else if (source.includes("kind':'bind")) { this.files.set(a.binding, Buffer.from(a.nonce)); r = { kind: 'bind' }; }
-        else if (source.includes("bytes':n")) { const c = Buffer.from(a.chunk, 'base64'); this.files.set(a.tmp, Buffer.concat([this.files.get(a.tmp)!, c])); r = { kind: 'chunk', offset: a.offset, bytes: c.length }; }
-        else if (source.includes("chunk':base64")) { const c = this.files.get(a.path)!.subarray(a.offset, a.offset + a.length); r = { kind: 'chunk', offset: a.offset, bytes: c.length, chunk: c.toString('base64') }; }
+        else if (source.includes("bytes':n")) { const p = Buffer.from(payload, 'base64'); const c = a.z ? zlib.inflateSync(p) : p; this.files.set(a.tmp, Buffer.concat([this.files.get(a.tmp)!, c])); r = { kind: 'chunk', offset: a.offset, bytes: c.length }; }
+        else if (source.includes("chunk':base64")) {
+            // Mirror the kernel command: zlib only when it saves at least 10%.
+            const c = this.files.get(a.path)!.subarray(a.offset, a.offset + a.length), packed = zlib.deflateSync(c, { level: 6 }), z = c.length > 0 && packed.length < c.length * 0.9;
+            r = { kind: 'chunk', offset: a.offset, bytes: c.length, z, chunk: (z ? packed : c).toString('base64') };
+        }
         else if (source.includes("kind':'meta")) r = { kind: 'meta', bytes: this.files.get(a.path)!.length };
         else if (source.includes("kind':'done")) { const v = this.files.get(a.tmp ?? a.path)!; const sha256 = crypto.createHash('sha256').update(v).digest('hex'); if (a.tmp) { if (sha256 !== a.sha256) throw new Error('verification'); if (!a.overwrite && this.files.has(a.dest)) throw new Error('EEXIST'); this.files.set(a.dest, v); this.files.delete(a.tmp); } if (a.binding) this.files.delete(a.binding); r = { kind: 'done', bytes: v.length, sha256: this.badHash ? 'bad' : sha256 }; }
         else { for (const p of a.paths ?? [a.tmp, a.binding]) this.files.delete(p); r = { kind: 'clean' }; }
@@ -70,7 +78,62 @@ async function main() {
     await assert.rejects(uploadFile({ notebookRef: 'n', hostPath: src, kernelPath: '/tmp/short' }, undefined, short), /failed before destination commit/);
     await lifecycleTests();
     await nativeTransferTests();
+    await encodingAndBudgetTests();
     console.log('kernelFiles tests passed');
+}
+async function encodingAndBudgetTests() {
+    const src = path.resolve('encoding-source'), dest = path.resolve('encoding-destination');
+    const args = { notebookRef: 'encoding', hostPath: src, kernelPath: '/tmp/encoding' };
+    const chunkCodes = (kernel: Kernel) => kernel.codes.filter((code) => decode(code).source.includes("bytes':n"));
+    {
+        // Compressible CSV-like data: each request carries the deflated chunk once.
+        const text = Buffer.from('2026-09-01T08:00:00Z,CARPARK,23.4\n'.repeat(Math.ceil(3 * TRANSFER_CHUNK_BYTES / 34))).subarray(0, 3 * TRANSFER_CHUNK_BYTES + 99);
+        const kernel = new Kernel(), host = new Map([[src, text]]), d = deps(kernel, host);
+        await uploadFile(args, undefined, d);
+        assert.deepStrictEqual(kernel.files.get(args.kernelPath), text);
+        const codes = chunkCodes(kernel);
+        assert.strictEqual(codes.length, 4);
+        assert.ok(Math.max(...codes.map((c) => Buffer.byteLength(c))) < TRANSFER_CHUNK_BYTES / 4, 'compressible chunks must shrink');
+        assert.ok(kernel.codes.every((c) => c.startsWith(TRANSFER_TAG + '\n')), 'every request carries the cache-purge tag');
+        assert.ok(kernel.sources.every((s) => s.includes('_ipython_cache') && s.includes('linecache')), 'every request purges cached transfer sources');
+        assert.ok(kernel.sources.every((s) => !s.includes("a['chunk']")), 'payload is not nested inside the JSON arguments');
+        await downloadFile({ ...args, hostPath: dest }, undefined, d);
+        assert.deepStrictEqual(host.get(dest), text, 'compressed download chunks decompress exactly');
+    }
+    {
+        // Incompressible data: one base64 layer (about 4/3), not three.
+        const random = crypto.randomBytes(2 * TRANSFER_CHUNK_BYTES);
+        const kernel = new Kernel(), host = new Map([[src, random]]), d = deps(kernel, host);
+        await uploadFile(args, undefined, d);
+        assert.deepStrictEqual(kernel.files.get(args.kernelPath), random);
+        for (const code of chunkCodes(kernel)) assert.ok(Buffer.byteLength(code) < TRANSFER_CHUNK_BYTES * 4 / 3 + 4096, `request too large: ${Buffer.byteLength(code)}`);
+        await downloadFile({ ...args, hostPath: dest }, undefined, d);
+        assert.deepStrictEqual(host.get(dest), random);
+    }
+    {
+        // A Python exception is reported by class name only, and cleanup still runs.
+        const kernel = new Kernel(), host = new Map([[src, Buffer.from('payload')]]), d = deps(kernel, host);
+        kernel.failWith = 'FileNotFoundError';
+        await assert.rejects(uploadFile(args, undefined, d), /kernel reported FileNotFoundError/);
+        assert.strictEqual(kernel.sources.length, 2, 'init error receipt, then one bounded cleanup');
+    }
+    {
+        // The per-kernel wire budget refuses before dispatch; a new kernel object starts fresh.
+        const random = crypto.randomBytes(TRANSFER_CHUNK_BYTES + 1000);
+        const kernel = new Kernel(), host = new Map([[src, random]]), d = { ...deps(kernel, host), kernelWireBudgetBytes: 200_000 };
+        await assert.rejects(uploadFile(args, undefined, d), /transfer budget/);
+        assert.strictEqual(chunkCodes(kernel).length, 0, 'no chunk dispatched beyond the budget');
+        assert.strictEqual(kernel.files.has(args.kernelPath), false);
+        const small = Buffer.from('small payload'); host.set(src, small);
+        await uploadFile(args, undefined, d);
+        kernel.files.set('/tmp/big', random);
+        await assert.rejects(downloadFile({ ...args, kernelPath: '/tmp/big', hostPath: dest }, undefined, d), /transfer budget/);
+        assert.strictEqual(host.has(dest), false);
+        const fresh = new Kernel(); fresh.files.set('/tmp/big', crypto.randomBytes(10_000));
+        d.getKernel = async () => fresh;
+        await downloadFile({ ...args, kernelPath: '/tmp/big', hostPath: dest }, undefined, d);
+        assert.deepStrictEqual(host.get(dest), fresh.files.get('/tmp/big'));
+    }
 }
 async function lifecycleTests() {
     const src = path.resolve('lifecycle-input'), dest = path.resolve('lifecycle-output');

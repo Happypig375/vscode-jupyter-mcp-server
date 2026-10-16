@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.4
+
+- Stop kernel-route transfers from growing kernel memory. IPython caches the source of every executed request in `linecache` for the kernel's lifetime, even outside history; with the previous triple encoding each 256 KiB upload chunk left about 622 KB there (12.4 MB after 20 chunks in IPython 8.24 and 9.16). Every transfer request now starts with a tag and removes earlier tagged sources, including IPython 7's `_ipython_cache`; a real-Python replay through IPython retains 0 bytes.
+- Send each upload chunk's payload once as a base64 literal instead of nesting it in base64-encoded JSON inside base64-encoded source (about 1.33x instead of 2.4x), and zlib-compress chunks in both directions when that saves at least 10% (CSV-like chunks shrink roughly twelvefold).
+- Refuse further chunk transfers on a kernel object after 64 MiB of chunk traffic, before dispatch, with guidance to use the native Colab file service or restart the kernel. Live Colab runtimes were lost after roughly 90-150 MB of chunk traffic.
+- Report kernel-side exceptions (for example a missing destination directory) by exception class instead of a generic receipt failure.
+
 ## 0.4.3
 
 - Route files above 4 MiB through Colab's registered Contents filesystem, with a 64 MiB cap, instead of encoding their payload into repeated kernel executions. Both upload and download support the optional exact `colabFileUri`; otherwise large transfers discover mounted/open Colab roots.

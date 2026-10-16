@@ -24,6 +24,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install IPython for the transfer cache-retention regression
+        run: python -m pip install ipython
+
       - name: Install dependencies
         run: npm ci
 

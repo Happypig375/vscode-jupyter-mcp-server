@@ -8,6 +8,30 @@ import { spawnSync } from 'child_process';
 import { ActiveKernelLike, downloadFile, getColabFileRoots, uploadFile } from '../kernelFiles';
 import { extensionRegistry, Uri, workspace } from './vscodeStub';
 
+const python = process.env.MCP_TEST_PYTHON ?? 'python';
+/** Replays real transfer requests through IPython (when installed) and returns the source it still caches. */
+function ipythonRetainedBytes(codes: string[], directory: string): number | undefined {
+    if (spawnSync(python, ['-c', 'import IPython'], { windowsHide: true }).status !== 0) return undefined;
+    const codesFile = path.join(directory, 'requests.json');
+    fs.writeFileSync(codesFile, JSON.stringify(codes));
+    const script = [
+        'import json, linecache, sys',
+        'from IPython.core.interactiveshell import InteractiveShell',
+        'shell = InteractiveShell.instance()',
+        'for code in json.load(open(sys.argv[1], encoding="utf-8")):',
+        '    shell.run_cell(code, store_history=False)',
+        'total = 0',
+        'for cache in (linecache.cache, getattr(linecache, "_ipython_cache", {})):',
+        '    for v in cache.values():',
+        '        if isinstance(v, tuple) and len(v) > 2 and v[2] and str(v[2][0]).startswith("# jupyter-mcp-transfer"):',
+        '            total += sum(len(line) for line in v[2])',
+        'print("RETAINED", total)'
+    ].join('\n');
+    const run = spawnSync(python, ['-', codesFile], { input: script, encoding: 'utf8', timeout: 120_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+    assert.strictEqual(run.status, 0, run.stderr);
+    return Number(run.stdout.match(/RETAINED (\d+)/)![1]);
+}
+
 async function main() {
     const parent = path.resolve('.vscode-test');
     await fs.promises.mkdir(parent, { recursive: true });
@@ -28,19 +52,23 @@ async function main() {
         if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mapArgs(v)]));
         return value;
     };
+    let nativePhase = true;
+    const mappedCodes: string[] = [];
     const kernel: ActiveKernelLike = {
         language: 'python', status: 'idle',
         async *executeCode(code) {
             calls++; largestCode = Math.max(largestCode, Buffer.byteLength(code));
-            assert.ok(Buffer.byteLength(code) < 12_000, 'File payload must never be encoded into a native kernel request');
+            if (nativePhase) assert.ok(Buffer.byteLength(code) < 12_000, 'File payload must never be encoded into a native kernel request');
             const outer = code.match(/b64decode\("([A-Za-z0-9+/=]+)"\)/)!;
             let source = Buffer.from(outer[1], 'base64').toString();
             const encodedArgs = source.match(/b64decode\("([A-Za-z0-9+/=]+)"\)/)!;
             const args = mapArgs(JSON.parse(Buffer.from(encodedArgs[1], 'base64').toString()));
-            // Translate only argument paths into the Windows/Linux fixture directory;
-            // execute the generated Python command and its receipt logic unchanged.
+            // Translate only argument paths into the Windows/Linux fixture directory, then run the
+            // complete generated request (wrapper, payload literal, command and receipt) unchanged.
             source = source.replace(encodedArgs[1], Buffer.from(JSON.stringify(args)).toString('base64'));
-            const run = spawnSync(process.env.MCP_TEST_PYTHON ?? 'python', ['-c', source], { encoding: 'utf8', timeout: 20_000, windowsHide: true });
+            const mapped = code.replace(outer[1], Buffer.from(source).toString('base64'));
+            if (!nativePhase) mappedCodes.push(mapped);
+            const run = spawnSync(python, ['-'], { input: mapped, encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
             if (run.error) throw run.error;
             if (run.status !== 0) { yield { text: 'Python execution failed' }; return; }
             yield { text: run.stdout };
@@ -108,6 +136,30 @@ async function main() {
         assert.strictEqual((await fs.promises.stat(destination)).size, 0);
         assert.deepStrictEqual(await fs.promises.readdir(content), ['roundtrip.bin']);
         console.log(`Real Python native round trip: ${size} bytes; actual hashes, atomic no-overwrite, overwrite, corruption, URI mismatch and empty-file checks passed; largest kernel request ${largestCode} bytes.`);
+
+        // Kernel-execute route (files at or below 4 MiB): real Python decodes the single payload
+        // literal, decompresses when flagged and verifies hashes; IPython must not retain requests.
+        nativePhase = false;
+        const mixed = Buffer.concat([crypto.randomBytes(400_000), Buffer.from('2026-09-01T08:00:00Z,CARPARK,23.4\n'.repeat(30_000))]);
+        const kernelSource = path.join(root, 'kernel-source.bin'), kernelDestination = path.join(root, 'kernel-download.bin');
+        await fs.promises.writeFile(kernelSource, mixed);
+        const kernelArgs = { notebookRef: 'file:///fixture.ipynb', hostPath: kernelSource, kernelPath: '/content/kernel-route.bin' };
+        const kup = JSON.parse(await uploadFile(kernelArgs));
+        assert.strictEqual(kup.transport, 'kernel-execute'); assert.strictEqual(kup.bytes, mixed.length);
+        assert.ok((await fs.promises.readFile(remotePath(kernelArgs.kernelPath))).equals(mixed), 'kernel-route upload is byte-identical');
+        const kdown = JSON.parse(await downloadFile({ ...kernelArgs, hostPath: kernelDestination }));
+        assert.strictEqual(kdown.sha256, kup.sha256);
+        assert.ok((await fs.promises.readFile(kernelDestination)).equals(mixed), 'kernel-route download is byte-identical');
+        const largestKernelRequest = Math.max(...mappedCodes.map((c) => Buffer.byteLength(c)));
+        assert.ok(largestKernelRequest < 262_144 * 4 / 3 + 8192, `single payload encoding expected, got ${largestKernelRequest}`);
+        const retained = ipythonRetainedBytes(mappedCodes, root);
+        if (retained === undefined) console.log('IPython is not installed; skipped the code-cache retention replay.');
+        else {
+            assert.strictEqual(retained, 0, 'IPython retained transfer request sources');
+            console.log(`IPython replay of ${mappedCodes.length} real transfer requests retained ${retained} bytes of request source.`);
+        }
+        await fs.promises.rm(remotePath(kernelArgs.kernelPath));
+        console.log(`Real Python kernel-route round trip: ${mixed.length} bytes in ${mappedCodes.length} requests; largest request ${largestKernelRequest} bytes.`);
     } finally {
         extensionRegistry.clear(); workspace.workspaceFolders = []; workspace.fs = {};
         assert.strictEqual(path.dirname(root), parent);

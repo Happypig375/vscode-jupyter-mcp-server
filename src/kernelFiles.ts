@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as zlib from 'zlib';
 import * as vscode from 'vscode';
 
 export const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
@@ -10,8 +11,18 @@ export const TRANSFER_CLEANUP_TIMEOUT_MS = 5_000;
 // Large payloads must use a file service, not hundreds of kernel executions.
 export const MAX_KERNEL_TRANSFER_BYTES = 4 * 1024 * 1024;
 export const NATIVE_TRANSFER_TIMEOUT_MS = 120_000;
+// Cumulative chunk payload (request code for uploads, base64 receipts for downloads) that one
+// kernel object may carry. Colab runtimes were lost after roughly 90-150 MB of chunk traffic.
+export const KERNEL_WIRE_BUDGET_BYTES = 64 * 1024 * 1024;
 const MAX_RECEIPT_CHARS = 2 * TRANSFER_CHUNK_BYTES + 4096;
 const RECEIPT = '__JUPYTER_MCP_FILE_RECEIPT__';
+// IPython stores the source of every executed cell in linecache for the kernel's lifetime,
+// including executions outside history. Every transfer request starts with this tag and
+// removes earlier tagged sources, so payload-bearing requests are not retained in memory.
+export const TRANSFER_TAG = '# jupyter-mcp-transfer';
+// Use zlib only when it saves at least this fraction; incompressible data is sent as is.
+const COMPRESSION_RATIO = 0.9;
+const kernelWireBytes = new WeakMap<ActiveKernelLike, number>();
 
 export interface KernelOutputItem { mime?: string; data?: unknown; }
 export interface KernelOutput { items?: KernelOutputItem[]; text?: unknown; value?: unknown; data?: unknown; }
@@ -38,6 +49,7 @@ export interface KernelFileDeps {
     cleanupTimeoutMs?: number;
     nativeTimeoutMs?: number;
     bindingTimeoutMs?: number;
+    kernelWireBudgetBytes?: number;
 }
 const activeTargets = new Set<string>();
 const activeKernels = new WeakSet<ActiveKernelLike>();
@@ -154,10 +166,39 @@ async function bindColab(candidates: ColabFileSystem[], bindingPath: string, non
     return matches[0];
 }
 
-function transferCode(command: string, args: Record<string, unknown>, nonce: string): string {
-    const source = [`import base64, hashlib, json, os`, `a=json.loads(base64.b64decode(${JSON.stringify(Buffer.from(JSON.stringify(args), 'utf8').toString('base64'))}).decode('utf-8'))`, command, `print(${JSON.stringify(RECEIPT + nonce + ':')}+json.dumps(result,separators=(',',':')))`].join('\n');
+const PURGE_CACHED_TRANSFER_SOURCES = [
+    'import linecache as _mcp_lc',
+    "for _mcp_cache in (getattr(_mcp_lc, '_ipython_cache', None), _mcp_lc.cache):",
+    ' if isinstance(_mcp_cache, dict):',
+    `  for _mcp_key in [k for k, v in list(_mcp_cache.items()) if isinstance(v, tuple) and len(v) > 2 and v[2] and str(v[2][0]).startswith(${JSON.stringify(TRANSFER_TAG)})]:`,
+    '   _mcp_cache.pop(_mcp_key, None)'
+].join('\n');
+/** The optional payload is a single base64 literal in the request, never re-encoded with its arguments. */
+function transferCode(command: string, args: Record<string, unknown>, nonce: string, payload = ''): string {
+    const body = command.split('\n').map((line) => ' ' + line).join('\n');
+    const source = [
+        `import base64, hashlib, json, os, zlib`,
+        `a=json.loads(base64.b64decode(${JSON.stringify(Buffer.from(JSON.stringify(args), 'utf8').toString('base64'))}).decode('utf-8'))`,
+        PURGE_CACHED_TRANSFER_SOURCES,
+        'try:', body,
+        'except Exception as _mcp_error:', " result={'kind':'error','error':type(_mcp_error).__name__}",
+        `print(${JSON.stringify(RECEIPT + nonce + ':')}+json.dumps(result,separators=(',',':')))`
+    ].join('\n');
     const encoded = Buffer.from(source, 'utf8').toString('base64');
-    return `exec(compile(__import__('base64').b64decode(${JSON.stringify(encoded)}),'<jupyter-mcp-transfer>','exec'),{'__builtins__':__builtins__})`;
+    return `${TRANSFER_TAG}\nexec(compile(__import__('base64').b64decode(${JSON.stringify(encoded)}),'<jupyter-mcp-transfer>','exec'),{'__builtins__':__builtins__,'_mcp_payload':${JSON.stringify(payload)}})`;
+}
+function chargeWire(kernel: ActiveKernelLike, bytes: number, deps: KernelFileDeps): void {
+    const used = kernelWireBytes.get(kernel) ?? 0;
+    const budget = deps.kernelWireBudgetBytes ?? KERNEL_WIRE_BUDGET_BYTES;
+    if (used + bytes > budget) {
+        throw new TransferFailure(`kernel-channel transfer budget for this kernel (${Math.round(budget / 1048576)} MiB) would be exceeded; repeated payload executions can exhaust Colab runtime memory. Use the native Colab file service (Colab explorer upload/download, or Colab: Mount Server to Workspace with colabFileUri), or restart the kernel before transferring more`);
+    }
+    kernelWireBytes.set(kernel, used + bytes);
+}
+function packChunk(chunk: Buffer): { payload: string; compressed: boolean } {
+    const packed = zlib.deflateSync(chunk, { level: 6 });
+    const compressed = chunk.length > 0 && packed.length < chunk.length * COMPRESSION_RATIO;
+    return { payload: (compressed ? packed : chunk).toString('base64'), compressed };
 }
 function outputText(value: unknown): string { if (typeof value === 'string') return value; if (value instanceof Uint8Array) return Buffer.from(value).toString('utf8'); return ''; }
 async function receipt(kernel: ActiveKernelLike, code: string, nonce: string, assertCurrent: () => Promise<void>, timeoutMs: number, token?: vscode.CancellationToken, onDispatch?: () => void): Promise<Record<string, unknown>> {
@@ -223,11 +264,15 @@ async function receipt(kernel: ActiveKernelLike, code: string, nonce: string, as
     const marker = `${RECEIPT}${nonce}:`;
     const matches = combined.split(/\r?\n/).filter((line) => line.startsWith(marker));
     if (matches.length !== 1) throw new Error('invalid receipt');
+    let value: unknown;
     try {
-        const value = JSON.parse(matches[0].slice(marker.length));
-        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid receipt');
-        return value as Record<string, unknown>;
+        value = JSON.parse(matches[0].slice(marker.length));
     } catch { throw new Error('invalid receipt'); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid receipt');
+    const record = value as Record<string, unknown>;
+    // The kernel reports only the exception class, never its message or file contents.
+    if (record.kind === 'error') throw new TransferFailure(`kernel reported ${typeof record.error === 'string' && /^[A-Za-z_][A-Za-z0-9_.]{0,80}$/.test(record.error) ? record.error : 'an exception'}`);
+    return record;
 }
 async function boundedKernel(ref: string, deps: KernelFileDeps, token?: vscode.CancellationToken): Promise<ActiveKernelLike> {
     ensureNotCancelled(token);
@@ -343,7 +388,10 @@ export async function uploadFile(a: FileTransferArgs, token?: vscode.Cancellatio
                     const { bytesRead } = await input.read(buffer, 0, requested, bytes);
                     if (bytesRead !== requested) throw new Error('short read');
                     const chunk = buffer.subarray(0, bytesRead);
-                    const appended = await receive(transferCode("d=base64.b64decode(a['chunk'])\nf=open(a['tmp'],'r+b')\nf.seek(0,2)\nif f.tell()!=a['offset']: f.close(); raise RuntimeError('offset')\nn=f.write(d); f.flush(); os.fsync(f.fileno()); f.close()\nif n!=len(d): raise RuntimeError('write')\nresult={'kind':'chunk','offset':a['offset'],'bytes':n}", { tmp: temporaryPath, chunk: chunk.toString('base64'), offset: bytes }, nonce), nonce);
+                    const packed = packChunk(chunk);
+                    const code = transferCode("p=base64.b64decode(_mcp_payload)\nd=zlib.decompress(p) if a['z'] else p\nf=open(a['tmp'],'r+b')\nf.seek(0,2)\nif f.tell()!=a['offset']: f.close(); raise RuntimeError('offset')\nn=f.write(d); f.flush(); os.fsync(f.fileno()); f.close()\nif n!=len(d): raise RuntimeError('write')\nresult={'kind':'chunk','offset':a['offset'],'bytes':n}", { tmp: temporaryPath, offset: bytes, z: packed.compressed }, nonce, packed.payload);
+                    chargeWire(kernel, Buffer.byteLength(code), deps);
+                    const appended = await receive(code, nonce);
                     if (appended.kind !== 'chunk' || exactNumber(appended.offset, bytes) !== bytes) throw new Error('invalid chunk');
                     exactNumber(appended.bytes, bytesRead);
                     hash.update(chunk);
@@ -412,9 +460,15 @@ export async function downloadFile(a: FileTransferArgs, token?: vscode.Cancellat
                     phase = 'transfer chunk';
                     ensureNotCancelled(token);
                     const requested = Math.min(TRANSFER_CHUNK_BYTES, remoteSize - bytes);
-                    const part = await receive(transferCode("f=open(a['path'],'rb'); f.seek(a['offset']); d=f.read(a['length']); f.close()\nresult={'kind':'chunk','offset':a['offset'],'bytes':len(d),'chunk':base64.b64encode(d).decode('ascii')}", { path: a.kernelPath, offset: bytes, length: requested }, nonce), nonce);
+                    // Reserve the uncompressed worst case before dispatch, then charge what arrived.
+                    const reserve = Math.ceil(requested / 3) * 4 + 512;
+                    chargeWire(kernel, reserve, deps);
+                    const part = await receive(transferCode(`f=open(a['path'],'rb'); f.seek(a['offset']); d=f.read(a['length']); f.close()\nc=zlib.compress(d,6)\nz=len(d)>0 and len(c)<len(d)*${COMPRESSION_RATIO}\nresult={'kind':'chunk','offset':a['offset'],'bytes':len(d),'z':z,'chunk':base64.b64encode(c if z else d).decode('ascii')}`, { path: a.kernelPath, offset: bytes, length: requested }, nonce), nonce);
+                    kernelWireBytes.set(kernel, Math.max(0, (kernelWireBytes.get(kernel) ?? 0) - reserve + (typeof part.chunk === 'string' ? part.chunk.length : 0)));
                     if (part.kind !== 'chunk' || exactNumber(part.offset, bytes) !== bytes) throw new Error('invalid chunk');
-                    const chunk = Buffer.from(typeof part.chunk === 'string' ? part.chunk : '', 'base64');
+                    const raw = Buffer.from(typeof part.chunk === 'string' ? part.chunk : '', 'base64');
+                    if (part.z !== true && part.z !== false && part.z !== undefined) throw new Error('invalid chunk');
+                    const chunk = part.z === true ? zlib.inflateSync(raw, { maxOutputLength: requested }) : raw;
                     exactNumber(part.bytes, requested);
                     if (chunk.length !== requested) throw new Error('invalid chunk');
                     await writeAll(output, chunk); hash.update(chunk); bytes += chunk.length;
