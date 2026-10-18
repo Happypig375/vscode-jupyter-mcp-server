@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.5
+
+- Resolve string cell references as stable IDs before retaining the numeric-string index fallback. Numeric-only native IDs such as `"40025805"` now work consistently in editing, reading, execution, search, output clearing, and movement; JSON numbers remain 0-based indices.
+- Document the existing `edit_cells` insertion contract: numeric indices and stable IDs are anchors after which the new cell is inserted, while `TOP` and `BOTTOM` select the boundaries.
+- Refuse `restart_kernels` when the public Jupyter API explicitly reports no active kernel, surface provider command failures (including bounded, URL-redacted status details), and report the post-command active-kernel observation without claiming completion or selecting another kernel.
+- Replace empty notebook-provider error payloads such as `Error: :` with an explicit bounded explanation.
+
 ## 0.4.4
 
 - Stop kernel-route transfers from growing kernel memory. IPython caches the source of every executed request in `linecache` for the kernel's lifetime, even outside history; with the previous triple encoding each 256 KiB upload chunk left about 622 KB there (12.4 MB after 20 chunks in IPython 8.24 and 9.16). Every transfer request now starts with a tag and removes earlier tagged sources, including IPython 7's `_ipython_cache`; a real-Python replay through IPython retains 0 bytes.

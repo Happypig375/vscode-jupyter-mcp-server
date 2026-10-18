@@ -290,6 +290,8 @@ async function main() {
         assert.ok(!res.isError, JSON.stringify(res));
         const meta = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri } });
         assert.match(meta.content[0].text, /"cellCount":3/);
+        const inserted = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: createdUri, cellIds: [1], view: 'source' } });
+        assert.match(JSON.parse(inserted.content[0].text).cells[0].source, /print\("inserted"\)/, 'numeric insert anchor must insert after the referenced cell');
     });
     await check('edit_cells TOP and BOTTOM insertion positions are exact', async () => {
         let res = await client.callTool({ name: 'edit_cells', arguments: { notebookRef: createdUri, edits: [{ cellId: 'TOP', editType: 'insert', newCode: 'top_marker' }] } });
