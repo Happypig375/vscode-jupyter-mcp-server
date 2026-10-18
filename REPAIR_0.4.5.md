@@ -21,4 +21,12 @@ The parent subsequently installed that exact VSIX, reloaded VS Code, and confirm
 
 A live 0.4.5 `read_notebook` request using string cell ID `"40025805"` returned the exact cell with `cell_id` `"40025805"` at index 120. The supporting receipts are `AGENTS/local/insight_mining_20261018/mcp_045*` and `mcp_reload_action.json` in the HKUST analysis repository. This verifies the numeric-only ID fix on the installed extension; it does not independently exercise every cell-consuming tool or the restart failure branches.
 
-The final cold notebook run under 0.4.5 remains pending. The extension has not been published to Marketplace, and no cold-run completion is claimed here.
+### Final cold run under 0.4.5
+
+The final live sequence used the same notebook reference. `restart_kernels` returned an observed `restarting` status while explicitly withholding completion; a subsequent `get_kernel_info` observation reported the kernel active and idle. The setup cell then completed as execution 1, followed by all remaining 82 code cells in notebook order as executions 2 through 83.
+
+The resulting notebook has 155 cells, 83 code cells, zero recorded errors, and 36 figures. All 36 figure bytes match the first cold run. All nine new public result sections reproduce exactly, and all prior numerical objects match; the retained parity record separately identifies the final-support protocol/key-label update and the added `late_growth` result without treating those labels as numerical changes.
+
+The 680,836-byte compressed public aggregate transferred through the bounded kernel-execution route with SHA-256 `4580d800d33c3adee56fd7799f1171466725caab32f4c629e09ca44db68c428f`. Its 7,412,029-byte decompressed JSON has SHA-256 `8143366225794a1e93fa10751aaf581516a1f7a44f9b60101df61c1d61be9eb7`.
+
+The supporting HKUST-repository receipts are `cold_v2_restart_01_response.json`, `cold_v2_kernel_info_02_response.json`, `cold_v2_setup_observe_01_response.json`, `cold_v2_observe_05_response.json`, `cold_notebook_v2_verification.json`, `cold_v2_transfer_verification.json`, and the public `analysis/decision_followthrough_2026_10_18/cold_run_v2_parity.json`. The earlier failed restart and stalled local configure helper remain preserved in that record and are not reclassified as 0.4.5 successes. The extension has not been published to Marketplace.
