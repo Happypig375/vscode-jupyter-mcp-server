@@ -9,7 +9,7 @@ import { getColabFileRoots } from './kernelFiles';
 
 export interface EditNotebookArgs {
     filePath: string;
-    /** Cell to edit/delete, or anchor for insert. Accepts cell index (number/string) or cell id. */
+    /** Cell to edit/delete, or anchor after which to insert. Accepts a cell index or stable cell id. */
     cellId?: string | number;
     /** For insert: TOP | BOTTOM, or a cellId/cellIndex after which to insert. */
     editType: 'insert' | 'edit' | 'delete' | 'replace';
@@ -232,30 +232,40 @@ export function cellIdentifier(cell: vscode.NotebookCell, index: number): string
 /** Resolve a cell index within a notebook from a cellId/index/TOP/BOTTOM ref. */
 export function resolveCellIndex(nb: vscode.NotebookDocument, cellId: string | number | undefined): number {
     const cellCount = nb.cellCount;
-    if (cellId === undefined || cellId === '' || String(cellId).toUpperCase() === 'TOP') {
+    if (cellId === undefined || cellId === '' || (typeof cellId === 'string' && cellId.toUpperCase() === 'TOP')) {
         return 0;
     }
-    if (String(cellId).toUpperCase() === 'BOTTOM') {
+    if (typeof cellId === 'string' && cellId.toUpperCase() === 'BOTTOM') {
         return cellCount - 1;
     }
-    if (/^\d+$/.test(String(cellId))) {
+
+    // JSON preserves the caller's intent here: numbers are indices, while strings
+    // may be stable cell IDs. Match every string form before retaining the legacy
+    // numeric-string index fallback, because nbformat cell IDs may contain only digits.
+    if (typeof cellId === 'string') {
+        const frag = cellId.replace(/^#/, '');
+        const exact = nb.getCells().findIndex((c, i) =>
+            cellIdentifier(c, i) === cellId ||
+            c.document.uri.fragment === frag ||
+            String(c.document.uri) === cellId
+        );
+        if (exact !== -1) return exact;
+        if (!/^\d+$/.test(cellId)) {
+            throw new Error(`Cell id '${cellId}' not found. Use a 0-based numeric index, or read cell IDs with read_notebook.`);
+        }
+    }
+
+    if (typeof cellId === 'number' || /^\d+$/.test(cellId)) {
         const n = Number(cellId);
+        if (!Number.isSafeInteger(n)) {
+            throw new Error(`Cell index ${String(cellId)} must be a non-negative safe integer.`);
+        }
         if (n < 0 || n >= cellCount) {
             throw new Error(`Cell index ${n} out of range (notebook has ${cellCount} cells).`);
         }
         return n;
     }
-    // Resolve by metadata.id anchor, then VS Code cell-URI fragment, then full URI.
-    const frag = String(cellId).replace(/^#/, '');
-    const idx = nb.getCells().findIndex((c, i) =>
-        cellIdentifier(c, i) === String(cellId) ||
-        c.document.uri.fragment === frag ||
-        String(c.document.uri) === cellId
-    );
-    if (idx === -1) {
-        throw new Error(`Cell id '${cellId}' not found. Use a 0-based cell index, or inspect the notebook via inspect_notebooks.`);
-    }
-    return idx;
+    throw new Error(`Cell id '${cellId}' not found. Use a 0-based numeric index, or read cell IDs with read_notebook.`);
 }
 
 /** Resolve the insertion point: TOP=0, BOTTOM/undefined=end, any other ref=after that cell. */
@@ -352,9 +362,14 @@ function decodeError(data: Uint8Array): string {
     const raw = new TextDecoder().decode(data);
     try {
         const error = JSON.parse(raw) as { name?: string; message?: string };
-        return `Error: ${error.name ?? 'Error'}: ${error.message ?? raw}`;
+        const name = typeof error.name === 'string' ? error.name.trim() : '';
+        const message = typeof error.message === 'string' ? error.message.trim() : '';
+        if (name && message) return `Error: ${name}: ${message}`;
+        if (message) return `Error: ${message}`;
+        if (name) return `Error: ${name}`;
+        return 'Notebook provider reported an error without a name or message.';
     } catch {
-        return `Error: ${raw}`;
+        return raw.trim() ? `Error: ${raw}` : 'Notebook provider reported an empty error payload.';
     }
 }
 
@@ -475,15 +490,77 @@ export async function saveNotebooks(filePaths: string[]): Promise<string> {
     return `Saved: ${saved.join(', ') || '(none)'}${skipped.length ? `\nSkipped: ${skipped.join(', ')}` : ''}`;
 }
 
+type ActiveKernel = { label?: string; language?: string; status?: string };
+type JupyterApi = {
+    /** Compatibility with older Jupyter extension exports. */
+    getKernel?: (u: vscode.Uri) => ActiveKernel | undefined;
+    kernels?: { getKernel(u: vscode.Uri): Thenable<ActiveKernel | undefined> };
+};
+type ActiveKernelObservation =
+    | { state: 'active'; kernel: ActiveKernel }
+    | { state: 'none'; reason: string }
+    | { state: 'unavailable'; reason: string };
+
+/** Read current active-kernel state without starting or selecting a kernel. */
+async function observeActiveKernel(nb: vscode.NotebookDocument): Promise<ActiveKernelObservation> {
+    const extension = vscode.extensions.getExtension<JupyterApi>('ms-toolsai.jupyter');
+    if (!extension) {
+        return { state: 'unavailable', reason: 'The Jupyter extension is unavailable through the public VS Code API.' };
+    }
+    let api: JupyterApi | undefined;
+    try { api = await extension.activate(); }
+    catch { return { state: 'unavailable', reason: 'Jupyter extension activation failed; runtime state could not be observed.' }; }
+    if (!api?.kernels?.getKernel && !api?.getKernel) {
+        return { state: 'unavailable', reason: 'The public Jupyter API does not expose active-kernel lookup.' };
+    }
+    try {
+        const kernel = api.kernels ? await api.kernels.getKernel(nb.uri) : api.getKernel!(nb.uri);
+        return kernel
+            ? { state: 'active', kernel }
+            : { state: 'none', reason: 'No active kernel was returned by the public Jupyter API.' };
+    } catch {
+        return { state: 'unavailable', reason: 'Jupyter active-kernel lookup failed; runtime state could not be observed.' };
+    }
+}
+
+function providerCommandFailure(error: unknown): string {
+    const name = error instanceof Error && error.name ? error.name : 'Error';
+    const message = error instanceof Error ? error.message : String(error);
+    const safeMessage = message
+        .replace(/(?:https?|wss?):\/\/\S+/gi, '[URL omitted]')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 500);
+    return safeMessage ? `${name}: ${safeMessage}` : name;
+}
+
 /** Request a kernel restart through Jupyter's provider command. Completion of the command does not prove the kernel has changed state. */
 export async function restartKernel(filePath: string): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
+    const before = await observeActiveKernel(nb);
+    if (before.state === 'none') {
+        throw new Error(`No active kernel is available for ${nb.uri.toString()}; no restart request was sent. Select or start the intended kernel explicitly, then verify it with get_kernel_info before retrying.`);
+    }
     invalidateExecutionGeneration(nb.uri.toString());
-    await vscode.commands.executeCommand('jupyter.restartkernel', nb.uri);
-    return `Kernel restart requested for ${nb.uri.toString()}. The provider may require confirmation, and completion cannot be confirmed here.`;
+    try {
+        const result = await vscode.commands.executeCommand<unknown>('jupyter.restartkernel', nb.uri);
+        if (result === false) throw new Error('The Jupyter restart command returned false.');
+    } catch (error) {
+        throw new Error(`Kernel restart command failed for ${nb.uri.toString()} (${providerCommandFailure(error)}). No restart completion is claimed.`);
+    }
+    const after = await observeActiveKernel(nb);
+    if (after.state === 'none') {
+        return `Kernel restart command returned for ${nb.uri.toString()}, but no active kernel is currently exposed. The restart may have failed or may still be in progress; completion is not confirmed. Call get_kernel_info before run_cells.`;
+    }
+    if (after.state === 'unavailable') {
+        return `Kernel restart command returned for ${nb.uri.toString()}, but active-kernel state could not be observed: ${after.reason} Completion is not confirmed. Call get_kernel_info before run_cells.`;
+    }
+    const label = after.kernel.label ? `'${after.kernel.label}'` : '(unlabelled kernel)';
+    const status = after.kernel.status ? ` with status '${after.kernel.status}'` : '';
+    return `Kernel restart command returned for ${nb.uri.toString()}. The public Jupyter API currently exposes ${label}${status}, but this does not confirm that restart completed. Call get_kernel_info before run_cells.`;
 }
 
 /**
@@ -514,30 +591,9 @@ export async function getKernelInfo(filePath: string): Promise<string> {
     if (!nb) {
         throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
     }
-    type ActiveKernel = { label?: string; language?: string; status?: string };
-    let kernel: ActiveKernel | undefined;
-    let runtimeReason: string | undefined;
-    type JupyterApi = {
-        /** Compatibility with older Jupyter extension exports. */
-        getKernel?: (u: vscode.Uri) => ActiveKernel | undefined;
-        kernels?: { getKernel(u: vscode.Uri): Thenable<ActiveKernel | undefined> };
-    };
-    const extension = vscode.extensions.getExtension<JupyterApi>('ms-toolsai.jupyter');
-    if (!extension) {
-        runtimeReason = 'The Jupyter extension is unavailable through the public VS Code API.';
-    } else {
-        let api: JupyterApi | undefined;
-        try { api = await extension.activate(); }
-        catch { runtimeReason = 'Jupyter extension activation failed; runtime state could not be observed.'; }
-        if (!runtimeReason && (!api?.kernels?.getKernel && !api?.getKernel)) {
-            runtimeReason = 'The public Jupyter API does not expose active-kernel lookup.';
-        } else if (!runtimeReason) {
-            try {
-                kernel = api!.kernels ? await api!.kernels.getKernel(nb.uri) : api!.getKernel!(nb.uri);
-            } catch { runtimeReason = 'Jupyter active-kernel lookup failed; runtime state could not be observed.'; }
-        }
-    }
-    const hasActiveKernel = Boolean(kernel);
+    const observation = await observeActiveKernel(nb);
+    const kernel = observation.state === 'active' ? observation.kernel : undefined;
+    const hasActiveKernel = observation.state === 'active';
     return JSON.stringify({
         notebook: nb.uri.toString(),
         kernel: {
@@ -545,7 +601,7 @@ export async function getKernelInfo(filePath: string): Promise<string> {
             language: kernel?.language ?? 'unknown',
             status: kernel?.status ?? 'unknown',
             runtime: hasActiveKernel ? 'active' : 'unknown',
-            runtimeReason: hasActiveKernel ? undefined : (runtimeReason ?? 'No active kernel was returned by the public Jupyter API.')
+            runtimeReason: hasActiveKernel ? undefined : observation.reason
         },
         capabilities: {
             selectedController: { availability: 'not-exposed', reason: 'The public Jupyter API does not expose the selected controller identity.' },

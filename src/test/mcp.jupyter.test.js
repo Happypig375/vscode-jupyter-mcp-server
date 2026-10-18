@@ -26,6 +26,8 @@ let executionMode = 'complete';
 let executionDeferred;
 let activeKernelAvailable = true;
 let kernelApiFailure;
+let restartCommandFailure;
+let dropKernelAfterRestart = false;
 let exactSelectionAccepted = true;
 let rejectLegacyKernelHint = false;
 let configureAvailable = true;
@@ -80,6 +82,9 @@ editFixture._cells[0].metadata = { id: 'cell-abc', metadata: { tags: ['keep'] } 
 editFixture._cells[0].outputs = [{ items: [{ mime: 'text/plain', data: Buffer.from('preserve-me') }] }];
 const longSourceFixture = makeDoc('file:///C:/long-source.ipynb', 'C:/long-source.ipynb');
 longSourceFixture._cells[0].value = 'x'.repeat(70000);
+const numericIdFixture = makeDoc('file:///C:/numeric-id.ipynb', 'C:/numeric-id.ipynb');
+numericIdFixture._cells[2].metadata = { id: '1' };
+numericIdFixture._cells[3].metadata = { id: '40025805' };
 
 const vscodeShim = {
     workspace: {
@@ -148,14 +153,17 @@ const vscodeShim = {
                         cell.executionSummary = { timing: { startTime: Date.now() } };
                         continue;
                     }
-                    cell.executionSummary = { success: executionMode !== 'error', executionOrder: 1, timing: { startTime: Date.now() - 50, endTime: Date.now() } };
-                    cell.outputs = [{ items: [
-                        { mime: 'text/html', data: Buffer.from(`<div>${'duplicated-rich-output '.repeat(2000)}</div>`) },
-                        { mime: 'text/plain', data: Buffer.from('hello\n') },
-                        { mime: 'image/png', data: Buffer.from([0, 255, 1, 254, 2, 253]) }
-                    ] }, { items: [
-                        { mime: 'application/vnd.code.notebook.stdout', data: Buffer.from('stream-line\n') }
-                    ] }];
+                    const failed = executionMode === 'error' || executionMode === 'empty-error';
+                    cell.executionSummary = { success: !failed, executionOrder: 1, timing: { startTime: Date.now() - 50, endTime: Date.now() } };
+                    cell.outputs = executionMode === 'empty-error'
+                        ? [{ items: [{ mime: 'application/vnd.code.notebook.error', data: Buffer.from('{"name":"","message":""}') }] }]
+                        : [{ items: [
+                            { mime: 'text/html', data: Buffer.from(`<div>${'duplicated-rich-output '.repeat(2000)}</div>`) },
+                            { mime: 'text/plain', data: Buffer.from('hello\n') },
+                            { mime: 'image/png', data: Buffer.from([0, 255, 1, 254, 2, 253]) }
+                        ] }, { items: [
+                            { mime: 'application/vnd.code.notebook.stdout', data: Buffer.from('stream-line\n') }
+                        ] }];
                 }
                 if (executionMode === 'deferred-complete') return executionDeferred.promise;
             }
@@ -171,7 +179,9 @@ const vscodeShim = {
             }
             if (cmd === 'jupyter.restartkernel') {
                 assert.ok(uri && typeof uri.toString === 'function', 'restart must receive the notebook URI');
+                if (restartCommandFailure) throw restartCommandFailure;
                 restarted.push(uri);
+                if (dropKernelAfterRestart) activeKernelAvailable = false;
             }
             if (cmd === 'jupyter.interruptkernel') {
                 assert.ok(uri && uri.notebookEditor && uri.notebookEditor.notebookUri, 'interrupt must receive notebook editor options');
@@ -256,6 +266,14 @@ async function main() {
     await check('kernel tools exposed when Jupyter present', async () => {
         const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
+        const editTool = tools.find((tool) => tool.name === 'edit_cells');
+        assert.match(editTool.description, /anchor.*after it/i);
+        assert.match(editTool.inputSchema.properties.edits.items.properties.cellId.description, /exact cell ID string.*anchor after which/i);
+        const runTool = tools.find((tool) => tool.name === 'run_cells');
+        assert.match(runTool.inputSchema.properties.cellIds.description, /numeric indices or exact string cell IDs/i);
+        const restartTool = tools.find((tool) => tool.name === 'restart_kernels');
+        assert.match(restartTool.description, /no active kernel/);
+        assert.match(restartTool.description, /does not confirm completion/);
     });
 
     // 2. run_cells waits and returns outputs.
@@ -451,6 +469,17 @@ async function main() {
         assert.deepStrictEqual(executionCalls.at(-1).ranges, [{ start: 0, end: 1 }]);
     });
 
+    await check('run_cells explains an empty provider error payload', async () => {
+        executionMode = 'empty-error';
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 500 } });
+        executionMode = 'complete';
+        assert.ok(!res.isError, JSON.stringify(res));
+        const receipt = JSON.parse(res.content[0].text);
+        assert.strictEqual(receipt.status, 'failed');
+        assert.match(receipt.cells[0].output, /without a name or message/);
+        assert.doesNotMatch(receipt.cells[0].output, /Error:\s*:/);
+    });
+
     await check('run_cells reports immediate command rejection and consumes detached rejection', async () => {
         executionMode = 'reject';
         const failed = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 500 } });
@@ -477,6 +506,43 @@ async function main() {
         const res = await client.callTool({ name: 'read_notebook', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: ['cell-abc'], view: 'source' } });
         assert.ok(!res.isError, JSON.stringify(res));
         assert.match(JSON.parse(res.content[0].text).cells[0].source, /print\("hello"\)/);
+    });
+
+    await check('numeric-only string cell IDs win over numeric-string index fallback', async () => {
+        const edited = await client.callTool({ name: 'edit_cells', arguments: {
+            notebookRef: 'file:///C:/numeric-id.ipynb', edits: [{ cellId: '40025805', editType: 'edit', newCode: 'print("numeric id")' }]
+        } });
+        assert.ok(!edited.isError, JSON.stringify(edited));
+        assert.strictEqual(numericIdFixture._cells[3].value, 'print("numeric id")');
+
+        const byId = await client.callTool({ name: 'read_notebook', arguments: {
+            notebookRef: 'file:///C:/numeric-id.ipynb', cellIds: ['40025805'], view: 'source'
+        } });
+        assert.strictEqual(JSON.parse(byId.content[0].text).cells[0].index, 3);
+
+        const collidingStringId = await client.callTool({ name: 'read_notebook', arguments: {
+            notebookRef: 'file:///C:/numeric-id.ipynb', cellIds: ['1'], view: 'source'
+        } });
+        assert.strictEqual(JSON.parse(collidingStringId.content[0].text).cells[0].index, 2, 'string "1" must select exact cell ID "1"');
+
+        const byNumericIndex = await client.callTool({ name: 'read_notebook', arguments: {
+            notebookRef: 'file:///C:/numeric-id.ipynb', cellIds: [1], view: 'source'
+        } });
+        assert.strictEqual(JSON.parse(byNumericIndex.content[0].text).cells[0].index, 1, 'number 1 must select index 1');
+
+        const numericStringFallback = await client.callTool({ name: 'read_notebook', arguments: {
+            notebookRef: 'file:///C:/numeric-id.ipynb', cellIds: ['0'], view: 'source'
+        } });
+        assert.strictEqual(JSON.parse(numericStringFallback.content[0].text).cells[0].index, 0, 'numeric string without an exact ID must retain index fallback');
+
+        const callsBefore = executionCalls.length;
+        const run = await client.callTool({ name: 'run_cells', arguments: {
+            notebookRef: 'file:///C:/numeric-id.ipynb', cellIds: ['40025805'], waitMs: 500
+        } });
+        assert.ok(!run.isError, JSON.stringify(run));
+        assert.strictEqual(JSON.parse(run.content[0].text).status, 'completed');
+        assert.strictEqual(executionCalls.length, callsBefore + 1);
+        assert.deepStrictEqual(executionCalls.at(-1).ranges, [{ start: 3, end: 4 }]);
     });
 
     await check('read_cells applies bounded 1-based source ranges and truncates long single lines', async () => {
@@ -718,6 +784,46 @@ async function main() {
             'file:///C:/nb.ipynb',
             'file:///C:/inactive.ipynb'
         ]);
+        assert.match(res.content[0].text, /does not confirm that restart completed/);
+    });
+
+    await check('restart_kernels refuses when no active kernel is exposed', async () => {
+        const before = restarted.length;
+        activeKernelAvailable = false;
+        try {
+            const res = await client.callTool({ name: 'restart_kernels', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
+            assert.ok(res.isError, JSON.stringify(res));
+            assert.match(res.content[0].text, /No active kernel/);
+            assert.match(res.content[0].text, /no restart request was sent/);
+            assert.strictEqual(restarted.length, before);
+        } finally { activeKernelAvailable = true; }
+    });
+
+    await check('restart_kernels reports provider command failures without claiming completion', async () => {
+        const before = restarted.length;
+        restartCommandFailure = new Error('404 Not Found at https://provider.invalid/private?token=secret');
+        try {
+            const res = await client.callTool({ name: 'restart_kernels', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
+            assert.ok(res.isError, JSON.stringify(res));
+            assert.match(res.content[0].text, /404 Not Found/);
+            assert.match(res.content[0].text, /No restart completion is claimed/);
+            assert.doesNotMatch(res.content[0].text, /provider\.invalid|token=secret/);
+            assert.strictEqual(restarted.length, before);
+        } finally { restartCommandFailure = undefined; }
+    });
+
+    await check('restart_kernels reports loss of active-kernel observation as uncertain', async () => {
+        dropKernelAfterRestart = true;
+        try {
+            const res = await client.callTool({ name: 'restart_kernels', arguments: { notebookRefs: ['file:///C:/nb.ipynb'] } });
+            assert.ok(!res.isError, JSON.stringify(res));
+            assert.match(res.content[0].text, /no active kernel is currently exposed/);
+            assert.match(res.content[0].text, /may have failed or may still be in progress/);
+            assert.match(res.content[0].text, /get_kernel_info before run_cells/);
+        } finally {
+            dropKernelAfterRestart = false;
+            activeKernelAvailable = true;
+        }
     });
 
     await check('interrupt_kernels uses Jupyter command and targets every requested URI', async () => {

@@ -58,12 +58,12 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         {
             description:
                 'Clear the saved OUTPUT of one or more cells in a notebook (removes outputs and execution state). ' +
-                'Provide the notebook URI and an array of 0-based cell indices (or cell ids).',
+                'Provide the notebook URI and an array of 0-based numeric indices or exact string cell IDs.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
                     notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
-                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or ids) to clear outputs from.' }
+                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based numeric indices or exact string cell IDs; numeric strings fall back to indices when no ID matches.' }
                 },
                 required: ['notebookRef', 'cellIds']
             })
@@ -173,7 +173,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
                     notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                     query: { type: 'string', description: 'Text to search for (source or output).' },
                     caseSensitive: { type: 'boolean', description: 'Match case (default false).' },
-                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Restrict search to these cell indices/ids (default: all).' }
+                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Restrict search to 0-based numeric indices or exact string cell IDs (default: all); numeric strings fall back to indices when no ID matches.' }
                 },
                 required: ['notebookRef', 'query']
             })
@@ -195,7 +195,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
                 type: 'object',
                 properties: {
                     notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
-                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Optional cell indices/ids to read (default: all).' },
+                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: 'Optional 0-based numeric indices or exact string cell IDs (default: all); numeric strings fall back to indices when no ID matches.' },
                     view: { type: 'string', enum: ['outline', 'source', 'outputs', 'all'], description: 'View to return (default outline).' },
                     startLine: { type: 'number', description: '1-based inclusive source start line.' },
                     endLine: { type: 'number', description: '1-based inclusive source end line.' },
@@ -245,6 +245,7 @@ required: ['notebookRef', 'format']
             description:
                 'Apply one or more edits to a notebook in order: insert, edit, or delete cells. ' +
                 'Provide the notebook URI and an array of { cellId, editType, newCode?, language?, run? } edits. ' +
+                'For insert, cellId is an anchor and the new cell is placed after it; TOP and BOTTOM select the notebook boundaries. ' +
                 'run (default false) explicitly re-executes an edited code cell after applying.',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
@@ -255,7 +256,7 @@ required: ['notebookRef', 'format']
                         items: {
                             type: 'object',
                             properties: {
-                                cellId: { type: ['string', 'number'], description: '0-based cell index, or TOP/BOTTOM for insert.' },
+                                cellId: { type: ['string', 'number'], description: 'Exact cell ID string or 0-based numeric index; numeric strings fall back to indices when no ID matches. For insert, this is the anchor after which the new cell is placed; TOP inserts first and BOTTOM inserts last.' },
                                 editType: { type: 'string', enum: ['insert', 'edit', 'delete', 'replace'] },
                                 newCode: { type: 'string', description: 'New cell content (required for insert/edit/replace).' },
                                 oldText: { type: 'string', description: 'For replace, exact non-empty text to replace once.' },
@@ -291,13 +292,13 @@ required: ['notebookRef', 'edits']
             {
                 description:
                     'Run one or more cells headlessly. Creates a tracked execution and waits up to waitMs (default 1000) for a bounded receipt; the sequential background runner continues after the request returns. ' +
-                    'Provide the notebook URI and an array of 0-based cell indices. Select a kernel separately with an exact id before running. ' +
+                    'Provide the notebook URI and an array of 0-based numeric indices or exact string cell IDs. Select a kernel separately with an exact id before running. ' +
                     'Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: {
                         notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
-                        cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices (or cell ids) to run.' },
+                        cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based numeric indices or exact string cell IDs; numeric strings fall back to indices when no ID matches.' },
                     waitMs: { type: 'number', description: 'How long this request waits for the tracked receipt (default 1000); execution continues independently.' },
                         includeOutputs: { type: 'boolean', description: 'Include compact saved outputs for completed cells (default true).' },
                         outputMode: { type: 'string', enum: ['summary', 'text', 'full'], description: 'Output detail: summary, preferred text (default), or all text representations.' },
@@ -347,7 +348,7 @@ required: ['notebookRef', 'edits']
         server.registerTool(
             'restart_kernels',
             {
-                description: 'Request a kernel restart for one or more open notebooks. The provider may require confirmation and completion cannot be confirmed by this tool. Provide an array of notebook URIs. Requires the Jupyter extension.',
+                description: 'Request a restart for active notebook kernels without selecting or starting another kernel. Refuses when the public Jupyter API explicitly reports no active kernel; provider failures are errors, and command return does not confirm completion. Requires the Jupyter extension.',
                 inputSchema: jsonSchemaToZod({
                     type: 'object',
                     properties: { notebookRefs: { type: 'array', items: { type: 'string' }, description: 'Notebook URIs or notebookRefs from list_notebooks.' } },
@@ -387,13 +388,13 @@ const a = (args ?? {}) as { notebookRefs?: string[] };
         {
             description:
                 'Move one or more cells to a new position in a notebook, preserving content, outputs, and metadata. ' +
-                'Provide the notebook URI, the 0-based cell indices to move (in current order), and toIndex (where the ' +
+                'Provide the notebook URI, the numeric indices or exact string cell IDs to move (in current order), and toIndex (where the ' +
                 'first moved cell should land).',
             inputSchema: jsonSchemaToZod({
                 type: 'object',
                 properties: {
                     notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
-                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based cell indices to move.' },
+                    cellIds: { type: 'array', items: { type: ['string', 'number'] }, description: '0-based numeric indices or exact string cell IDs; numeric strings fall back to indices when no ID matches.' },
                     toIndex: { type: 'number', description: 'Index where the first moved cell should land.' }
                 },
 required: ['notebookRef', 'cellIds', 'toIndex']
