@@ -49,7 +49,8 @@ function fixture(options: {
     return { deps, events, get released() { return released; }, get checked() { return checked; } };
 }
 async function waitForActionOrFinish(setupId: string): Promise<any> {
-    for (let attempt = 0; attempt < 100; attempt++) {
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
         const current = JSON.parse(await getColabSetup(ref, setupId));
         if (current.stage === 'awaiting_kernel_selection' || current.stage === 'finished') return current;
         await new Promise((resolve) => setTimeout(resolve, 1));
