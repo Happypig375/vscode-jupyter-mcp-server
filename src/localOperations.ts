@@ -22,9 +22,15 @@ import {
     searchCells
 } from './notebookOps';
 import { checkColabRuntime, downloadFile, uploadFile } from './kernelFiles';
+import { getColabEnvironmentPreparation, prepareColabEnvironment } from './colabEnvironment';
+import { closeColabTerminals, listColabTerminals } from './colabTerminals';
 import { assertNoColabSetup, configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel } from './colabSetup';
 
 export type LocalOperation =
+    | 'list_colab_terminals'
+    | 'close_colab_terminals'
+    | 'prepare_colab_environment'
+    | 'get_colab_environment_preparation'
     | 'create_notebook'
     | 'inspect_notebooks'
     | 'read_cells'
@@ -68,6 +74,14 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
         for (const ref of typeof args.notebookRef === 'string' ? [args.notebookRef] : Array.isArray(args.notebookRefs) ? args.notebookRefs : []) assertNoColabSetup(String(ref));
     }
     switch (operation) {
+        case 'list_colab_terminals':
+            return listColabTerminals();
+        case 'close_colab_terminals':
+            return closeColabTerminals(args.inventoryId as string, args.terminalRefs as string[]);
+        case 'prepare_colab_environment':
+            return prepareColabEnvironment();
+        case 'get_colab_environment_preparation':
+            return getColabEnvironmentPreparation(args.preparationId as string);
         case 'create_notebook':
             return createNotebook(typeof args.title === 'string' ? args.title : 'New notebook');
         case 'inspect_notebooks':

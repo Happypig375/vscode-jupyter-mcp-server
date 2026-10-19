@@ -56,7 +56,7 @@ async function main() {
         timeout: 60000
     });
     if (nativePython.status !== 0) process.exit(nativePython.status || 1);
-    for (const file of ['colabDesktop.test.cjs', 'colabNative.test.cjs', 'colabSetup.test.cjs']) {
+    for (const file of ['colabDesktop.test.cjs', 'colabNative.test.cjs', 'colabSetup.test.cjs', 'colabEnvironment.test.cjs', 'colabTerminals.test.cjs']) {
         const result = spawnSync('node', [path.join(root, '.vscode-test', file)], { cwd: root, stdio: 'inherit', timeout: 60000 });
         if (result.status !== 0) process.exit(result.status || 1);
     }

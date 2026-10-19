@@ -75,6 +75,17 @@ async function main(): Promise<void> {
         const listed = await originalBroker.listNotebooks();
         assert.strictEqual(listed.length, 4);
         assert.ok(listed.some((group) => group.windowId === 'window-d' && group.notebooks.length === 0));
+        assert.strictEqual(await originalBroker.invokeWindow('list_colab_terminals', {}, 'window-d'), 'window-d:list_colab_terminals');
+        assert.strictEqual(await originalBroker.invokeWindow('close_colab_terminals', { inventoryId: 'inventory', terminalRefs: ['terminal'] }, 'window-d'), 'window-d:close_colab_terminals');
+        assert.strictEqual(await originalBroker.invokeWindow('prepare_colab_environment', {}, 'window-d'), 'window-d:prepare_colab_environment');
+        assert.strictEqual(await originalBroker.invokeWindow('get_colab_environment_preparation', { preparationId: 'receipt' }, 'window-d'), 'window-d:get_colab_environment_preparation');
+        assert.deepStrictEqual(invocations.get('window-d')!.splice(0), [
+            { operation: 'list_colab_terminals', args: {} },
+            { operation: 'close_colab_terminals', args: { inventoryId: 'inventory', terminalRefs: ['terminal'] } },
+            { operation: 'prepare_colab_environment', args: {} },
+            { operation: 'get_colab_environment_preparation', args: { preparationId: 'receipt' } }
+        ]);
+
         const duplicates = listed.flatMap((group) => group.notebooks.map((notebook) => ({ ...notebook, windowId: group.windowId }))).filter((notebook) => notebook.uri === shared);
         assert.strictEqual(duplicates.length, 2);
         assert.match(duplicates[0].notebookRef, /^nb_[0-9a-f]{24}$/);

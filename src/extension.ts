@@ -11,6 +11,7 @@ import { registerNotebookTools } from './server';
 import { isNotebookRef, notebookRefFor } from './notebookRefs';
 import packageJson from '../package.json';
 import { disposeColabSetups } from './colabSetup';
+import { initializeColabEnvironment } from './colabEnvironment';
 
 // Derive the MCP handshake version from the packaged extension metadata.
 const EXTENSION_VERSION = packageJson.version;
@@ -76,6 +77,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
     }
 
+    try { await initializeColabEnvironment(context); }
+    catch { output.appendLine('[jupyter-mcp] Colab desktop preparation is unavailable in this extension host; other notebook tools remain available.'); }
     await startServer();
 
     context.subscriptions.push(

@@ -2,6 +2,10 @@
 
 ## 0.5.0
 
+- Add window-scoped terminal inspection and explicit closure for Colab preparation blockers. Short-lived references bind exact terminal objects and metadata; closure never infers idleness or ownership, selects all terminals implicitly, or reads command/history/environment content. Partial and uncertain closure remain explicit.
+
+- Add window-scoped `prepare_colab_environment` and durable `get_colab_environment_preparation`. They prepare an isolated workspace/native connection before using existing notebook tools. Missing-port bootstrap is bounded to one clean empty default Windows VS Code 1.142.0 window, uses normal quit with vetoes and exact process identity, and never forces termination or changes `argv.json`. Desktop readiness remains distinct from verified Colab runtime readiness.
+
 - Allow `configure_kernel(runtime: "colab")` to take an exact prior MCP `serverAlias`. It reuses a uniquely mounted verified match or selects only that existing server, without creating a fallback, then retains the explicit kernel/startup/mount/nonce lifecycle.
 
 - Detect failed Colab extension activation before opening its picker, including a cached failure in an extension reported as active. Return a sanitized activation blocker with normal recovery guidance.

@@ -9,6 +9,49 @@ async function invokeMany(router: NotebookRouter, operation: LocalOperation, not
 }
 /** Register the notebook MCP server's tools on a given McpServer. */
 export function registerNotebookTools(server: McpServer, router: NotebookRouter, hasJupyter: boolean): void {
+    server.registerTool('list_colab_terminals', {
+        description: 'Inspect integrated terminals in one VS Code window before Colab environment preparation. Returns short-lived opaque references and bounded metadata, never commands, history or environment. This cannot establish that a shell is idle or owned by the caller. No terminal is closed.',
+        inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+            windowId: { type: 'string', description: 'Optional destination windowId from list_notebooks.' }
+        } })
+    }, async (args) => {
+        const a = (args ?? {}) as { windowId?: string };
+        const text = await router.invokeWindow('list_colab_terminals', {}, a.windowId);
+        return { content: [{ type: 'text' as const, text }] };
+    });
+    server.registerTool('close_colab_terminals', {
+        description: 'Close only explicitly selected terminals from the latest list_colab_terminals inventory in the same window. Closing may terminate commands and discard terminal scrollback: use only for terminals whose closure is authorized. This never infers idleness or ownership, and never closes all terminals implicitly. Stale or changed targets fail before closure; the result preserves partial or uncertain closure. Retry prepare_colab_environment only after confirmed closure.',
+        inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+            inventoryId: { type: 'string', description: 'Exact inventoryId from the latest list_colab_terminals result (expires after 60 seconds).' },
+            terminalRefs: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32, uniqueItems: true, description: 'Explicit terminal references from that inventory, whose closure is authorized.' },
+            windowId: { type: 'string', description: 'Destination windowId used for the inventory.' }
+        }, required: ['inventoryId', 'terminalRefs'] })
+    }, async (args) => {
+        const a = args as { inventoryId: string; terminalRefs: string[]; windowId?: string };
+        const text = await router.invokeWindow('close_colab_terminals', { inventoryId: a.inventoryId, terminalRefs: a.terminalRefs }, a.windowId);
+        return { content: [{ type: 'text' as const, text }] };
+    });
+    server.registerTool('prepare_colab_environment', {
+        description: 'Prepare a local VS Code desktop window for native Colab setup before opening a notebook. Reuse a verified native connection; an empty window gets an isolated local workspace. On the supported default Windows installation, a missing connection can trigger a tracked normal app restart from one clean empty window, preserving normal quit vetoes. This prepares only the desktop environment, never a kernel. Follow the receipt, list_notebooks, and existing open_notebooks/create_notebook tools, then configure_kernel. No arbitrary launch arguments, scripts, forced shutdown, or sign-in bypass.',
+        inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+            windowId: { type: 'string', description: 'Optional destination windowId from list_notebooks.' }
+        } })
+    }, async (args) => {
+        const a = (args ?? {}) as { windowId?: string };
+        const text = await router.invokeWindow('prepare_colab_environment', {}, a.windowId);
+        return { content: [{ type: 'text' as const, text }] };
+    });
+    server.registerTool('get_colab_environment_preparation', {
+        description: 'Read a durable Colab desktop preparation receipt, including after an app restart. Route to the exact workspace/window identified by the receipt. Readiness requires that workspace and a fresh native connection check; runtimeReady remains false until configure_kernel/check_colab verifies Colab.',
+        inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+            preparationId: { type: 'string', description: 'Exact preparationId returned by prepare_colab_environment.' },
+            windowId: { type: 'string', description: 'Optional destination windowId from list_notebooks.' }
+        }, required: ['preparationId'] })
+    }, async (args) => {
+        const a = args as { preparationId: string; windowId?: string };
+        const text = await router.invokeWindow('get_colab_environment_preparation', { preparationId: a.preparationId }, a.windowId);
+        return { content: [{ type: 'text' as const, text }] };
+    });
     // All tools are multi-capable (arrays); single-use is a 1-element array.
     // Document and execution operations use the native VS Code notebook API.
     //

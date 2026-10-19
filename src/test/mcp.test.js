@@ -88,6 +88,12 @@ const vscodeShim = {
         onDidChangeConfiguration: () => ({ dispose() {} })
     },
     window: {
+        terminals: [],
+        onDidOpenTerminal: () => ({ dispose() {} }),
+        onDidCloseTerminal: () => ({ dispose() {} }),
+        onDidChangeTerminalState: () => ({ dispose() {} }),
+        onDidStartTerminalShellExecution: () => ({ dispose() {} }),
+        onDidEndTerminalShellExecution: () => ({ dispose() {} }),
         createOutputChannel: () => ({ appendLine: (l) => { lines.push(l); console.log('[OUT]', l); }, dispose() {} }),
         createStatusBarItem: () => statusBar,
         showNotebookDocument: async () => { shownDocuments++; }
@@ -163,7 +169,8 @@ async function waitForServer(timeoutMs = 10000) {
 }
 
 async function main() {
-    const context = { subscriptions: { push: (d) => disposables.push(d) } };
+    const storageRoot = require('fs').mkdtempSync(path.join(require('os').tmpdir(), 'mcp-boundary-storage-'));
+    const context = { globalStorageUri: { scheme: 'file', fsPath: storageRoot, path: decodeURIComponent(require('url').pathToFileURL(storageRoot).pathname), authority: '', query: '', fragment: '' }, extensionPath: ROOT, extension: { id: 'local.test' }, subscriptions: { push: (d) => disposables.push(d) } };
     await bundle.activate(context);
     if (PORT === 0) PORT = Number(String(statusBar.tooltip).match(/127\.0\.0\.1:(\d+)/)[1]);
     const client = await waitForServer();
@@ -181,8 +188,43 @@ async function main() {
 
     // 1. No Jupyter -> kernel tools absent, document tools present.
     await check('tool set (no Jupyter)', async () => {
-        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks'];
+        const expected = ['list_colab_terminals', 'close_colab_terminals', 'prepare_colab_environment', 'get_colab_environment_preparation', 'create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
+    });
+
+    await check('terminal inventory is window-routed and closure requires explicit strict targets', async () => {
+        const listing = JSON.parse((await client.callTool({ name: 'list_notebooks', arguments: {} })).content[0].text);
+        const listed = await client.callTool({ name: 'list_colab_terminals', arguments: { windowId: listing[0].windowId } });
+        assert.ok(!listed.isError, JSON.stringify(listed));
+        assert.deepStrictEqual(JSON.parse(listed.content[0].text).terminals, []);
+        const wrongWindow = await client.callTool({ name: 'list_colab_terminals', arguments: { windowId: 'absent-window' } });
+        assert.ok(wrongWindow.isError);
+        for (const args of [{}, { inventoryId: 'x', terminalRefs: [] }, { inventoryId: 'x', terminalRefs: ['x'], all: true }, { inventoryId: 'x', terminalRefs: ['x'], command: 'exit' }]) {
+            assert.ok((await client.callTool({ name: 'close_colab_terminals', arguments: args })).isError);
+        }
+    });
+
+    await check('desktop preparation schemas reject notebook refs, launch flags and scripts', async () => {
+        for (const arguments_ of [{ notebookRef: 'file:///C:/x.ipynb' }, { args: ['--unsafe'] }, { script: 'x' }]) {
+            const response = await client.callTool({ name: 'prepare_colab_environment', arguments: arguments_ });
+            assert.ok(response.isError);
+        }
+        const missing = await client.callTool({ name: 'get_colab_environment_preparation', arguments: {} });
+        assert.ok(missing.isError);
+    });
+    await check('desktop preparation routes to an empty window and keeps remote hosts blocked', async () => {
+        const listing = JSON.parse((await client.callTool({ name: 'list_notebooks', arguments: {} })).content[0].text);
+        vscodeShim.env.remoteName = 'ssh-remote';
+        try {
+            const response = await client.callTool({ name: 'prepare_colab_environment', arguments: { windowId: listing[0].windowId } });
+            assert.ok(response.isError);
+            assert.match(response.content[0].text, /requires a local VS Code window/);
+        } finally { delete vscodeShim.env.remoteName; }
+        const malformed = await client.callTool({ name: 'get_colab_environment_preparation', arguments: { windowId: listing[0].windowId, preparationId: '../receipt' } });
+        assert.ok(malformed.isError);
+        assert.match(malformed.content[0].text, /preparationId is malformed/);
+        const wrongWindow = await client.callTool({ name: 'prepare_colab_environment', arguments: { windowId: 'absent-window' } });
+        assert.ok(wrongWindow.isError);
     });
 
     // 2. create_notebook in an empty window -> untitled.
@@ -388,6 +430,8 @@ async function main() {
 
     await client.close();
     await bundle.deactivate();
+    for (const disposable of disposables) disposable.dispose();
+    require('fs').rmSync(storageRoot, { recursive: true, force: true });
     console.log(`\n${passed} checks passed`);
     // Delay exit so pending transport I/O settles (avoids a Windows native crash),
     // then force-exit so lingering server handles don't keep c8 alive.

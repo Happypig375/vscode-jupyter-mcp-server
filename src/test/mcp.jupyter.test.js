@@ -269,7 +269,8 @@ async function waitForServer(timeoutMs = 10000) {
 }
 
 async function main() {
-    const context = { subscriptions: { push: (d) => disposables.push(d) } };
+    const storageRoot = require('fs').mkdtempSync(path.join(require('os').tmpdir(), 'mcp-boundary-storage-'));
+    const context = { globalStorageUri: { scheme: 'file', fsPath: storageRoot, path: decodeURIComponent(require('url').pathToFileURL(storageRoot).pathname), authority: '', query: '', fragment: '' }, extensionPath: ROOT, extension: { id: 'local.test' }, subscriptions: { push: (d) => disposables.push(d) } };
     await bundle.activate(context);
     if (PORT === 0) PORT = Number(String(statusBar.tooltip).match(/127\.0\.0\.1:(\d+)/)[1]);
     const client = await waitForServer();
@@ -286,7 +287,7 @@ async function main() {
 
     // 1. With Jupyter present, kernel tools ARE exposed.
     await check('kernel tools exposed when Jupyter present', async () => {
-        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'mount_colab_server', 'get_kernel_setup', 'cancel_kernel_setup', 'list_setup_kernels', 'select_setup_kernel', 'check_colab', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
+        const expected = ['list_colab_terminals', 'close_colab_terminals', 'prepare_colab_environment', 'get_colab_environment_preparation', 'create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'mount_colab_server', 'get_kernel_setup', 'cancel_kernel_setup', 'list_setup_kernels', 'select_setup_kernel', 'check_colab', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
         const editTool = tools.find((tool) => tool.name === 'edit_cells');
         assert.match(editTool.description, /anchor.*after it/i);
@@ -968,6 +969,8 @@ async function main() {
 
     await client.close();
     await bundle.deactivate();
+    for (const disposable of disposables) disposable.dispose();
+    require('fs').rmSync(storageRoot, { recursive: true, force: true });
     console.log(`\n${passed} jupyter-present checks passed`);
     setTimeout(() => process.exit(process.exitCode || 0), 200);
 }

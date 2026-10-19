@@ -21,6 +21,8 @@ function main() {
     execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'notebookMetadata.test.cjs')], opts);
     execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'colabDesktop.test.cjs')], opts);
     execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'colabSetup.test.cjs')], opts);
+    execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'colabEnvironment.test.cjs')], opts);
+    execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'colabTerminals.test.cjs')], opts);
     const out = execFileSync(c8Bin, ['--clean=false', 'node', path.join(root, '.vscode-test', 'kernelFiles.python.test.cjs')], opts);
     console.log(out);
 
