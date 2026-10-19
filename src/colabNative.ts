@@ -138,7 +138,9 @@ class NativeDriver implements DesktopSetupDriver {
     }
     async waitForInput(inputLabels: readonly string[], signal: AbortSignal): Promise<string> {
         const inputs = labels(inputLabels);
-        return (await this.poll(inputs, signal)).name;
+        // Setup awaits a new prompt. The preceding filtered picker can remain
+        // visible briefly after Enter; it is not a new provider handoff.
+        return (await this.poll(inputs, signal, s => s.value === '')).name;
     }
     async choose(inputLabels: readonly string[], optionLabels: readonly string[], signal: AbortSignal): Promise<string> {
         const inputs = labels(inputLabels), options = labels(optionLabels);

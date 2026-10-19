@@ -10,7 +10,7 @@ const ref = 'file:///test.ipynb';
 function fixture(options: {
     optional?: boolean; checkFails?: boolean; checkFalse?: boolean; failChoice?: boolean; close?: boolean;
     omitListing?: boolean; listFails?: boolean; listDelay?: boolean; selectDelay?: boolean; providerDelay?: boolean;
-    productionBind?: boolean; missingServerAlias?: boolean; directSourcePicker?: boolean;
+    productionBind?: boolean; missingServerAlias?: boolean; directSourcePicker?: boolean; providerHandoff?: string;
     listings?: Array<Array<{ choiceId: string; label: string }>>;
 } = {}) {
     reset();
@@ -52,7 +52,10 @@ function fixture(options: {
             }
             return labels[0] === 'Select Another Kernel...' ? 'Select Another Kernel...' : labels[0];
         },
-        waitForInput: async (headers: readonly string[]) => { const result = inputs.shift()!; assert.ok(headers.includes(result)); return result; },
+        waitForInput: async (headers: readonly string[]) => {
+            const result = headers.includes('Select a Jupyter Server') ? (options.providerHandoff ?? 'Select a Jupyter Server') : inputs.shift()!;
+            assert.ok(headers.includes(result)); return result;
+        },
         enter: async (headers: readonly string[], value: string) => { assert.deepStrictEqual(headers, ['Alias your server']); assert.ok(value.length < 10, 'Colab 0.9.7 alias length limit'); assert.match(value, /^m[a-f0-9]{8}$/); enteredAlias = value; events.push('alias'); },
         listChoices: async (headers: readonly string[], signal: AbortSignal) => {
             assert.deepStrictEqual(headers, ['Select a Kernel from ' + enteredAlias]); events.push('list');
@@ -136,6 +139,16 @@ async function main() {
         assert.deepStrictEqual(f.events, ['lease', 'bind', 'Colab', alias, 'list', 'chosen:kernel-python', alias, 'dispose']);
         assert.ok(!f.events.includes('Select Another Kernel...'));
         assert.deepStrictEqual(f.checkedRoots, ['colab://matching/']);
+    });
+    await test('one reopened provider picker selects only Colab before the exact existing alias', async () => {
+        for (const providerHandoff of ['Select Kernel', 'Select Another Kernel']) {
+            const alias = 'm7ae91d89'; const f = fixture({ directSourcePicker: true, providerHandoff });
+            const r = await result(f, alias);
+            assert.strictEqual(r.ready, true); assert.strictEqual(r.serverAlias, alias);
+            assert.deepStrictEqual(f.headerSelections[1], [providerHandoff]);
+            assert.deepStrictEqual(f.events, ['lease', 'bind', 'Colab', 'Colab', alias, 'list', 'chosen:kernel-python', alias, 'dispose']);
+            assert.ok(!f.events.includes('New Colab Server'));
+        }
     });
     await test('multi-folder recovery uses the notebook folder name and workbench bullet separator', async () => {
         const f = fixture(); state.relativeNotebookLabel = 'nested/target.ipynb';

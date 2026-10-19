@@ -172,6 +172,18 @@ test('a permanently busy filtered picker times out without Enter', async () => {
     await rejects(driver.chooseListed!([KERNEL_HEADER], choices[0].choiceId, SIGNAL), 'picker_timeout');
     assert.equal(fixture.submits, 0);
 });
+test('waiting for a new provider prompt ignores the old filtered source picker', async () => {
+    const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
+    fixture.title = 'Select Kernel'; fixture.placeholder = 'Type to choose a kernel source'; fixture.ariaLabel = fixture.placeholder;
+    fixture.value = 'Colab'; let observations = 0;
+    fixture.beforeEvaluate = expression => {
+        if (expression.includes('return {dom:true') && ++observations === 3) {
+            fixture.title = 'Select Another Kernel'; fixture.value = '';
+        }
+    };
+    assert.equal(await driver.waitForInput(['Select a Jupyter Server', 'Select Kernel', 'Select Another Kernel'], SIGNAL), 'Select Another Kernel');
+    assert.ok(observations >= 3); assert.equal(fixture.submits, 0); assert.deepEqual(fixture.writes, []);
+});
 test('lost owner marker before select prevents mutation', async () => {
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
     const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL); fixture.markerCount = 0;

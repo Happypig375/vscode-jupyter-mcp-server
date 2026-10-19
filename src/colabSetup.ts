@@ -454,6 +454,13 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         const initialHeaders = ['Select Kernel', 'Select Another Kernel', ...notebookLabels.flatMap(label => [`Select kernel for '${label}'`, `Change kernel for '${label}'`])];
         const first = await picker((stepSignal) => driver!.choose(initialHeaders, ['Select Another Kernel...', 'Colab'], stepSignal));
         if (first !== 'Colab') await picker((stepSignal) => driver!.choose(['Select Kernel', 'Select Another Kernel'], ['Colab'], stepSignal));
+        // After a workspace refresh VS Code can reopen its source picker once
+        // before handing control to Colab. Require an empty new prompt, then
+        // permit only one additional exact Colab selection, never a retry loop.
+        const providerPrompt = await picker((stepSignal) => driver!.waitForInput(['Select a Jupyter Server', 'Select Kernel', 'Select Another Kernel'], stepSignal));
+        if (providerPrompt !== 'Select a Jupyter Server') {
+            await picker((stepSignal) => driver!.choose([providerPrompt], ['Colab'], stepSignal));
+        }
         let alias: string;
         if (requestedAlias) {
             alias = requestedAlias;
