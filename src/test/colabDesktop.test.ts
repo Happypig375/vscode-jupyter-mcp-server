@@ -179,6 +179,69 @@ async function testWrongAndMultipleMarkers(): Promise<void> {
     await rejectsCode(multiple.bind(MARKER, new AbortController().signal), 'window_binding_failed');
 }
 
+async function testBindRestoresExactOwnerBeforeFirstPicker(): Promise<void> {
+    let foregrounded = false;
+    const markerOnly = `0 window Code\n\t1 status bar item ${MARKER}`;
+    const runner = new FixtureRunner({
+        tree: () => foregrounded ? pickerTree(MARKER, 'Select Kernel', ['Colab']) : markerOnly,
+        override: (args) => {
+            if (args[1] === 'get-app-state' && args.includes('--restore-window')) {
+                foregrounded = true;
+                // Restoration itself sees only the owner marker. The simulated first
+                // picker becomes observable on the subsequent choose poll.
+                return snapshot(valueAfter(args, '--window-id'), markerOnly);
+            }
+            return undefined;
+        }
+    });
+    const driver = createColabDesktopDriverForTest(runner, { pollMs: 1, pickerTimeoutMs: 20 });
+    const signal = new AbortController().signal;
+    await driver.bind(MARKER, signal);
+    assert.strictEqual(foregrounded, true);
+    assert.strictEqual(await driver.choose(['Select Kernel'], ['Colab'], signal), 'Colab');
+    const restored = runner.calls.findIndex((call) => call[1] === 'get-app-state' && call.includes('--restore-window'));
+    const click = runner.calls.findIndex((call) => call[1] === 'click');
+    assert.ok(restored >= 0 && restored < click, 'The exact owner must be restored before the first picker action');
+    const restoreCall = runner.calls[restored];
+    assert.strictEqual(valueAfter(restoreCall, '--app'), 'pid:42');
+    assert.strictEqual(valueAfter(restoreCall, '--window-id'), 'w1');
+}
+
+async function testBindRejectsLostOrDuplicateMarkerAfterRestore(): Promise<void> {
+    for (const restoredTree of [
+        '0 window Code\n\t1 status bar item wrong-marker',
+        `0 window Code\n\t1 status bar item ${MARKER}\n\t2 button ${MARKER}`
+    ]) {
+        let restoring = false;
+        const runner = new FixtureRunner({
+            tree: () => restoring ? restoredTree : `0 window Code\n\t1 status bar item ${MARKER}`,
+            override: (args) => {
+                if (args[1] === 'get-app-state' && args.includes('--restore-window')) restoring = true;
+                return undefined;
+            }
+        });
+        const driver = createColabDesktopDriverForTest(runner);
+        await rejectsCode(driver.bind(MARKER, new AbortController().signal), 'window_binding_failed');
+        assert.strictEqual(runner.calls.filter((call) => ['click', 'set-value', 'press-key'].includes(call[1])).length, 0);
+    }
+}
+
+async function testBindRejectsFailedOwnerRestore(): Promise<void> {
+    const runner = new FixtureRunner({
+        tree: () => `0 window Code\n\t1 status bar item ${MARKER}`,
+        override: (args) => {
+            if (args[1] === 'get-app-state' && args.includes('--restore-window')) {
+                return json({ ok: false, error: { code: 'window_not_focused', message: 'private provider detail' } });
+            }
+            return undefined;
+        }
+    });
+    const driver = createColabDesktopDriverForTest(runner);
+    const error = await rejectsCode(driver.bind(MARKER, new AbortController().signal), 'window_binding_failed');
+    assert.ok(!error.message.includes('private'));
+    assert.strictEqual(runner.calls.filter((call) => ['click', 'set-value', 'press-key'].includes(call[1])).length, 0);
+}
+
 async function testAmbiguityNeverClicks(): Promise<void> {
     const runner = new FixtureRunner({
         tree: () => pickerTree(MARKER, 'Select Kernel', ['Colab', 'Colab'])
@@ -334,7 +397,7 @@ async function testOneWindowFocusRestoreRetry(): Promise<void> {
     assert.ok(!clicks[0].includes('--restore-window'));
     assert.ok(clicks[1].includes('--restore-window'));
     const restoredSnapshots = runner.calls.filter((call) => call[1] === 'get-app-state' && call.includes('--restore-window'));
-    assert.strictEqual(restoredSnapshots.length, 1);
+    assert.strictEqual(restoredSnapshots.length, 2, 'Bind restore plus the one focus-error retry');
 }
 
 async function testEntryRefusesWithoutValueProof(): Promise<void> {
@@ -494,6 +557,9 @@ async function main(): Promise<void> {
     testExecutableResolution();
     await testNormalPickerAndSafeEntry();
     await testWrongAndMultipleMarkers();
+    await testBindRestoresExactOwnerBeforeFirstPicker();
+    await testBindRejectsLostOrDuplicateMarkerAfterRestore();
+    await testBindRejectsFailedOwnerRestore();
     await testAmbiguityNeverClicks();
     await testPickerOptionsStayInsideRecognizedList();
     await testUnsafeChoiceTimesOutWithoutAction();

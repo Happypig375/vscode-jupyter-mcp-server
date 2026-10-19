@@ -302,7 +302,13 @@ class OrcaDesktopDriver implements DesktopSetupDriver {
             }
         }
         if (matches.length !== 1) throw new DesktopSetupError('window_binding_failed');
-        this.binding = matches[0];
+        const owner = matches[0];
+        // Binding identifies the owner, but showing an editor does not guarantee that
+        // its OS window is foreground. Restore only the exact marker-proved PID/window,
+        // then re-prove ownership before setup is allowed to open its first picker.
+        const restored = await this.snapshot(owner, signal, true, 'window_binding_failed');
+        this.requireMarker(restored, owner);
+        this.binding = owner;
     }
 
     async waitForInput(inputLabels: readonly string[], signal: AbortSignal): Promise<string> {
