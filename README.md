@@ -86,6 +86,8 @@ The package declares `ms-toolsai.jupyter` as a dependency. Kernel-backed tools (
 
 ### Colab setup and checking
 
+Colab activation is checked before opening any picker, even if VS Code reports the extension as active. A cached activation failure returns `colab_activation_failed`; inspect Colab's Output log, restore connectivity and reload the window before retrying. Failed activation can leave Google's authentication provider unregistered until that reload.
+
 `configure_kernel({ notebookRef, runtime: "colab" })` performs Colab initialization inside MCP. It uses the installed Colab 0.9.7 extension and VS Code's native Chromium connection and smoke-test driver to operate its normal picker. **Orca is not required or used by this path.** A local, trusted VS Code window with an open folder/workspace is required. Remote extension hosts and unsupported provider versions return a blocker before setup.
 
 Launch the VS Code app with `--enable-smoke-test-driver --remote-debugging-port=<port>` and set machine-scoped `jupyterMcp.nativeDebugPort` to that exact local port. An automation launcher may instead provide `JUPYTER_MCP_NATIVE_DEBUG_PORT` in the app's environment; a nonzero setting takes precedence. The adapter connects only to `127.0.0.1` and rejects redirected hosts, ports and non-page targets. A VS Code app already running without a debugging port needs a full, normal app restart to enable it; opening another window or reloading extensions cannot add that listener. The internal driver is capability checked, and its picker behavior was tested with VS Code 1.142.0. This bootstrap requirement is separate from runtime setup; an existing verified Colab kernel can be reused without it.

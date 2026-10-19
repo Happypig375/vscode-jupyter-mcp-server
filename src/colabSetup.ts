@@ -293,7 +293,13 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         if (!jupyter?.kernels?.getKernel) fail('jupyter_api_unavailable', 'The public Jupyter kernel API is unavailable.');
         const active = await bounded(jupyter.kernels.getKernel(originalNotebook.uri), signal);
         if (active && active.status !== 'idle') fail('kernel_busy', 'Wait for the current kernel to become idle before Colab setup.');
-        if (!extension.isActive) await bounded(extension.activate(), signal);
+        // VS Code can report isActive after a failed activation. activate() also
+        // checks the cached activation error, so always await it before any UI.
+        try { await bounded(extension.activate(), signal); }
+        catch {
+            alive(signal);
+            fail('colab_activation_failed', 'The Colab extension failed to activate. Check its Output log and restore connectivity, then reload this VS Code window before retrying. No kernel picker was opened.');
+        }
         const oldRoots = getColabFileRoots();
         if (active && oldRoots.length === 1) {
             job.stage = 'verifying_runtime';

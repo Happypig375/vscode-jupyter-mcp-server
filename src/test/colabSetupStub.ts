@@ -8,7 +8,7 @@ function cell(value: string, index: number, identity: string): any {
     return { kind: 2, index, metadata: {}, outputs: [], document: { uri: uri(identity), languageId: 'python', getText: () => value } };
 }
 export function reset(): void {
-    Object.assign(state, { remoteName: undefined, trusted: true, version: '0.9.7', installed: true, activationFailure: false, editorMismatch: false,
+    Object.assign(state, { remoteName: undefined, trusted: true, version: '0.9.7', installed: true, activationFailure: false, colabIsActive: false, activationCalls: 0, editorMismatch: false,
         active: undefined, calls: [], markers: [], startupMode: 'success', mountMode: 'single', selection: true, editFailure: false, cleanupFailure: false, cleanupHang: false });
     const cells = [cell('never_execute_user_code()', 0, 'vscode-notebook-cell:///one'), cell('second_user_cell()', 1, 'vscode-notebook-cell:///two')];
     state.notebook = { notebookType: 'jupyter-notebook', uri: uri('file:///test.ipynb'), isClosed: false, metadata: {},
@@ -56,7 +56,7 @@ export const window = {
     createStatusBarItem: () => { const marker = { text: '', show() {}, dispose() {} }; state.markers.push(marker); return marker; }
 };
 export const extensions = { getExtension: (id: string): any => id === 'google.colab' ? state.installed ? {
-    isActive: false, packageJSON: { version: state.version }, activate: async () => { if (state.activationFailure) throw new Error('secret activation'); }
+    isActive: state.colabIsActive, packageJSON: { version: state.version }, activate: async () => { state.activationCalls++; if (state.activationFailure) throw new Error('secret activation'); }
 } : undefined : { activate: async () => ({ kernels: { getKernel: async () => state.active } }) } };
 export const commands = { executeCommand: async (id: string, ...args: any[]) => {
     state.calls.push([id, ...args]);

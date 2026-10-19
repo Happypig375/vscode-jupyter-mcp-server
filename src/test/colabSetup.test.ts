@@ -96,6 +96,14 @@ async function main() {
     ] as const) await test('preflight rejects ' + name, async () => {
         const f = fixture(); mutate(); const r = await result(f); assert.strictEqual(r.code, code); assert.strictEqual(r.ready, false); assert.strictEqual(f.checked, 0); assert.deepStrictEqual(f.events, []);
     });
+    for (const isActive of [false, true]) await test('failed Colab activation stops before UI even when isActive=' + isActive, async () => {
+        const f = fixture(); state.colabIsActive = isActive; state.activationFailure = true;
+        const r = await result(f);
+        assert.strictEqual(state.activationCalls, 1); assert.strictEqual(r.code, 'colab_activation_failed');
+        assert.strictEqual(r.ready, false); assert.strictEqual(r.failedStage, 'preflight');
+        assert.doesNotMatch(JSON.stringify(r), /secret/); assert.deepStrictEqual(f.events, []);
+        assert.deepStrictEqual(state.calls, []); assert.strictEqual(f.checked, 0);
+    });
     await test('wrong revealed notebook prevents picker and startup', async () => {
         const f = fixture(); state.editorMismatch = true; const r = await result(f); assert.strictEqual(r.code, 'notebook_changed'); assert.strictEqual(f.released, 1); assert.deepStrictEqual(state.calls, []);
     });
