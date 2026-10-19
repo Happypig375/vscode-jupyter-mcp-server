@@ -377,7 +377,7 @@ export class BrokerCoordinator implements NotebookRouter {
 
     private async invokeRegistration(registration: WindowRegistration, operation: LocalOperation, args: Record<string, unknown>): Promise<string> {
         if (registration.id === this.windowId) return this.options.invokeLocal(operation, args);
-        const requestedWait = operation === 'run_cells' || operation === 'get_execution' ? args.waitMs : undefined;
+        const requestedWait = ['run_cells', 'get_execution', 'configure_kernel', 'get_kernel_setup', 'cancel_kernel_setup'].includes(operation) ? args.waitMs : undefined;
         const timeoutMs = typeof requestedWait === 'number' && Number.isSafeInteger(requestedWait) && requestedWait >= 0
             ? Math.max(1500, Math.min(Number.MAX_SAFE_INTEGER, requestedWait + 1500))
             : 2_147_000_000;

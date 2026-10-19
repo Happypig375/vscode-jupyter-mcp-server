@@ -17,6 +17,8 @@ const disposables = [];
 const interrupted = [];
 const restarted = [];
 const selectedKernels = [];
+const pickerCalls = [];
+const shownEditors = [];
 const startedKernels = [];
 const legacyKernelHints = [];
 const openNotebooks = [];
@@ -29,6 +31,9 @@ let kernelApiFailure;
 let restartCommandFailure;
 let dropKernelAfterRestart = false;
 let exactSelectionAccepted = true;
+let pickerResult = true;
+let colabInstalled = true;
+let colabActivationFails = false;
 let rejectLegacyKernelHint = false;
 let configureAvailable = true;
 let startupDetail = 'Kernel is idle and ready.';
@@ -87,6 +92,11 @@ numericIdFixture._cells[2].metadata = { id: '1' };
 numericIdFixture._cells[3].metadata = { id: '40025805' };
 
 const vscodeShim = {
+    CancellationTokenSource: class {
+        constructor() { this.token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }; }
+        cancel() { this.token.isCancellationRequested = true; }
+        dispose() {}
+    },
     workspace: {
         getConfiguration: () => ({ get: (k, d) => {
             if (k === 'transport') return 'http';
@@ -115,22 +125,34 @@ const vscodeShim = {
     window: {
         createOutputChannel: () => ({ appendLine: (l) => { lines.push(l); console.log('[OUT]', l); }, dispose() {} }),
         createStatusBarItem: () => statusBar,
-        showNotebookDocument: async (doc) => ({ notebook: showNotebookMismatch ? openNotebooks[0] : doc })
+        showNotebookDocument: async (doc) => {
+            const editor = { notebook: showNotebookMismatch ? openNotebooks[0] : doc };
+            shownEditors.push(editor);
+            return editor;
+        }
     },
-    extensions: { getExtension: () => ({ id: 'ms-toolsai.jupyter', isActive: true, activate: async () => { if (kernelApiFailure === 'activation') throw new Error('secret activation detail'); return { getKernel: () => { if (kernelApiFailure === 'query') throw new Error('secret query detail'); return activeKernelAvailable ? ({ label: 'Python 3.12.2', language: 'python', status: 'idle' }) : undefined; } }; } }), onDidChange: () => ({ dispose() {} }) },
+    extensions: { getExtension: (id) => id === 'google.colab'
+        ? (colabInstalled ? { id, isActive: false, activate: async () => { if (colabActivationFails) throw new Error('secret Colab activation detail'); } } : undefined)
+        : ({ id: 'ms-toolsai.jupyter', isActive: true, activate: async () => { if (kernelApiFailure === 'activation') throw new Error('secret activation detail'); return { getKernel: () => { if (kernelApiFailure === 'query') throw new Error('secret query detail'); return activeKernelAvailable ? ({ label: 'Python 3.12.2', language: 'python', status: 'idle' }) : undefined; } }; } }), onDidChange: () => ({ dispose() {} }) },
     commands: {
         registerCommand: () => ({ dispose() {} }),
         executeCommand: async (cmd, uri, cellUris) => {
             if (cmd === '_resolveNotebookKernels') return availableKernels;
             if (cmd === '_notebook.selectKernel') {
+                throw new Error('internal active-editor kernel selection must not be used');
+            }
+            if (cmd === 'notebook.selectKernel') {
+                if (uri.kernelInfo) {
+                    legacyKernelHints.push(uri.kernelInfo.label);
+                    if (rejectLegacyKernelHint) throw new Error('legacy selection failed');
+                    return;
+                }
+                assert.ok(shownEditors.includes(uri.notebookEditor), 'selection requires the actual shown NotebookEditor object');
+                pickerCalls.push(uri);
+                if (!uri.id) return pickerResult;
                 if (!exactSelectionAccepted) return false;
                 selectedKernels.push(`${uri.extension}/${uri.id}`);
                 return true;
-            }
-            if (cmd === 'notebook.selectKernel') {
-                legacyKernelHints.push(uri.kernelInfo.label);
-                if (rejectLegacyKernelHint) throw new Error('legacy selection failed');
-                return;
             }
             if (cmd === 'notebook.execute') {
                 throw new Error('run-all command must not be used for targeted cell execution');
@@ -264,7 +286,7 @@ async function main() {
 
     // 1. With Jupyter present, kernel tools ARE exposed.
     await check('kernel tools exposed when Jupyter present', async () => {
-        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
+        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'get_kernel_setup', 'cancel_kernel_setup', 'check_colab', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
         const editTool = tools.find((tool) => tool.name === 'edit_cells');
         assert.match(editTool.description, /anchor.*after it/i);
@@ -665,8 +687,72 @@ async function main() {
     await check('configure_kernel is explicit and reports a configuration request', async () => {
         const res = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
         assert.ok(!res.isError, JSON.stringify(res));
-        assert.match(res.content[0].text, /configuration requested/i);
+        const setup = JSON.parse(res.content[0].text);
+        assert.strictEqual(setup.configurationRequested, true);
+        assert.strictEqual(setup.status, 'active_kernel_observed');
+        assert.strictEqual(setup.ready, false);
         assert.strictEqual(startedKernels.at(-1).name, 'configure_notebook');
+    });
+
+    await check('configure_kernel rejects provider prose as proof of successful startup', async () => {
+        activeKernelAvailable = false;
+        startupDetail = 'The kernel has been successfully started.';
+        try {
+            const res = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
+            const setup = JSON.parse(res.content[0].text);
+            assert.strictEqual(setup.status, 'not_ready');
+            assert.strictEqual(setup.ready, false);
+            assert.strictEqual(setup.kernel, null);
+            assert.match(setup.reason, /No active kernel/);
+            assert.doesNotMatch(res.content[0].text, /successfully started/);
+        } finally { activeKernelAvailable = true; startupDetail = 'Kernel is idle and ready.'; }
+    });
+
+    await check('configure_kernel preserves pending and unavailable observations', async () => {
+        activeKernelAvailable = false;
+        startupDetail = 'The kernel is still starting in the background.';
+        try {
+            const res = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
+            const setup = JSON.parse(res.content[0].text);
+            assert.strictEqual(setup.status, 'pending');
+            assert.strictEqual(setup.ready, false);
+            assert.strictEqual(setup.providerReportedPending, true);
+            kernelApiFailure = 'query';
+            startupDetail = 'Startup completed.';
+            const unavailable = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
+            assert.strictEqual(JSON.parse(unavailable.content[0].text).status, 'not_ready');
+            assert.doesNotMatch(unavailable.content[0].text, /secret/);
+        } finally { activeKernelAvailable = true; kernelApiFailure = undefined; startupDetail = 'Kernel is idle and ready.'; }
+    });
+
+    await check('automatic Colab setup returns tracked preflight blockers without generic fallback', async () => {
+        const before = { picker: pickerCalls.length, start: startedKernels.length, execution: executionCalls.length };
+        const res = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/inactive.ipynb', runtime: 'colab', waitMs: 1000 } });
+        const setup = JSON.parse(res.content[0].text);
+        assert.strictEqual(setup.ready, false); assert.strictEqual(setup.status, 'failed');
+        assert.strictEqual(setup.code, 'workspace_untrusted'); assert.match(setup.setupId, /^setup_/);
+        assert.deepStrictEqual({ picker: pickerCalls.length, start: startedKernels.length, execution: executionCalls.length }, before);
+        const read = await client.callTool({ name: 'get_kernel_setup', arguments: { notebookRef: 'file:///C:/inactive.ipynb', setupId: setup.setupId } });
+        assert.deepStrictEqual(JSON.parse(read.content[0].text), setup);
+        const wrong = await client.callTool({ name: 'get_kernel_setup', arguments: { notebookRef: 'file:///C:/nb.ipynb', setupId: setup.setupId } });
+        assert.ok(wrong.isError);
+        const cancel = await client.callTool({ name: 'cancel_kernel_setup', arguments: { notebookRef: 'file:///C:/inactive.ipynb', setupId: setup.setupId } });
+        assert.strictEqual(JSON.parse(cancel.content[0].text).status, 'failed');
+        const wait = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/inactive.ipynb', runtime: 'colab', waitMs: 60001 } });
+        assert.ok(wait.isError);
+    });
+
+    await check('Colab tool schemas and absent filesystem reject before side effects', async () => {
+        const starts = startedKernels.length, picks = pickerCalls.length, runs = executionCalls.length;
+        for (const args of [{ runtime: 'local' }, { runtime: 'colab', start: true }]) {
+            const res = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb', ...args } });
+            assert.ok(res.isError);
+        }
+        let res = await client.callTool({ name: 'check_colab', arguments: { notebookRef: 'file:///C:/nb.ipynb', start: true } });
+        assert.ok(res.isError);
+        res = await client.callTool({ name: 'check_colab', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
+        assert.ok(res.isError); assert.match(res.content[0].text, /No registered Colab filesystem root/);
+        assert.deepStrictEqual([startedKernels.length, pickerCalls.length, executionCalls.length], [starts, picks, runs]);
     });
 
     await check('save_notebooks force-saves a clean file notebook', async () => {
@@ -720,6 +806,16 @@ async function main() {
         exactSelectionAccepted = true;
         assert.ok(res.isError);
         assert.match(res.content[0].text, /did not select kernel/i);
+    });
+
+    await check('select_kernel uses the actual target editor through the public command', async () => {
+        const res = await client.callTool({ name: 'select_kernel', arguments: {
+            notebookRef: 'file:///C:/inactive.ipynb', kernelId: 'ms-toolsai.jupyter/python-312'
+        } });
+        assert.ok(!res.isError, JSON.stringify(res));
+        assert.strictEqual(pickerCalls.at(-1).notebookEditor, shownEditors.at(-1));
+        assert.strictEqual(pickerCalls.at(-1).notebookEditor.notebook, openNotebooks[1]);
+        assert.strictEqual(selectedKernels.at(-1), 'ms-toolsai.jupyter/python-312');
     });
 
     await check('select_kernel rejects start before provider side effects', async () => {

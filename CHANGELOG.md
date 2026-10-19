@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- Add automatic Colab initialization with `configure_kernel({ notebookRef, runtime: "colab" })`: select a standard CPU server and Python through the installed Colab 0.9.7 picker, run/remove an owned temporary startup cell, mount the same server and verify runtime/filesystem identity. The optional local Orca CLI supplies semantic UI actions inside MCP; no local/GPU/paid-upgrade fallback. An already active verified Colab runtime is reused.
+- Add tracked `get_kernel_setup` and `cancel_kernel_setup`, bounded waits/deadline, exact-window marker binding, cross-window desktop exclusion, and explicit retained-cell/server/cleanup status. Normal sign-in/consent/MFA and unsupported UI remain blockers; no authentication bypass or private credential access.
+- Add `check_colab`: verify the current idle Python kernel against the active Colab filesystem using a fresh private nonce, validate Linux/Python/Colab module diagnostics, and confirm cleanup through both surfaces. Missing, ambiguous, stale, busy, replaced, or unresponsive runtimes fail without a verified result. Verification applies only at the time of the call.
+- Response format change: generic `configure_kernel` now returns structured JSON observations instead of provider prose. Text claiming successful startup no longer becomes a success claim when the public API exposes no active kernel. An observed kernel still requires a responsiveness/provider check.
+- Select exact controller IDs through the public `notebook.selectKernel` command with the actual target editor, avoiding selection in a different active notebook.
+
 ## 0.4.5
 
 - Resolve string cell references as stable IDs before retaining the numeric-string index fallback. Numeric-only native IDs such as `"40025805"` now work consistently in editing, reading, execution, search, output clearing, and movement; JSON numbers remain 0-based indices.

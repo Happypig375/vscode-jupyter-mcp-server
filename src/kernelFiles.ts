@@ -35,6 +35,7 @@ export interface ColabFileSystem {
     writeFile(kernelPath: string, content: Uint8Array): Promise<void>;
 }
 export interface FileTransferArgs { notebookRef: string; hostPath: string; kernelPath: string; overwrite?: boolean; maxBytes?: number; colabFileUri?: string; }
+export interface ColabRuntimeCheckArgs { notebookRef: string; colabFileUri?: string; }
 export interface KernelFileDeps {
     getKernel(notebookRef: string): Promise<ActiveKernelLike | undefined>;
     openRead(filePath: string): Promise<ReadHandle>;
@@ -44,6 +45,8 @@ export interface KernelFileDeps {
     unlink(filePath: string): Promise<void>;
     stat(filePath: string): Promise<{ size: number }>;
     colabFileSystems?(args: FileTransferArgs): ColabFileSystem[];
+    /** Local test seam; production discovers roots from registered VS Code resources. */
+    getColabFileRoots?(): string[];
     /** Local test seam; not an MCP tool parameter. */
     executionTimeoutMs?: number;
     cleanupTimeoutMs?: number;
@@ -80,7 +83,8 @@ const fsDeps: KernelFileDeps = {
     link: (from, to) => fs.promises.link(from, to),
     unlink: (filePath) => fs.promises.unlink(filePath),
     stat: async (filePath) => fs.promises.stat(filePath),
-    colabFileSystems: colabFileSystems
+    colabFileSystems: colabFileSystems,
+    getColabFileRoots
 };
 
 /** Exposed workspace/document roots are candidates, not proof of kernel identity. */
@@ -337,6 +341,122 @@ async function writeAll(output: WriteHandle, chunk: Buffer): Promise<void> {
 function exactNumber(value: unknown, expected?: number): number {
     if (!Number.isSafeInteger(value) || (value as number) < 0 || (expected !== undefined && value !== expected)) throw new Error('invalid count');
     return value as number;
+}
+
+function exactRecord(record: Record<string, unknown>, keys: string[]): void {
+    const actual = Object.keys(record).sort();
+    const expected = [...keys].sort();
+    if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) throw new Error('invalid diagnostic receipt');
+}
+
+function colabCheckTarget(a: ColabRuntimeCheckArgs, deps: KernelFileDeps): { root: string; fileSystem: ColabFileSystem } {
+    if (!a.notebookRef) throw new Error('notebookRef is required.');
+    let explicit: vscode.Uri | undefined;
+    if (a.colabFileUri !== undefined) {
+        try { explicit = vscode.Uri.parse(a.colabFileUri, true); }
+        catch { throw new Error('colabFileUri must be an exact Colab root URI such as colab://server/.'); }
+        if (explicit.scheme !== 'colab' || !explicit.authority || explicit.path !== '/' || explicit.query || explicit.fragment || !a.colabFileUri.startsWith('colab://')) {
+            throw new Error('colabFileUri must be an exact Colab root URI such as colab://server/.');
+        }
+    }
+    let roots: string[];
+    try { roots = explicit ? [explicit.with({ path: '/', query: '', fragment: '' }).toString()] : [...new Set((deps.getColabFileRoots ?? getColabFileRoots)())]; }
+    catch { throw new Error('Colab filesystem roots could not be inspected; no runtime check was executed.'); }
+    if (!roots.length) throw new Error('No registered Colab filesystem root is available; mount the active Colab server in VS Code before checking the runtime.');
+    if (roots.length > 1) throw new Error('Multiple Colab filesystem roots are available; provide colabFileUri to select one before checking the runtime.');
+    const root = roots[0];
+    let candidates: ColabFileSystem[];
+    try { candidates = deps.colabFileSystems?.({ notebookRef: a.notebookRef, hostPath: '', kernelPath: '/', colabFileUri: root }) ?? []; }
+    catch { throw new Error('The selected Colab filesystem provider is unavailable; no runtime check was executed.'); }
+    if (candidates.length !== 1) throw new Error(candidates.length ? 'The selected Colab root did not resolve to one filesystem provider; no runtime check was executed.' : 'The active Google Colab filesystem provider is unavailable; activate it and mount the server before checking the runtime.');
+    return { root, fileSystem: candidates[0] };
+}
+
+function isFileNotFound(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false;
+    const value = error as { code?: unknown; name?: unknown };
+    return value.code === 'FileNotFound' || value.name === 'EntryNotFound (FileSystemError)';
+}
+
+function colabCheckReason(error: unknown): string {
+    const message = error instanceof Error ? error.message : '';
+    const allowed = [
+        'cancelled', 'kernel lookup timed out', 'kernel execution timed out', 'kernel became unavailable',
+        'active kernel is busy or unavailable', 'active kernel changed or became unavailable',
+        'No active Python kernel is available.', 'File transfer requires an active Python kernel.',
+        'Kernel is busy or unavailable; file transfer was not attempted.', 'Active kernel lacks the public executeCode API.',
+        'A file transfer is already active for this notebook.', 'A file transfer is already active for this kernel.',
+        'A prior file transfer execution has not settled in this kernel; transfer was not attempted.',
+        'native filesystem binding timed out; no payload was transferred', 'kernel receipt exceeded output limit',
+        'kernel became unavailable during native file transfer',
+        'invalid receipt', 'invalid diagnostic receipt', 'Colab filesystem nonce did not match the active kernel.',
+        'The active kernel is not a Linux Colab runtime.', 'The active kernel does not provide the google.colab module.'
+    ];
+    if (allowed.includes(message) || /^kernel reported [A-Za-z_][A-Za-z0-9_.]{0,80}$/.test(message)) return message;
+    return 'diagnostic execution or validation failed';
+}
+
+class ColabCheckFailure extends Error {}
+
+/**
+ * Verify the current kernel against an active registered Colab filesystem. This is a
+ * point-in-time diagnostic only: it never starts or selects a runtime and is not cached.
+ */
+export async function checkColabRuntime(a: ColabRuntimeCheckArgs, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {
+    const target = colabCheckTarget(a, deps); // Root/provider validation must precede any kernel execution.
+    return withTransfer(a.notebookRef, deps, async (kernel, current) => {
+        const nonce = crypto.randomUUID();
+        // Use the established Colab Contents path and a non-hidden filename:
+        // Jupyter may reject dotfiles even when the kernel can create them.
+        const noncePath = `/content/jupyter-mcp-colab-check-${nonce}`;
+        let probeAttempted = false;
+        let kernelCleanupVerified = false;
+        let cleanupVerified = false;
+        const clean = async () => {
+            const cleaned = await receipt(kernel, transferCode("try:\n with open(a['path'],'rb') as f: owned=f.read(len(a['nonce'])+1)==a['nonce'].encode('ascii')\n if not owned: raise ValueError('nonce ownership changed')\n os.unlink(a['path'])\nexcept FileNotFoundError: pass\nresult={'kind':'colab-clean','absent':not os.path.lexists(a['path'])}", { path: noncePath, nonce }, nonce), nonce, current, deps.cleanupTimeoutMs ?? TRANSFER_CLEANUP_TIMEOUT_MS);
+            exactRecord(cleaned, ['kind', 'absent']);
+            if (cleaned.kind !== 'colab-clean' || cleaned.absent !== true) throw new Error('cleanup confirmation failed');
+            kernelCleanupVerified = true;
+            const providerAbsent = await nativeStep(kernel, current, async () => {
+                try { await target.fileSystem.stat(noncePath); return false; }
+                catch (error) { return isFileNotFound(error); }
+            }, deps, undefined, true);
+            if (!providerAbsent) throw new Error('cleanup confirmation failed');
+            cleanupVerified = true;
+        };
+        try {
+            const probed = await receipt(kernel, transferCode("import importlib.util, os, platform, sys\nf=open(a['path'],'x',encoding='ascii'); f.write(a['nonce']); f.flush(); os.fsync(f.fileno()); f.close()\ntry: has_colab=importlib.util.find_spec('google.colab') is not None\nexcept (ImportError, AttributeError, ValueError): has_colab=False\nresult={'kind':'colab-probe','pid':os.getpid(),'platform':sys.platform,'python':platform.python_version(),'googleColabModule':has_colab}", { path: noncePath, nonce }, nonce), nonce, current, deps.executionTimeoutMs ?? TRANSFER_EXECUTION_TIMEOUT_MS, token, () => { probeAttempted = true; });
+            exactRecord(probed, ['kind', 'pid', 'platform', 'python', 'googleColabModule']);
+            if (probed.kind !== 'colab-probe' || !Number.isSafeInteger(probed.pid) || (probed.pid as number) <= 0 || typeof probed.python !== 'string' || !/^\d{1,2}\.\d{1,2}\.\d{1,3}$/.test(probed.python)) throw new Error('invalid diagnostic receipt');
+            if (probed.platform !== 'linux') throw new Error('The active kernel is not a Linux Colab runtime.');
+            if (probed.googleColabModule !== true) throw new Error('The active kernel does not provide the google.colab module.');
+            try { await bindColab([target.fileSystem], noncePath, nonce, kernel, current, deps, token); }
+            catch (error) {
+                if (error instanceof TransferFailure && error.message.includes('did not uniquely match')) throw new Error('Colab filesystem nonce did not match the active kernel.');
+                throw error;
+            }
+            // clean() ends with nativeStep's bounded post-I/O kernel identity check.
+            await clean();
+            ensureNotCancelled(token);
+            return JSON.stringify({
+                verified: true, runtime: 'colab', checkedAt: new Date().toISOString(), colabRoot: target.root,
+                kernel: { pid: probed.pid, platform: probed.platform, python: probed.python },
+                checks: { responsive: true, googleColabModule: true, nativeFilesystemNonce: true, cleanup: true }
+            });
+        } catch (error) {
+            if (probeAttempted && !kernelCleanupVerified && !unsettledKernels.has(kernel) && !(error instanceof TransferFailure && error.unsettled)) {
+                try { await clean(); } catch { /* Report uncertainty below; never clean through another kernel. */ }
+            }
+            if (kernelCleanupVerified && !cleanupVerified) throw new ColabCheckFailure('Colab runtime check failed: the kernel probe was removed, but absence could not be verified through the selected Colab filesystem. Check the current server and colabFileUri before retrying.');
+            if (probeAttempted && !cleanupVerified) throw new ColabCheckFailure('Colab runtime check failed and cleanup of its private nonce file could not be verified; reconnect or restart the runtime before retrying.');
+            throw new ColabCheckFailure(`Colab runtime check failed: ${colabCheckReason(error)}`);
+        }
+    }, token).catch((error: unknown) => {
+        if (error instanceof ColabCheckFailure) throw error;
+        // Lookup/activation errors occur outside the diagnostic callback. Do not
+        // expose provider URLs, credentials, or arbitrary exception contents.
+        throw new Error(`Colab runtime check failed: ${colabCheckReason(error)}`);
+    });
 }
 
 export async function uploadFile(a: FileTransferArgs, token?: vscode.CancellationToken, deps: KernelFileDeps = fsDeps): Promise<string> {

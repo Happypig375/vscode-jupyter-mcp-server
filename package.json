@@ -2,7 +2,7 @@
   "name": "vscode-jupyter-mcp-server",
   "displayName": "Jupyter MCP Server",
   "description": "A notebook-specific MCP server for running, editing, creating, and managing Jupyter notebooks from MCP clients.",
-  "version": "0.4.5",
+  "version": "0.5.0",
   "publisher": "Happypig375",
   "license": "MIT",
   "icon": "icon.png",
@@ -65,6 +65,12 @@
           "type": "boolean",
           "default": true,
           "description": "Save dirty notebooks before running/editing so tools operate on current contents."
+        },
+        "jupyterMcp.orcaPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Absolute path to the optional Orca computer CLI for automatic Colab setup. Empty uses a known local installation when available. No shell commands or extra arguments are accepted."
         }
       }
     },
@@ -83,7 +89,7 @@
   },
   "scripts": {
     "compile": "esbuild src/extension.ts --bundle --external:vscode --format=cjs --platform=node --target=node20 --sourcemap --outfile=dist/extension.js",
-    "compile:test": "esbuild src/test/broker.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/broker.test.cjs && esbuild src/test/kernelFiles.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.test.cjs && esbuild src/test/notebookMetadata.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/notebookMetadataStub.ts --outfile=.vscode-test/notebookMetadata.test.cjs && esbuild src/test/kernelFiles.python.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.python.test.cjs",
+    "compile:test": "esbuild src/test/broker.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/broker.test.cjs && esbuild src/test/kernelFiles.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.test.cjs && esbuild src/test/notebookMetadata.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/notebookMetadataStub.ts --outfile=.vscode-test/notebookMetadata.test.cjs && esbuild src/test/kernelFiles.python.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.python.test.cjs && esbuild src/test/colabDesktop.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/colabDesktop.test.cjs && esbuild src/test/colabSetup.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/colabSetupStub.ts --outfile=.vscode-test/colabSetup.test.cjs",
     "watch": "esbuild src/extension.ts --bundle --external:vscode --format=cjs --platform=node --target=node20 --sourcemap --outfile=dist/extension.js --watch",
     "typecheck": "tsc --noEmit",
     "test": "npm run compile && npm run compile:test && node src/test/runTest.js",

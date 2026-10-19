@@ -10,6 +10,7 @@ import { listOpenNotebooks } from './notebookOps';
 import { registerNotebookTools } from './server';
 import { isNotebookRef, notebookRefFor } from './notebookRefs';
 import packageJson from '../package.json';
+import { disposeColabSetups } from './colabSetup';
 
 // Derive the MCP handshake version from the packaged extension metadata.
 const EXTENSION_VERSION = packageJson.version;
@@ -175,5 +176,6 @@ async function stopServer(): Promise<void> {
 }
 
 export async function deactivate(): Promise<void> {
+    disposeColabSetups();
     await stopServer();
 }

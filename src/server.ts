@@ -125,14 +125,43 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         );
 
         server.registerTool('configure_kernel', {
-            description: 'Run the Jupyter provider-owned setup workflow for a notebook. The provider may show picker, authentication, consent, selection, or startup UI and controls the resulting runtime state.',
+            description: 'Set up the exact notebook. runtime colab automates the installed Colab 0.9.7 picker through the local Orca computer CLI, requests a Standard CPU server, selects Python, runs/removes a temporary pass cell, mounts its filesystem, and verifies both surfaces with a fresh nonce. An already active verified Colab runtime is reused. Returns a tracked setupId; poll get_kernel_setup or cancel_kernel_setup. Sign-in/MFA/consent remains normal provider UI and may need the user. No local/GPU/paid-upgrade fallback. The generic default invokes Jupyter setup without claiming runtime readiness.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {
-                notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' }
+                notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
+                runtime: { type: 'string', enum: ['generic', 'colab'], description: 'Requested runtime. Use colab for automatic Colab setup; generic is the compatibility default.' },
+                waitMs: { type: 'number', description: 'Colab only: wait 0–60000 ms for a setup receipt (default 1000). The bounded background setup continues after this request returns.' }
             }, required: ['notebookRef'] })
         }, async (args) => {
-            const a = (args ?? {}) as { notebookRef?: string };
+            const a = (args ?? {}) as { notebookRef?: string; runtime?: 'generic' | 'colab'; waitMs?: number };
             if (!a.notebookRef) throw new Error('notebookRef is required');
             const text = await router.invokeNotebook('configure_kernel', a.notebookRef, a as Record<string, unknown>);
+            return { content: [{ type: 'text' as const, text }] };
+        });
+
+        for (const operation of ['get_kernel_setup', 'cancel_kernel_setup'] as const) server.registerTool(operation, {
+            description: operation === 'get_kernel_setup'
+                ? 'Read the current or specified Colab setup receipt without dispatching setup. Readiness is point-in-time evidence from its completed nonce check.'
+                : 'Cancel an in-progress Colab setup and close its owned picker. Does not delete an assigned server or interrupt scientific cells. Non-cancellable provider assignment may still finish; the receipt reports retained startup cells or pending cleanup.',
+            inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+                notebookRef: { type: 'string' }, setupId: { type: 'string', description: 'Optional exact setupId; otherwise most recent setup for this notebook.' },
+                waitMs: { type: 'number', description: 'Wait 0–60000 ms for the receipt (default 0).' }
+            }, required: ['notebookRef'] })
+        }, async (args) => {
+            const a = (args ?? {}) as { notebookRef?: string; setupId?: string; waitMs?: number };
+            if (!a.notebookRef) throw new Error('notebookRef is required');
+            return { content: [{ type: 'text' as const, text: await router.invokeNotebook(operation, a.notebookRef, a as Record<string, unknown>) }] };
+        });
+
+        server.registerTool('check_colab', {
+            description: 'Verify the current active idle Python kernel against Colab\'s native filesystem with a fresh nonce and a bounded runtime probe. Creates and removes one tiny temporary file; does not select or start a kernel, edit notebook cells, install packages, or read user data. A label, installed module or mounted folder alone cannot pass. Verification is for this call only.',
+            inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+                notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
+                colabFileUri: { type: 'string', description: 'Optional exact colab://server/ root with no query or fragment. Otherwise one mounted/open Colab root is required. The root must match a fresh nonce in the selected kernel.' }
+            }, required: ['notebookRef'] })
+        }, async (args) => {
+            const a = (args ?? {}) as { notebookRef?: string; colabFileUri?: string };
+            if (!a.notebookRef) throw new Error('notebookRef is required');
+            const text = await router.invokeNotebook('check_colab', a.notebookRef, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };
         });
 

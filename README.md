@@ -12,7 +12,7 @@ A notebook-specific MCP server that runs inside VS Code. An external MCP client 
 2. Check the `$(notebook) MCP` status item and copy its URL, or use the output channel. The default endpoint is `http://127.0.0.1:51303/mcp`.
 3. Configure the external client to use Streamable HTTP and that copied endpoint.
 
-The tool contract below describes 0.4.0; see the [changelog](CHANGELOG.md) for earlier versions. After an upgrade, refresh or reconnect the client's MCP tool catalog if it still advertises old parameters. The connected server's `tools/list` response is authoritative.
+The tool contract below describes 0.5.0; see the [changelog](CHANGELOG.md) for earlier versions. After an upgrade, refresh or reconnect the client's MCP tool catalog if it still advertises old parameters. The connected server's `tools/list` response is authoritative.
 
 ## How this project differs
 
@@ -26,11 +26,11 @@ The design is an in-extension broker over the user's live, shared in-memory `Not
 | Pushed output streaming | **Not implemented.** Bounded polling serves request/response clients. Pushed events would add client notification support and event-history management that this workflow does not require. | [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) documents polling and streaming. |
 | Cell locking | **Not implemented.** The server checks explicit targets and execution freshness without imposing an edit-ownership policy on the user and agent. Locking would require a separate coordination policy. | [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp) exposes cell-lock tools. |
 | Per-run interruption | **Not implemented as an isolated cancellation tool.** `interrupt_kernels` explicitly requests a kernel-wide interrupt; stopping observation of a run does not prove its code stopped. | This server's [interrupt implementation](src/notebookOps.ts) uses the notebook kernel command. |
-| Provider startup and administration | **Generic Jupyter integration; no dedicated Colab adapter.** Reuse registered controllers and normal provider setup. The checked Colab extension exposes no public connect/start API for an adapter to call. Dedicated provisioning, Drive, terminal, and resource-management tools are not implemented. | [Google Colab MCP](https://github.com/googlecolab/colab-mcp) bridges browser sessions; [Colab CLI](https://github.com/googlecolab/google-colab-cli) manages runtimes and files. The [Colab VS Code guide](https://github.com/googlecolab/colab-vscode/wiki/User-Guide) documents its own setup and administration. |
+| Provider startup and administration | **Automatic Colab initialization and runtime verification in 0.5.0.** MCP handles CPU/server/Python selection, startup and mounting through the normal provider UI, then proves kernel/filesystem identity. Requires the supported local Colab/Orca adapter; authentication may require the user. Drive, terminal and general resource management are not implemented. | The [Colab VS Code guide](https://github.com/googlecolab/colab-vscode/wiki/User-Guide) documents its provider-owned connection and administration flow. |
 
 Whole-notebook reads, cell anchors, and export were inspired by [vscode-inmemory-notebook-mcp](https://github.com/vatsapatel/vscode-inmemory-notebook-mcp); the execution-wait and output-capture pattern came from [vscode-runtime-notebook-mcp](https://github.com/olavocarvalho/vscode-runtime-notebook-mcp).
 
-Sources and repository documentation were checked on 2026-09-06. This is a bounded, documentation-scoped comparison; it does not claim competitor installation or behavioral testing.
+Sources and repository documentation were checked on 2026-09-06. The Colab setup row was rechecked on 2026-10-19 against the guide, installed 0.9.7 bundle and corresponding source linked below. This is a bounded, documentation-scoped comparison; it does not claim competitor installation or behavioral testing.
 
 ## Tools
 
@@ -47,7 +47,9 @@ Cell references accept zero-based numeric indices or the string `cell_id` return
 | `get_kernel_info` | Read | Report observed active runtime fields and explicit unavailable reasons |
 | `get_execution` | Read | Inspect a tracked `executionId`, or recover the notebook's latest run; optionally wait for its result |
 | `list_kernels` | Read | List exact registered kernel/controller IDs; read-only |
-| `configure_kernel` | Manage | Invoke Jupyter's provider configuration tool; normal picker/auth/consent UI may appear |
+| `configure_kernel` | Manage | Generic Jupyter setup or tracked automatic Colab CPU initialization with runtime verification |
+| `get_kernel_setup` / `cancel_kernel_setup` | Manage | Poll or cancel Colab initialization, including cleanup and retained-server/cell status |
+| `check_colab` | Diagnose | Prove the active idle kernel matches a Colab filesystem root through a fresh nonce and confirm cleanup |
 | `edit_cells` | Write | Insert, edit, delete, or exact-text replace cells; optional explicit rerun |
 | `move_cells` | Write | Move cells while preserving content, outputs, and metadata |
 | `clear_cell_outputs` | Write | Clear outputs and execution state |
@@ -76,9 +78,29 @@ For outputs, `outputMode` selects `summary`, preferred `text`, or `full` textual
 
 ### Jupyter and providers
 
-The package declares `ms-toolsai.jupyter` as a dependency. Kernel-backed tools (`list_kernels`, `configure_kernel`, `select_kernel`, `run_cells`, restart/interrupt, and file transfer) are registered when that extension is present; presence does not guarantee every runtime API is available. `get_kernel_info` and `get_execution` remain exposed for read-only diagnostics.
+The package declares `ms-toolsai.jupyter` as a dependency. Kernel-backed tools (`list_kernels`, `configure_kernel`, `check_colab`, `select_kernel`, `run_cells`, restart/interrupt, and file transfer) are registered when that extension is present; presence does not guarantee every runtime API is available. `get_kernel_info` and `get_execution` remain exposed for read-only diagnostics.
 
-`list_kernels` lists currently registered controllers, including those contributed by other extensions; it does not discover every dormant provider. `configure_kernel` explicitly delegates setup to Jupyter and may display a picker, authentication, or consent UI. `select_kernel` requires an exact listed ID. Inspection, listing, and file transfer do not start or select a kernel. File transfer requires the public API of an active idle Python kernel; see Microsoft's [kernel execution and authorization sample](https://github.com/microsoft/vscode-extension-samples/tree/main/jupyter-kernel-execution-sample).
+`list_kernels` lists currently registered controllers, including those contributed by other extensions; it does not discover every dormant provider. `configure_kernel` defaults to generic Jupyter setup and may display a picker, authentication, or consent UI. Its JSON response distinguishes an observed active kernel, pending setup, and no ready kernel; `ready` remains false because observation alone does not prove responsiveness or provider identity. `select_kernel` requires an exact listed ID and passes the actual target editor to the public selection command. Inspection, listing, and file transfer do not start or select a kernel. File transfer requires the public API of an active idle Python kernel; see Microsoft's [kernel execution and authorization sample](https://github.com/microsoft/vscode-extension-samples/tree/main/jupyter-kernel-execution-sample).
+
+### Colab setup and checking
+
+`configure_kernel({ notebookRef, runtime: "colab" })` performs Colab initialization inside MCP. It uses the installed Colab 0.9.7 extension and an optional local Orca computer CLI to operate its normal picker. The automatic adapter currently supports the Windows Orca computer provider 1.0.0/protocol 1. A local, trusted VS Code window with an open folder/workspace is required. Set the machine-scoped `jupyterMcp.orcaPath` to an absolute executable path if the known local installation is not detected. Remote extension hosts and unsupported provider versions return a blocker before setup.
+
+The workflow reuses an already active runtime only after a fresh Colab check. Otherwise it selects **Colab ? New Colab Server ? CPU**, chooses **Standard** and **Latest** if those prompts appear, supplies a unique alias, and selects Python. It executes only an inserted temporary `pass` cell, removes that cell after confirmed completion, invokes Colab's server-mount command, selects the same alias if needed, and verifies the kernel against the mounted filesystem. It does not choose GPU/TPU, purchase an upgrade, install packages, mount Google Drive, or delete existing servers. Google's sign-in, consent and MFA remain normal security interactions; an unhandled prompt stops setup with a blocker.
+
+The request returns a `setupId`. Poll `get_kernel_setup({ notebookRef, setupId, waitMs: 1000 })` until `status` is `ready`, `failed`, or `cancelled`. Only `ready: true` with a completed verification permits a readiness claim. `waitMs` is 0?60000 ms (setup default 1000, polling default 0); request expiry does not cancel the five-minute background workflow. `cancel_kernel_setup` cancels it explicitly. Setup records are bounded to sixteen and last only for the extension-window lifetime. A transient unique marker binds actions to the owning window, and a machine-wide lease prevents overlapping setup clicks. MCP notebook mutations are refused while that notebook's setup is active. No accessibility tree, notebook text, account label, or screenshot is returned by setup.
+
+A cancelled provider assignment may still create a server; MCP does not delete it automatically. A queued/running or edited startup cell is retained and reported, and unsettled commands retain the setup lease until they settle. Inspect `failedStage`, `serverMayRemain`, `startupCellRetained`, and `cleanupPending` after a failure. Server naming is confirmed by the following picker displaying the exact generated alias, including when Windows does not expose the input value. Picker completion alone never proves readiness. Exact-ID selection requires VS Code's observed boolean confirmation and fails closed if a future version stops supplying it.
+
+Before submitting a server name, MCP also requires the provider's alias prompt to identify **Colab CPU**. Cancelling setup keeps notebook mutations blocked until pending commands and runtime verification finish. If a command remains stuck after cancellation, use VS Code's normal interrupt control for the owned startup cell, or reload the owning window to recover the extension state; a reload does not prove remote work stopped. A persistent desktop lock after every owning VS Code process has exited needs inspection of the task-specific `jupyter-mcp-colab-setup-*` temporary directory; do not remove a live owner's lock. These are exceptional recovery paths, not steps in normal initialization.
+
+`check_colab({ notebookRef })` also remains available independently. It requires an active idle Python kernel and one registered Colab filesystem root. Supply `colabFileUri: "colab://<server-id>/"` if multiple roots exist; this is a root URI without a query or fragment. The check creates one exclusive non-hidden nonce file in `/content`, validates bounded Linux/Python/module diagnostics, and requires the same nonce through the native Colab filesystem. It removes only its owned probe and confirms absence through both surfaces before returning `verified: true`. Labels, an installed module, or a mounted folder alone cannot pass. The receipt includes the root, process ID, Python version, timestamp and individual checks. The check reads no user files and edits no notebook cells.
+
+If kernel-side removal succeeds but the filesystem is unavailable, check the current server/root before retrying. If execution or cleanup has not settled, retain that uncertainty. Verification applies only at that moment; check again after kernel changes. Standalone transfer/check request cancellation is not forwarded through cross-window routing; their internal deadlines still apply.
+
+The flow was checked on 2026-10-19 against the installed Colab 0.9.7 bundle, its [user guide](https://github.com/googlecolab/colab-vscode/wiki/User-Guide), a [corresponding source snapshot](https://github.com/googlecolab/colab-vscode/blob/d9b4965b4c56d00a85b4cf58c2ea9ca6cda48bc5/src/jupyter/provider.ts), and VS Code's [exact-editor command mapping](https://github.com/microsoft/vscode/blob/1.142.0/src/vs/workbench/api/common/extHostNotebookKernels.ts). The source snapshot is not a tagged 0.9.7 release. Routine setup clicks are performed by the MCP adapter; authentication and unsupported UI remain explicit blockers.
+
+### File transfer and runtime management
 
 Files above 4 MiB require Colab's registered filesystem provider, which uses Jupyter's Contents API. This is the same file service used by **Upload to Colab** and Colab's native download command. The provider buffers a whole file, so native transfers have a hard 64 MiB cap even if `maxBytes` is larger. Smaller files use 256 KiB kernel chunks unless `colabFileUri` explicitly selects the native service. Each chunk request carries its payload once as a base64 literal, zlib-compressed when that saves at least 10%. IPython keeps the source of every executed request in `linecache` for the kernel's lifetime, so each transfer request is tagged and removes earlier tagged sources; payload-bearing requests are not retained. A kernel object carries at most 64 MiB of chunk traffic; beyond that, transfers are refused before dispatch with guidance to use the native service or restart the kernel. Kernel-side exceptions are reported by class name only.
 
@@ -92,17 +114,13 @@ The optional Colab VS Code extension contributes controllers through Jupyter. On
 
 On 2026-10-14, Marketplace 0.4.3 with `google.colab` 0.9.7 passed a live 65,568,700-byte native upload/download round trip and a separate 62,572,000-byte upload. Hashes matched and the same Colab process remained responsive through subsequent notebook execution. See [the validation record](TRANSFER_DIAGNOSIS.md#14-october-live-colab-verification) for timings, scope and remaining limits.
 
-A bootstrap adapter was considered on the same date. The installed 0.9.3 command manifest has no connect/start command; current upstream [activation](https://github.com/googlecolab/colab-vscode/blob/main/src/extension.ts) returns no extension API, and Auto Connect is handled inside the [Jupyter provider](https://github.com/googlecolab/colab-vscode/blob/main/src/jupyter/provider.ts). The browser-focused Colab MCP server does not expose that VS Code provider.
-
-Jupyter's [public API](https://github.com/microsoft/vscode-jupyter/blob/main/src/api.d.ts) lets an extension register its own server collection, but does not expose other extensions' provider instances. Its `kernels.getKernel` returns already-started kernels for open notebooks. The internal [`jupyter.kernel.selectJupyterServerKernel`](https://github.com/microsoft/vscode-jupyter/blob/main/src/notebooks/controllers/kernelSource/kernelSourceCommandHandler.ts) command accepts an extension ID, provider ID, and notebook, then invokes the normal server/kernel selector; it has no argument for choosing a server or provider action. The older [`addRemoteJupyterServer`](https://github.com/microsoft/vscode-jupyter/blob/main/src/standalone/api/unstable/index.ts) API is deprecated and rejects callers outside Codespaces. These routes do not provide unattended Colab bootstrap.
-
-Providers can mark a sole setup command `canBeAutoSelected`, but the checked Colab provider does not use that option. A provider API for listing existing runtimes and connecting to an explicit runtime would justify an optional MCP adapter. Until such a route exists, initial Colab setup can still require user interaction; wrapping its picker would not remove that requirement.
+Jupyter's [public kernel API](https://github.com/microsoft/vscode-jupyter/blob/v2025.9.1/src/standalone/api/kernels/index.ts) returns already-started kernels for open notebooks, without provider identity. Colab's [0.9.7 activation](https://github.com/googlecolab/colab-vscode/blob/d9b4965b4c56d00a85b4cf58c2ea9ca6cda48bc5/src/extension.ts) exports no connection API. The 0.5.0 setup flow therefore uses the normal notebook picker and a separate filesystem proof, rather than private provider registries or authentication state.
 
 ## Recommended flow
 
 1. Call `list_notebooks` and select a `notebookRef`.
 2. Read its outline, then request `view: "source"` for the cells needed. Edit cells and refresh indices or fallback anchors after structural changes.
-3. If a kernel must be chosen, list its registered controllers and select an exact ID. Configure the provider explicitly when necessary.
+3. If a kernel must be chosen, list its registered controllers and select an exact ID. Configure the provider explicitly when necessary. For Colab, use `runtime: "colab"`, poll its setup receipt, and require a successful nonce verification before workload execution.
 4. Call `run_cells`. `waitMs` defaults to 1,000; zero returns immediately, and larger values can wait for long jobs. This is a request wait budget, not an execution time limit. A returned ID or dispatch status does not prove execution started.
 5. If the run is unfinished, call `get_execution` with that ID. Its `waitMs` defaults to zero and also supports long waits. A client may impose a shorter request timeout; neither that timeout nor an expired wait budget interrupts execution. Omit the ID to recover the latest tracked run after a lost response.
 6. Read results and save edits or export the notebook. Completed background runs persist file-backed outputs, including remote results; untitled notebooks are not force-saved.
@@ -131,12 +149,13 @@ All windows share the configured loopback HTTP URL. The first window binds the b
 | `jupyterMcp.transport` | `http` | Streamable HTTP on loopback; `stdio` is scoped to the extension host and has no standalone Node launcher |
 | `jupyterMcp.port` | `51303` | Shared machine-scoped broker port |
 | `jupyterMcp.saveBeforeExecute` | `true` | Pre-save dirty notebooks before edit, move, or run |
+| `jupyterMcp.orcaPath` | empty | Absolute local Orca CLI path for automatic Colab setup; empty detects a known installation |
 
 ## Development and testing
 
 Install dependencies with `npm ci`, then run `npm run typecheck` and `npm run compile`. Press **F5** to open an Extension Development Host.
 
-`npm test` compiles the extension and runs the MCP boundary, Jupyter integration, broker, and kernel-file suites. `npm run coverage` merges their c8 coverage and enforces statements/lines >=75%, branches >=55%, and functions >=85%. The tests use shims without downloading VS Code; live provider checks are separate. CI runs on Ubuntu, Windows, and macOS.
+`npm test` compiles the extension and runs the MCP boundary, Jupyter integration, broker, kernel-file, desktop-adapter and Colab-setup suites. `npm run coverage` merges their c8 coverage and enforces statements/lines >=75%, branches >=55%, and functions >=85%. The tests use shims without downloading VS Code; live provider checks are separate. CI runs on Ubuntu, Windows, and macOS.
 
 ## License
 

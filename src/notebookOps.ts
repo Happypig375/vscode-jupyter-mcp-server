@@ -618,12 +618,33 @@ export async function getKernelInfo(filePath: string): Promise<string> {
     }, null, 2);
 }
 
-/** Explicitly request generic Jupyter provider setup; completion does not imply runtime startup. */
-export async function configureKernel(filePath: string): Promise<string> {
+/** Generic provider setup. Automatic Colab setup is routed through colabSetup. */
+export async function configureKernel(filePath: string, runtime: 'generic' | 'colab' = 'generic'): Promise<string> {
     const nb = findNotebook(filePath);
     if (!nb) throw new Error(`No open notebook matches '${filePath}'. Use list_notebooks to list them.`);
+    if (runtime !== 'generic' && runtime !== 'colab') throw new Error('runtime must be generic or colab.');
+    if (runtime === 'colab') throw new Error('Automatic Colab setup must use the routed configure_kernel tool.');
     const result = await invokeJupyterConfigureTool(nb);
-    return `Kernel configuration requested for ${nb.uri.toString()}.${result.detail ? `\n${result.detail}` : ''}`;
+    const observation = await observeActiveKernel(nb);
+    // Provider prose can claim success after a cancelled or stale setup. Report
+    // our observation separately and never promote that prose to readiness.
+    const active = observation.state === 'active';
+    return JSON.stringify({
+        notebook: nb.uri.toString(),
+        configurationRequested: true,
+        status: active ? 'active_kernel_observed' : result.pending ? 'pending' : 'not_ready',
+        ready: false,
+        kernel: active ? {
+            label: observation.kernel.label ?? null,
+            language: observation.kernel.language ?? 'unknown',
+            status: observation.kernel.status ?? 'unknown'
+        } : null,
+        reason: active
+            ? 'An active kernel is exposed, but its responsiveness and provider identity have not been checked.'
+            : observation.reason,
+        providerReportedPending: result.pending,
+        nextStep: 'Verify the intended runtime before running notebook cells.'
+    }, null, 2);
 }
 
 /** Enumerate registered notebook controllers, optionally configuring providers first. */
@@ -693,11 +714,12 @@ export async function selectKernel(filePath: string, kernelId: string, start = f
         throw new Error(`Kernel '${kernelId}' is not available for ${nb.uri.toString()}. Available kernel ids: ${available}`);
     }
 
-    // Kernel selection is scoped to the active notebook editor. Bring the requested
-    // document forward, then use the exact extension/controller pair resolved by VS Code.
-    await revealNotebookForExecution(nb);
+    // Pass the actual editor through the public command's extension-host mapping;
+    // relying on whichever notebook is active can select the wrong notebook.
+    const editor = await revealNotebookForExecution(nb);
     const slash = kernel.id.indexOf('/');
-    const selected = await vscode.commands.executeCommand<boolean>('_notebook.selectKernel', {
+    const selected = await vscode.commands.executeCommand<boolean>('notebook.selectKernel', {
+        notebookEditor: editor,
         id: kernel.id.slice(slash + 1),
         extension: kernel.extension
     });
@@ -1009,12 +1031,13 @@ async function waitForCellExecution(notebook: vscode.NotebookDocument, index: nu
 }
 
 /** Reveal the target notebook and fail closed if VS Code returns another editor. */
-async function revealNotebookForExecution(nb: vscode.NotebookDocument): Promise<void> {
+async function revealNotebookForExecution(nb: vscode.NotebookDocument): Promise<vscode.NotebookEditor> {
     const editor = await vscode.window.showNotebookDocument(nb, { preview: false, preserveFocus: false });
     const revealed = editor?.notebook;
     if (!revealed || revealed.uri.toString() !== nb.uri.toString()) {
         throw new Error(`VS Code did not reveal notebook ${nb.uri.toString()} for execution.`);
     }
+    return editor;
 }
 
 /**
