@@ -20,7 +20,7 @@ const ACTIVE = 'colab-environment-active.json';
 const HELPER = 'colab-environment-helper.cjs';
 const FOLDER_MARKER = 'jupyter-mcp-environment.json';
 
-type PreparationStatus = 'workspace_open_requested' | 'arming_restart' | 'restart_requested' | 'app_launched' | 'environment_ready' | 'failed';
+type PreparationStatus = 'workspace_open_requested' | 'workspace_conversion_requested' | 'arming_restart' | 'restart_requested' | 'app_launched' | 'environment_ready' | 'failed';
 
 export interface ColabEnvironmentReceiptForTest {
     schema: 1;
@@ -35,6 +35,7 @@ export interface ColabEnvironmentReceiptForTest {
     expectedWindowLabel: string;
     port: number;
     generatedWorkspace: boolean;
+    folderPreparation?: { originalName: string; preparedName: string; requestedAt?: number; workspaceFileUri?: string };
     installedCommit?: string;
     main?: ProcessIdentity;
     executablePath?: string;
@@ -130,6 +131,7 @@ class ColabEnvironmentManager {
     private readonly workspaceRoot: string;
     private readonly activePath: string;
     private disposed = false;
+    private workspacePreparation?: Promise<void>;
 
     constructor(private readonly context: ColabEnvironmentContextForTest, private readonly deps: ColabEnvironmentDependenciesForTest) {
         // File URI interpretation belongs to the host filesystem, independently of
@@ -159,7 +161,7 @@ class ColabEnvironmentManager {
                 }
             }
         }
-        await this.reconcile(receipt);
+        if (!await this.reconcile(receipt)) await this.prepareWorkspace(receipt);
     }
 
     async prepare(folderUri?: string): Promise<string> {
@@ -167,18 +169,32 @@ class ColabEnvironmentManager {
         const requestedFolder = folderUri === undefined ? undefined : await resolveRequestedFolder(folderUri);
         const currentPort = await this.findWorkingPort();
         if (currentPort) {
+            const active = await this.obtainActive();
+            if (active) {
+                const receipt = await this.requireReceipt(active);
+                this.presentMatchingActive(receipt, requestedFolder);
+                const freshNativeBind = await this.reconcile(receipt);
+                if (!freshNativeBind) await this.prepareWorkspace(receipt);
+                return this.present(await this.requireReceipt(active), freshNativeBind);
+            }
             const current = currentWorkspaceIdentity();
             if (current) {
-                if (requestedFolder && requestedFolder.uri !== current.uri) {
+                if (requestedFolder && requestedFolder.uri !== current.uri &&
+                    !(vscode.workspace.workspaceFile && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === requestedFolder.uri)) {
                     throw new ColabEnvironmentError('workspace_mismatch', 'The requested folder is not this window\'s current workspace. Use an empty window or omit folderUri to prepare the current workspace.');
+                }
+                if (!vscode.workspace.workspaceFile) {
+                    assertWorkspaceConversionSafe();
+                    const receipt = await this.createBootstrapReceipt(currentPort, 'workspace_open_requested', undefined,
+                        { uri: current.uri, label: current.label, path: vscode.Uri.parse(current.uri).fsPath });
+                    await this.prepareWorkspace(receipt);
+                    return this.present(await this.requireReceipt(receipt.preparationId));
                 }
                 const receipt = await this.newReceipt(current, currentPort, false, 'environment_ready');
                 receipt.readyAt = this.deps.now();
                 await this.writeReceipt(receipt);
                 return this.present(receipt, true);
             }
-            const active = await this.obtainActive();
-            if (active) return this.presentMatchingActive(await this.requireReceipt(active), requestedFolder);
             const receipt = await this.createBootstrapReceipt(currentPort, 'workspace_open_requested', undefined, requestedFolder);
             try {
                 await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.parse(receipt.workspaceUri), {
@@ -289,16 +305,77 @@ class ColabEnvironmentManager {
         if (receipt.status !== 'environment_ready' && this.deps.now() > receipt.deadline) {
             await this.fail(receipt, 'preparation_timeout'); return false;
         }
-        const current = currentWorkspaceIdentity();
-        if (!current || current.uri !== receipt.workspaceUri) return false;
+        if (!this.matchesWorkspace(receipt)) return false;
         if (!vscode.workspace.isTrusted) return false;
         if (receipt.generatedWorkspace && !await this.verifyFolderMarker(receipt)) return false;
         if (!await this.deps.probeNative(receipt.port)) return false;
+        // Native probing yields. Recheck the exact workspace before pinning the
+        // newly created configuration or publishing readiness.
+        if (!this.matchesWorkspace(receipt) || !vscode.workspace.isTrusted) return false;
+        if (receipt.folderPreparation && !receipt.folderPreparation.workspaceFileUri) {
+            receipt.folderPreparation.workspaceFileUri = vscode.workspace.workspaceFile!.toString();
+        }
         if (receipt.status !== 'environment_ready') {
             receipt.status = 'environment_ready'; receipt.readyAt = this.deps.now(); receipt.failure = undefined;
             await this.writeReceipt(receipt); await this.releaseActive(receipt.preparationId);
         }
         return true;
+    }
+
+    private matchesWorkspace(receipt: Receipt): boolean {
+        const preparation = receipt.folderPreparation;
+        if (!preparation) return currentWorkspaceIdentity()?.uri === receipt.workspaceUri;
+        const folders = vscode.workspace.workspaceFolders;
+        const file = vscode.workspace.workspaceFile;
+        if (!file || !folders?.length || folders[0].uri.toString() !== receipt.workspaceUri || folders[0].name !== preparation.preparedName) return false;
+        if (preparation.workspaceFileUri) return file.toString() === preparation.workspaceFileUri;
+        return receipt.status === 'workspace_conversion_requested' && preparation.requestedAt !== undefined &&
+            file.scheme === 'untitled' && folders.length === 1;
+    }
+
+    /** Only explicit preparation and its activation continuation can dispatch this
+     * public API operation. Polling a receipt never changes the workspace. */
+    private async prepareWorkspace(receipt: Receipt): Promise<void> {
+        if (this.workspacePreparation) return this.workspacePreparation;
+        const pending = this.convertWorkspace(receipt);
+        this.workspacePreparation = pending;
+        try { await pending; } finally { if (this.workspacePreparation === pending) this.workspacePreparation = undefined; }
+    }
+
+    private async convertWorkspace(receipt: Receipt): Promise<void> {
+        // Re-read inside the serialized operation: overlapping callers may hold
+        // an older pre-dispatch receipt, and a request must never be sent twice.
+        receipt = await this.requireReceipt(receipt.preparationId);
+        const preparation = receipt.folderPreparation;
+        if (!preparation || preparation.requestedAt !== undefined ||
+            !['workspace_open_requested', 'app_launched', 'restart_requested'].includes(receipt.status) ||
+            this.deps.now() > receipt.deadline) return;
+        const exactFolder = () => !vscode.workspace.workspaceFile && vscode.workspace.workspaceFolders?.length === 1 &&
+            vscode.workspace.workspaceFolders[0].uri.toString() === receipt.workspaceUri &&
+            vscode.workspace.workspaceFolders[0].name === preparation.originalName;
+        if (!exactFolder()) return;
+        try {
+            this.assertLocalHost();
+            assertWorkspaceConversionSafe();
+            if (receipt.generatedWorkspace && !await this.verifyFolderMarker(receipt)) return;
+            if (!await this.deps.probeNative(receipt.port)) return;
+            preparation.requestedAt = this.deps.now();
+            receipt.status = 'workspace_conversion_requested';
+            await this.writeReceipt(receipt);
+            // There is no await between final public-state checks and dispatch.
+            if (this.disposed || this.deps.now() > receipt.deadline || !exactFolder()) throw new ColabEnvironmentError('workspace_changed', 'The preparation workspace changed before conversion.');
+            this.assertLocalHost();
+            assertWorkspaceConversionSafe();
+            const accepted = vscode.workspace.updateWorkspaceFolders(0, 1, {
+                uri: vscode.workspace.workspaceFolders![0].uri, name: preparation.preparedName
+            });
+            if (!accepted) throw new ColabEnvironmentError('workspace_conversion_rejected', 'VS Code rejected workspace preparation.');
+            // Replacing the first root terminates this extension host. The new
+            // activation verifies the one-root untitled workspace and fresh CDP
+            // binding; true here is not completion and is never retried.
+        } catch (error) {
+            await this.fail(receipt, error instanceof ColabEnvironmentError ? error.code : 'workspace_conversion_failed');
+        }
     }
 
     private async createBootstrapReceipt(
@@ -313,8 +390,9 @@ class ColabEnvironmentManager {
             const expectedWindowLabel = requestedFolder?.label ?? `colab-bootstrap-${preparationId.slice(0, 8)}`;
             const workspacePath = requestedFolder?.path ?? path.join(this.workspaceRoot, expectedWindowLabel);
             if (!requestedFolder) await fs.mkdir(workspacePath, { recursive: false });
-            const identity = { uri: vscode.Uri.file(workspacePath).toString(), label: expectedWindowLabel };
+            const identity = { uri: requestedFolder?.uri ?? vscode.Uri.file(workspacePath).toString(), label: expectedWindowLabel };
             const receipt = await this.newReceipt(identity, port, !requestedFolder, status, preparationId, workspacePath);
+            receipt.folderPreparation = { originalName: expectedWindowLabel, preparedName: `${expectedWindowLabel} [Colab ${preparationId.slice(0, 8)}]` };
             if (restart) Object.assign(receipt, restart);
             if (!requestedFolder) await writeJsonAtomic(path.join(workspacePath, FOLDER_MARKER), { schema: SCHEMA, preparationId, nonce: receipt.nonce });
             await this.writeReceipt(receipt);
@@ -364,18 +442,22 @@ class ColabEnvironmentManager {
 
     private present(receipt: Receipt, freshNativeBind = false): string {
         const current = currentWorkspaceIdentity();
-        const exactWindow = current?.uri === receipt.workspaceUri;
+        const exactWindow = this.matchesWorkspace(receipt);
+        const expectedWindowLabel = exactWindow ? current!.label : receipt.folderPreparation?.requestedAt !== undefined
+            ? receipt.folderPreparation.preparedName : receipt.expectedWindowLabel;
         const ready = receipt.status === 'environment_ready' && exactWindow && vscode.workspace.isTrusted && freshNativeBind;
-        const status = receipt.status !== 'failed' && exactWindow && !vscode.workspace.isTrusted ? 'workspace_untrusted' : receipt.status === 'environment_ready'
+        const status = receipt.status !== 'failed' && (exactWindow || current?.uri === receipt.workspaceUri) && !vscode.workspace.isTrusted ? 'workspace_untrusted' : receipt.status === 'environment_ready'
             ? !exactWindow ? 'workspace_mismatch' : !freshNativeBind ? 'native_binding_unavailable' : 'environment_ready'
             : receipt.status;
         const next = ready
-            ? { tool: 'list_notebooks', hint: `Use the connected window labelled '${receipt.expectedWindowLabel}', then call open_notebooks there if the notebook is not already open.` }
+            ? { tool: 'list_notebooks', hint: `Use the connected window labelled '${expectedWindowLabel}', then call open_notebooks there if the notebook is not already open.` }
             : status === 'workspace_open_requested' || status === 'workspace_mismatch'
-                ? { tool: 'list_notebooks', hint: `Find the connected window labelled '${receipt.expectedWindowLabel}' and route get_colab_environment_preparation to it.` }
+                ? { tool: 'list_notebooks', hint: `Find the connected window for '${receipt.expectedWindowLabel}' and route get_colab_environment_preparation to it.` }
                 : { tool: 'get_colab_environment_preparation', preparationId: receipt.preparationId, hint: 'Poll after VS Code has restarted; this status proves only the desktop environment.' };
         return JSON.stringify({ preparationId: receipt.preparationId, status, environmentReady: ready, runtimeReady: false,
-            workspaceUri: receipt.workspaceUri, expectedWindowLabel: receipt.expectedWindowLabel, failure: receipt.failure, next });
+            workspaceUri: receipt.folderPreparation?.workspaceFileUri ?? receipt.workspaceUri,
+            folderUri: receipt.folderPreparation ? receipt.workspaceUri : undefined,
+            expectedWindowLabel, failure: receipt.failure, next });
     }
 
     private receiptPath(id: string): string { return path.join(this.receiptRoot, `${id}.json`); }
@@ -477,14 +559,28 @@ async function probeNativePort(port: number): Promise<boolean> {
 function currentWorkspaceIdentity(): { uri: string; label: string } | undefined {
     const workspaceFile = vscode.workspace.workspaceFile;
     if (workspaceFile) {
-        const label = workspaceFile.scheme === 'file'
-            ? path.basename(workspaceFile.fsPath, path.extname(workspaceFile.fsPath))
-            : 'workspace';
+        const label = vscode.workspace.workspaceFolders?.map(folder => folder.name).join(', ') || 'workspace';
         return { uri: workspaceFile.toString(), label };
     }
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length !== 1 || folders[0].uri.scheme !== 'file') return undefined;
     return { uri: folders[0].uri.toString(), label: folders[0].name };
+}
+
+function assertWorkspaceConversionSafe(): void {
+    if (vscode.debug.activeDebugSession) throw new ColabEnvironmentError('debug_session_present', 'Stop debugging before preparing the workspace.');
+    if (vscode.workspace.notebookDocuments.length || vscode.window.visibleNotebookEditors.length || vscode.window.activeNotebookEditor) {
+        throw new ColabEnvironmentError('open_notebook_present', 'Prepare the workspace before opening notebooks; conversion refreshes the extension host.');
+    }
+    if (vscode.window.terminals.length) throw new ColabEnvironmentError('terminal_present', 'Inspect restored terminals and close only authorized explicit references before workspace preparation.');
+    if (vscode.workspace.textDocuments.some(document => document.isDirty || document.isUntitled || document.uri.scheme === 'file') ||
+        vscode.window.visibleTextEditors.length || vscode.window.activeTextEditor) {
+        throw new ColabEnvironmentError('open_document_present', 'Close user documents before workspace preparation.');
+    }
+    const tabs = vscode.window.tabGroups.all.flatMap(group => [...group.tabs]);
+    if (tabs.some(tab => tab.label !== 'Welcome' || tab.input !== undefined || tab.isDirty)) {
+        throw new ColabEnvironmentError('editor_present', 'Close editor tabs before workspace preparation.');
+    }
 }
 
 export function resolveLocalGlobalStoragePathForTest(
@@ -772,11 +868,20 @@ async function readJson(file: string): Promise<any | undefined> {
 }
 function validateReceipt(value: any): Receipt | undefined {
     if (!value || value.schema !== SCHEMA || !isUuid(value.preparationId) || !isUuid(value.nonce) ||
-        !['workspace_open_requested', 'arming_restart', 'restart_requested', 'app_launched', 'environment_ready', 'failed'].includes(value.status) ||
+        !['workspace_open_requested', 'workspace_conversion_requested', 'arming_restart', 'restart_requested', 'app_launched', 'environment_ready', 'failed'].includes(value.status) ||
         !Number.isSafeInteger(value.createdAt) || !Number.isSafeInteger(value.deadline) || value.deadline !== value.createdAt + PREPARATION_MS ||
         typeof value.workspaceUri !== 'string' || value.workspaceUri.length > 4096 || typeof value.expectedWindowLabel !== 'string' ||
         (value.generatedWorkspace && !/^colab-bootstrap-[0-9a-f]{8}$/.test(value.expectedWindowLabel)) ||
         !validPort(value.port) || typeof value.generatedWorkspace !== 'boolean') return undefined;
+    const preparation = value.folderPreparation;
+    if (preparation !== undefined && (!preparation || typeof preparation.originalName !== 'string' ||
+        preparation.originalName !== value.expectedWindowLabel || preparation.originalName.length > 512 ||
+        preparation.preparedName !== `${preparation.originalName} [Colab ${value.preparationId.slice(0, 8)}]` ||
+        (preparation.requestedAt !== undefined && (!Number.isSafeInteger(preparation.requestedAt) ||
+            preparation.requestedAt < value.createdAt || preparation.requestedAt > value.deadline)) ||
+        (preparation.workspaceFileUri !== undefined && (typeof preparation.workspaceFileUri !== 'string' ||
+            preparation.workspaceFileUri.length > 4096 || !/^untitled:[^\r\n]+$/.test(preparation.workspaceFileUri) || preparation.requestedAt === undefined)))) return undefined;
+    if (value.status === 'workspace_conversion_requested' && (!preparation || preparation.requestedAt === undefined)) return undefined;
     if (['arming_restart', 'restart_requested', 'app_launched'].includes(value.status) &&
         (typeof value.executablePath !== 'string' || typeof value.userDataDir !== 'string' || typeof value.extensionsDir !== 'string' ||
          !value.main || !Number.isSafeInteger(value.main.pid) || typeof value.main.executablePath !== 'string' ||

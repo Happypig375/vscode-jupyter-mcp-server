@@ -283,17 +283,49 @@ async function main() {
     assert.strictEqual(prepareReceipt.environmentReady, false);
     assert.strictEqual(prepareReceipt.runtimeReady, false);
     assert.match(prepareReceipt.expectedWindowLabel, /^colab-bootstrap-[0-9a-f]{8}$/);
+    assert.strictEqual(prepareReceipt.folderUri, prepareReceipt.workspaceUri, 'initial receipt must expose the exact generated folder');
+    assert.strictEqual(new URL(prepareReceipt.folderUri).protocol, 'file:');
+    const finalWindowLabel = `${prepareReceipt.expectedWindowLabel} [Colab ${prepareReceipt.preparationId.slice(0, 8)}]`;
 
-    const routed = await until(async () => {
+    // Re-list throughout the folder-to-untitled-workspace conversion. Replacing the
+    // first root restarts the extension host and therefore may replace the broker ID;
+    // no operation is routed through a pre-conversion ID.
+    const transitions = [];
+    receipt.workspaceTransitionListings = transitions;
+    let lastTransition;
+    const ready = await until(async () => {
         const groups = await listNotebooks();
         assertGroupShape(groups);
-        const matches = groups.filter(group => group.windowLabel === prepareReceipt.expectedWindowLabel);
-        return matches.length === 1 ? { groups, owner: matches[0] } : false;
-    }, 'Generated workspace window did not register uniquely with the broker.', 60_000);
-    receipt.workspaceListing = routed.groups;
-    assert.notStrictEqual(routed.owner.windowId, initialWindowId, 'generated workspace must have a distinct broker window identity');
-    assert.deepStrictEqual(routed.owner.notebooks, []);
-    assert.strictEqual(routed.groups.filter(group => group.windowId === initialWindowId).length, 1, 'original empty window must remain uniquely registered');
+        const summary = groups.map(group => ({ windowId: group.windowId, windowLabel: group.windowLabel, notebookCount: group.notebooks.length }));
+        const encoded = JSON.stringify(summary);
+        if (encoded !== lastTransition && transitions.length < 40) {
+            transitions.push(summary);
+            lastTransition = encoded;
+        }
+        const matches = groups.filter(group => group.windowLabel === finalWindowLabel);
+        if (matches.length !== 1) return false;
+        const owner = matches[0];
+        let text;
+        try {
+            text = await callText('get_colab_environment_preparation', {
+                preparationId: prepareReceipt.preparationId,
+                windowId: owner.windowId
+            });
+        } catch {
+            return false;
+        }
+        const value = JSON.parse(text);
+        if (value.environmentReady !== true) return false;
+        await pause(500);
+        const stableGroups = await listNotebooks();
+        const stable = stableGroups.filter(group => group.windowLabel === finalWindowLabel);
+        if (stable.length !== 1 || stable[0].windowId !== owner.windowId) return false;
+        return { text, value, owner: stable[0], groups: stableGroups };
+    }, 'Renamed untitled workspace did not become a stable ready broker owner.', 75_000);
+    receipt.workspaceListing = ready.groups;
+    assert.notStrictEqual(ready.owner.windowId, initialWindowId, 'prepared workspace must have a distinct broker window identity');
+    assert.deepStrictEqual(ready.owner.notebooks, []);
+    assert.strictEqual(ready.groups.filter(group => group.windowId === initialWindowId).length, 1, 'original empty window must remain uniquely registered');
 
     const mismatchText = await callText('get_colab_environment_preparation', {
         preparationId: prepareReceipt.preparationId,
@@ -305,40 +337,32 @@ async function main() {
     assert.strictEqual(mismatchReceipt.status, 'workspace_mismatch');
     assert.strictEqual(mismatchReceipt.environmentReady, false);
     assert.strictEqual(mismatchReceipt.runtimeReady, false);
-
-    const ready = await until(async () => {
-        const text = await callText('get_colab_environment_preparation', {
-            preparationId: prepareReceipt.preparationId,
-            windowId: routed.owner.windowId
-        });
-        const value = JSON.parse(text);
-        return value.environmentReady === true ? { text, value } : false;
-    }, 'Exact generated workspace did not prove fresh native marker readiness.', 45_000);
     receipt.readyReceiptRaw = ready.text;
     receipt.readyReceipt = ready.value;
     assert.strictEqual(ready.value.status, 'environment_ready');
     assert.strictEqual(ready.value.runtimeReady, false);
-    assert.strictEqual(ready.value.workspaceUri, prepareReceipt.workspaceUri);
-    assert.strictEqual(ready.value.expectedWindowLabel, prepareReceipt.expectedWindowLabel);
+    assert.strictEqual(new URL(ready.value.workspaceUri).protocol, 'untitled:');
+    assert.strictEqual(ready.value.folderUri, prepareReceipt.folderUri);
+    assert.strictEqual(ready.value.expectedWindowLabel, finalWindowLabel);
 
-    const createText = await callText('create_notebook', { title: 'Environment fixture', windowId: routed.owner.windowId });
+    const createText = await callText('create_notebook', { title: 'Environment fixture', windowId: ready.owner.windowId });
     receipt.createNotebookResponse = createText;
     const createdMatch = /^Created (file:\/\/\/.*?) and opened it in the editor\.$/.exec(createText);
     assert.ok(createdMatch, 'create_notebook must create a real workspace file');
     const createdUri = createdMatch[1];
-    const relativeCreated = path.relative(fileURLToPath(ready.value.workspaceUri), fileURLToPath(createdUri));
+    const relativeCreated = path.relative(fileURLToPath(ready.value.folderUri), fileURLToPath(createdUri));
     assert.ok(relativeCreated && !relativeCreated.startsWith('..') && !path.isAbsolute(relativeCreated), 'created notebook must belong to the generated workspace');
 
-    const firstOpenText = await callText('open_notebooks', { uris: [diskNotebookUri], windowId: routed.owner.windowId });
+    const firstOpenText = await callText('open_notebooks', { uris: [diskNotebookUri], windowId: ready.owner.windowId });
     receipt.firstOpenResponse = firstOpenText;
     assert.match(firstOpenText, /^Opened from disk:/);
-    const secondOpenText = await callText('open_notebooks', { uris: [diskNotebookUri], windowId: routed.owner.windowId });
+    const secondOpenText = await callText('open_notebooks', { uris: [diskNotebookUri], windowId: ready.owner.windowId });
     receipt.secondOpenResponse = secondOpenText;
     assert.match(secondOpenText, /^Already open; preserved live document:/, 'second open must reveal the existing document');
 
     const finalListing = await until(async () => {
         const groups = await listNotebooks();
-        const owner = groups.find(group => group.windowId === routed.owner.windowId);
+        const owner = groups.find(group => group.windowId === ready.owner.windowId);
         return owner?.notebooks.length === 2 ? groups : false;
     }, 'Created and opened notebooks were not both attributed to the generated workspace.');
     receipt.finalListing = finalListing;
@@ -351,14 +375,16 @@ async function main() {
             allNotebookOwners.set(key, owners);
         }
     }
-    assert.deepStrictEqual(allNotebookOwners.get(fileUriKey(diskNotebookUri)), [routed.owner.windowId], 'fixture notebook must have one exact owner');
-    assert.deepStrictEqual(allNotebookOwners.get(fileUriKey(createdUri)), [routed.owner.windowId], 'created notebook must have one exact owner');
+    assert.deepStrictEqual(allNotebookOwners.get(fileUriKey(diskNotebookUri)), [ready.owner.windowId], 'fixture notebook must have one exact owner');
+    assert.deepStrictEqual(allNotebookOwners.get(fileUriKey(createdUri)), [ready.owner.windowId], 'created notebook must have one exact owner');
     assert.strictEqual(finalListing.find(group => group.windowId === initialWindowId)?.notebooks.length, 0, 'original window must remain empty');
-    assert.strictEqual(finalListing.filter(group => group.windowLabel === prepareReceipt.expectedWindowLabel).length, 1, 'workspace owner label must remain unique');
+    assert.strictEqual(finalListing.filter(group => group.windowLabel === finalWindowLabel).length, 1, 'renamed workspace owner label must remain unique');
 
     receipt.assertions = {
         initialWindowEmpty: true,
         generatedWorkspaceUnique: true,
+        transientPreconversionWindowIdNotPinned: true,
+        folderPromotedToUntitledWorkspace: true,
         wrongWindowNotReady: true,
         exactWindowFreshNativeReady: true,
         runtimeReadyFalse: true,
@@ -387,7 +413,7 @@ main().catch(error => {
                 .filter(item => item.type === 'page' && /workbench(?:\.html)?/.test(item.url))
                 .sort((left, right) => Number(left.id === initialTargetId) - Number(right.id === initialTargetId));
             if (pages.length < 1 || pages.filter(page => page.id === initialTargetId).length !== 1) throw new Error('owned workbench targets changed before close');
-            let requested = 0;
+            const requested = [];
             for (const page of pages) {
                 const windowControl = await connectDebugger(page.webSocketDebuggerUrl);
                 const close = await windowControl.command('Runtime.evaluate', {
@@ -399,22 +425,25 @@ main().catch(error => {
                             return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
                         };
                         const items = [...document.querySelectorAll('.statusbar-item')].filter(element => visible(element) && element.textContent.trim() === marker);
-                        if (items.length !== 1) return { ok: false, reason: 'fixture_close_marker_not_unique', count: items.length };
-                        const actions = [...items[0].querySelectorAll('a,button,[role="button"]')].filter(visible);
-                        const action = actions.length === 1 ? actions[0] : items[0].matches('a,button,[role="button"]') ? items[0] : undefined;
-                        if (!action) return { ok: false, reason: 'fixture_close_action_not_unique', count: actions.length };
-                        action.click();
-                        return { ok: true };
+                        if (items.length > 1) return { ok: false, reason: 'fixture_close_marker_not_unique', count: items.length };
+                        if (items.length === 1) {
+                            const actions = [...items[0].querySelectorAll('a,button,[role="button"]')].filter(visible);
+                            const action = actions.length === 1 ? actions[0] : items[0].matches('a,button,[role="button"]') ? items[0] : undefined;
+                            if (!action) return { ok: false, reason: 'fixture_close_action_not_unique', count: actions.length };
+                            action.click();
+                            return { ok: true, method: 'fixture_close_command' };
+                        }
+                        return { ok: false, reason: 'fixture_close_marker_missing', count: 0 };
                     })()`,
                     returnByValue: true
                 });
                 const value = close.result?.value;
                 if (!value?.ok) throw new Error(value?.reason ?? 'fixture close command unavailable');
-                requested++;
+                requested.push({ targetId: page.id, method: value.method });
                 await pause(400);
                 windowControl.close();
             }
-            receipt.closeRequested = { command: 'workbench.action.closeWindow', windows: requested };
+            receipt.closeRequested = { windows: requested };
         } catch {
             receipt.closeRequested = 'unconfirmed';
         }
@@ -432,7 +461,7 @@ main().catch(error => {
             child.kill();
             receipt.ownedProcessKillRequested = true;
             receipt.passed = false;
-            receipt.error = receipt.error ?? 'Owned isolated VS Code did not exit after Browser.close.';
+            receipt.error = receipt.error ?? 'Owned isolated VS Code did not exit after normal window-close commands.';
             process.exitCode = 1;
         }
     }

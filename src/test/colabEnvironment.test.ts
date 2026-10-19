@@ -260,8 +260,15 @@ test('readiness requires the exact generated workspace, nonce marker and a fresh
         await fs.writeFile(markerPath, JSON.stringify({ schema: 1, preparationId: receipt.preparationId, nonce: crypto.randomUUID() }));
         assert.strictEqual(parsed(await manager.get(initial.preparationId)).environmentReady, false);
         await fs.writeFile(markerPath, JSON.stringify({ schema: 1, preparationId: receipt.preparationId, nonce: receipt.nonce }));
+        assert.strictEqual(parsed(await manager.get(initial.preparationId)).environmentReady, false);
+        assert.strictEqual(state.workspaceUpdates.length, 0, 'polling must not convert a folder');
+        await manager.initialize();
+        assert.strictEqual(state.workspaceUpdates.length, 1);
+        state.workspaceFile = rawUri('untitled:123456');
+        state.folders[0].name = receipt.folderPreparation!.preparedName;
         const ready = parsed(await manager.get(initial.preparationId));
-        assert.strictEqual(ready.status, 'environment_ready'); assert.strictEqual(ready.environmentReady, true); assert.strictEqual(ready.workspaceUri, uri.toString());
+        assert.strictEqual(ready.status, 'environment_ready'); assert.strictEqual(ready.environmentReady, true);
+        assert.strictEqual(ready.workspaceUri, state.workspaceFile.toString()); assert.strictEqual(ready.folderUri, uri.toString());
         f.deps.probeNative = async () => false;
         const stale = parsed(await manager.get(initial.preparationId));
         assert.strictEqual(stale.status, 'native_binding_unavailable'); assert.strictEqual(stale.environmentReady, false);
@@ -480,6 +487,11 @@ test('an explicit existing folder survives restart preparation without writing i
         const untrusted = parsed(await manager.get(result.preparationId));
         assert.strictEqual(untrusted.environmentReady, false); assert.strictEqual(untrusted.status, 'workspace_untrusted');
         state.trusted = true;
+        f.deps.env.VSCODE_PID = String(PID + 1); // the normal-quit bootstrap launched a different main process
+        await manager.initialize();
+        assert.strictEqual(state.workspaceUpdates.length, 1);
+        state.workspaceFile = rawUri('untitled:654321');
+        state.folders[0].name = receipt.folderPreparation.preparedName;
         const ready = parsed(await manager.get(result.preparationId));
         assert.strictEqual(ready.environmentReady, true); assert.strictEqual(ready.runtimeReady, false);
     } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
@@ -499,8 +511,10 @@ test('a configured native empty window opens only the explicitly requested folde
         await rejectsCode(() => manager.prepare(fileUri(other).toString()), 'preparation_target_mismatch');
         assert.strictEqual(state.calls.length, 1);
         state.folders = [{ uri: fileUri(await fs.realpath(folder)), name: 'project' }];
-        await rejectsCode(() => manager.prepare(fileUri(other).toString()), 'workspace_mismatch');
-        assert.strictEqual(parsed(await manager.prepare(fileUri(folder).toString())).environmentReady, true);
+        await rejectsCode(() => manager.prepare(fileUri(other).toString()), 'preparation_target_mismatch');
+        const requested = parsed(await manager.prepare(fileUri(folder).toString()));
+        assert.strictEqual(requested.status, 'workspace_conversion_requested'); assert.strictEqual(requested.environmentReady, false);
+        assert.strictEqual(state.workspaceUpdates.length, 1);
     } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
 });
 
@@ -516,6 +530,123 @@ test('folder selection rejects remote, malformed, unavailable and non-directory 
         await rejectsCode(() => manager.prepare(fileUri(path.join(f.temp, 'missing')).toString()), 'folder_unavailable');
         assert.strictEqual(f.quitCalls, 0); assert.deepStrictEqual(state.calls, []);
         assert.deepStrictEqual(await fs.readdir(path.join(f.root, 'colab-environment-receipts')), []);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('one-root conversion is durable, read-only to poll, and survives activation before later mounts', async () => {
+    const f = await fixture({ native: true });
+    try {
+        const folder = path.join(f.temp, 'project'); await fs.mkdir(folder);
+        state.folders = [{ uri: fileUri(folder), name: 'project' }];
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const requested = parsed(await manager.prepare());
+        assert.strictEqual(requested.status, 'workspace_conversion_requested'); assert.strictEqual(requested.environmentReady, false);
+        assert.strictEqual(state.workspaceUpdates.length, 1);
+        assert.deepStrictEqual(state.workspaceUpdates[0].slice(0, 2), [0, 1]);
+        assert.strictEqual(state.workspaceUpdates[0][2].uri, state.folders[0].uri);
+        assert.notStrictEqual(state.workspaceUpdates[0][2].name, 'project');
+        const receiptPath = path.join(f.root, 'colab-environment-receipts', `${requested.preparationId}.json`);
+        const persisted = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
+        assert.strictEqual(persisted.folderPreparation.requestedAt, f.deps.now());
+        await manager.get(requested.preparationId); await manager.prepare(); await manager.initialize();
+        assert.strictEqual(state.workspaceUpdates.length, 1, 'an unacknowledged conversion is never replayed');
+        state.workspaceFile = rawUri('untitled:owned-workspace'); state.folders[0].name = state.workspaceUpdates[0][2].name;
+        const activated = createColabEnvironmentForTest({ ...f.context, subscriptions: [] }, f.deps); await activated.initialize();
+        const ready = parsed(await activated.get(requested.preparationId));
+        assert.strictEqual(ready.environmentReady, true); assert.strictEqual(ready.runtimeReady, false);
+        assert.strictEqual(ready.workspaceUri, 'untitled:owned-workspace'); assert.strictEqual(ready.expectedWindowLabel, state.folders[0].name);
+        const pinned = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
+        assert.strictEqual(pinned.folderPreparation.workspaceFileUri, 'untitled:owned-workspace');
+        state.folders.push({ uri: rawUri('colab://owned/content'), name: 'm12345678' });
+        assert.strictEqual(parsed(await activated.get(requested.preparationId)).environmentReady, true);
+        assert.strictEqual(state.workspaceUpdates.length, 1);
+        state.workspaceFile = rawUri('untitled:different-workspace');
+        assert.strictEqual(parsed(await activated.get(requested.preparationId)).environmentReady, false);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('conversion refuses restored work and retains the blocker without closing or saving it', async () => {
+    for (const [configure, code] of [
+        [() => { state.notebooks = [{}]; }, 'open_notebook_present'],
+        [() => { state.terminals = [{}]; }, 'terminal_present'],
+        [() => { state.documents = [{ isDirty: true }]; }, 'open_document_present'],
+        [() => { state.activeDebugSession = {}; }, 'debug_session_present'],
+        [() => { state.tabs = [{ label: 'draft', isDirty: true }]; }, 'editor_present']
+    ] as const) {
+        const f = await fixture({ native: true });
+        try {
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const initial = parsed(await manager.prepare());
+            state.folders = [{ uri: state.calls[0][1], name: initial.expectedWindowLabel }]; configure();
+            await manager.initialize();
+            const final = parsed(await manager.get(initial.preparationId));
+            assert.strictEqual(final.status, 'failed'); assert.strictEqual(final.failure, code);
+            assert.strictEqual(state.workspaceUpdates.length, 0); assert.strictEqual(state.calls.length, 1);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('API rejection is terminal and concurrent preparations dispatch conversion once', async () => {
+    const f = await fixture({ native: true });
+    try {
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const initial = parsed(await manager.prepare());
+        state.folders = [{ uri: state.calls[0][1], name: initial.expectedWindowLabel }];
+        state.workspaceUpdateResult = false;
+        await Promise.all([manager.prepare(), manager.prepare()]);
+        assert.strictEqual(state.workspaceUpdates.length, 1);
+        const final = parsed(await manager.get(initial.preparationId));
+        assert.strictEqual(final.status, 'failed'); assert.strictEqual(final.failure, 'workspace_conversion_rejected');
+        await manager.initialize(); assert.strictEqual(state.workspaceUpdates.length, 1);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('conversion rejects work introduced during native probing and never dispatches from receipt reads', async () => {
+    const f = await fixture({ native: true });
+    try {
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const initial = parsed(await manager.prepare());
+        state.folders = [{ uri: state.calls[0][1], name: initial.expectedWindowLabel }];
+        await manager.get(initial.preparationId); assert.strictEqual(state.workspaceUpdates.length, 0);
+        f.deps.probeNative = async () => { state.terminals = [{}]; return true; };
+        await manager.initialize();
+        const final = parsed(await manager.get(initial.preparationId));
+        assert.strictEqual(final.failure, 'terminal_present'); assert.strictEqual(state.workspaceUpdates.length, 0);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('conversion readback requires the exact renamed root in a one-root untitled workspace', async () => {
+    const f = await fixture({ native: true });
+    try {
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const initial = parsed(await manager.prepare());
+        const root = { uri: state.calls[0][1], name: initial.expectedWindowLabel };
+        state.folders = [root]; await manager.initialize();
+        state.workspaceFile = fileUri(path.join(f.temp, 'unrelated.code-workspace'));
+        root.name = state.workspaceUpdates[0][2].name;
+        assert.strictEqual(parsed(await manager.get(initial.preparationId)).environmentReady, false);
+        state.workspaceFile = rawUri('untitled:owned');
+        state.folders.push({ uri: rawUri('colab://unverified/content'), name: 'unexpected' });
+        assert.strictEqual(parsed(await manager.get(initial.preparationId)).environmentReady, false);
+        state.folders = [root]; root.name = 'wrong-name';
+        assert.strictEqual(parsed(await manager.get(initial.preparationId)).environmentReady, false);
+        root.name = state.workspaceUpdates[0][2].name;
+        f.deps.probeNative = async () => { root.name = 'changed-during-probe'; return true; };
+        assert.strictEqual(parsed(await manager.get(initial.preparationId)).environmentReady, false);
+        assert.strictEqual(state.workspaceUpdates.length, 1);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('existing configured workspaces are reused with their actual folder labels', async () => {
+    const f = await fixture({ native: true });
+    try {
+        const folder = path.join(f.temp, 'project'); await fs.mkdir(folder);
+        state.folders = [{ uri: fileUri(await fs.realpath(folder)), name: 'project' }];
+        state.workspaceFile = rawUri('untitled:already-existing');
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.prepare(fileUri(folder).toString()));
+        assert.strictEqual(result.environmentReady, true); assert.strictEqual(result.expectedWindowLabel, 'project');
+        assert.strictEqual(state.workspaceUpdates.length, 0);
     } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
 });
 

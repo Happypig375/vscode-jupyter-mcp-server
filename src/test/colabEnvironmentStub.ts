@@ -48,7 +48,8 @@ export function reset(): void {
         trusted: true, remoteName: undefined, folders: undefined, workspaceFile: undefined,
         notebooks: [], documents: [], visibleNotebooks: [], activeNotebook: undefined,
         terminals: [], visibleEditors: [], activeEditor: undefined, tabs: [], calls: [],
-        configuredPort: 0, confirmBeforeClose: 'never', activeDebugSession: undefined
+        configuredPort: 0, confirmBeforeClose: 'never', activeDebugSession: undefined,
+        workspaceUpdates: [], workspaceUpdateResult: true, onWorkspaceUpdate: undefined
     });
 }
 reset();
@@ -63,6 +64,11 @@ export const workspace = {
     get workspaceFile() { return state.workspaceFile; },
     get notebookDocuments() { return state.notebooks; },
     get textDocuments() { return state.documents; },
+    updateWorkspaceFolders: (start: number, deleteCount: number, ...folders: unknown[]) => {
+        state.workspaceUpdates.push([start, deleteCount, ...folders]);
+        state.onWorkspaceUpdate?.();
+        return state.workspaceUpdateResult;
+    },
     getConfiguration: (section: string) => ({
         get: (_key: string, fallback: unknown) => section === 'window' ? state.confirmBeforeClose : state.configuredPort || fallback
     })

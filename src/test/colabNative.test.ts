@@ -56,7 +56,10 @@ class Fixture implements ColabNativeSession {
 }
 function setup(fixture = new Fixture(), overrides: Partial<ColabNativeTransport> = {}) {
     const transport: ColabNativeTransport = { targets: async () => [TARGET], connect: async () => fixture, ...overrides };
-    const driver = createColabNativeDriverForTest(9222, transport, { pickerMs: 20, pollMs: 1 });
+    // Real Windows timers can consume the old 20 ms budget before three
+    // observations complete under load. Keep timeouts bounded without making
+    // success depend on sub-scheduler timing; production timing is unchanged.
+    const driver = createColabNativeDriverForTest(9222, transport, { pickerMs: 250, pollMs: 1 });
     return { fixture, driver };
 }
 async function rejects(promise: Promise<unknown>, code: DesktopSetupErrorCode) {
