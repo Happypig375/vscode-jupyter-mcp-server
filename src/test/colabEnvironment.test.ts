@@ -108,7 +108,7 @@ function helperHarness(options: {
         main: { pid: 123, executablePath: 'C:\\Code.exe', creationTime: CREATION }, executablePath: 'C:\\Code.exe',
         workspacePath: 'C:\\workspace', userDataDir: 'C:\\user', extensionsDir: 'C:\\extensions', port: 59267 };
     const files = new Map<string, Buffer>([[receiptPath, Buffer.from(JSON.stringify(receipt))]]);
-    const timers: Array<() => void> = []; const launches: Array<{ executable: string; args: string[] }> = [];
+    const timers: Array<() => void> = []; const launches: Array<{ executable: string; args: string[]; options: any }> = [];
     let exits = 0; let inspections = 0; let armed = false; let remainingReadFailures = options.readFailuresAfterArm ?? 0;
     const fakeFs = {
         readFileSync: (file: string) => {
@@ -132,13 +132,15 @@ function helperHarness(options: {
             if (observation === 'changed') return { status: 0, stdout: `C:\\Other.exe\n${CREATION}\n` };
             return observation === 'live' ? { status: 0, stdout: `C:\\Code.exe\n${CREATION}\n` } : { status: 0, stdout: '' };
         },
-        spawn: (executable: string, args: string[]) => {
-            launches.push({ executable, args }); const child: any = new EventEmitter(); child.pid = 777; child.unref = () => undefined;
+        spawn: (executable: string, args: string[], spawnOptions: any) => {
+            launches.push({ executable, args, options: spawnOptions }); const child: any = new EventEmitter(); child.pid = 777; child.unref = () => undefined;
             timers.push(() => child.emit(options.spawnError ? 'error' : 'spawn', options.spawnError ? new Error('no executable') : undefined));
             return child;
         }
     };
-    const fakeProcess: any = { argv: ['node', 'helper', receiptPath, id, token], pid: 456, env: {}, send() { armed = true; }, exit: () => { exits++; } };
+    const fakeProcess: any = { argv: ['node', 'helper', receiptPath, id, token], pid: 456,
+        env: { ELECTRON_RUN_AS_NODE: '1', VSCODE_PID: '123', VSCODE_IPC_HOOK_CLI: 'old-pipe', PATH: 'sentinel-path' },
+        send() { armed = true; }, exit: () => { exits++; } };
     vm.runInNewContext(`(function(){${HELPER_SOURCE_FOR_TEST}\n})()`, {
         require: (name: string) => name === 'fs' ? fakeFs : name === 'child_process' ? fakeCp : require(name),
         process: fakeProcess, Buffer, Date: { now: () => now, parse: Date.parse }, Number,
@@ -457,6 +459,66 @@ test('PowerShell identity query distinguishes a missing process from a CIM failu
     assert.strictEqual(failed.status, 17); assert.notStrictEqual(failed.stderr.trim(), '');
 });
 
+test('an explicit existing folder survives restart preparation without writing into it', async () => {
+    const f = await fixture({ restart: true });
+    const folder = path.join(f.temp, 'user-project'); await fs.mkdir(folder);
+    await fs.writeFile(path.join(folder, 'sentinel.txt'), 'preserve');
+    try {
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.prepare(fileUri(folder).toString()));
+        assert.strictEqual(result.status, 'restart_requested');
+        assert.strictEqual(result.workspaceUri, fileUri(await fs.realpath(folder)).toString());
+        assert.strictEqual(result.expectedWindowLabel, 'user-project');
+        const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${result.preparationId}.json`), 'utf8'));
+        assert.strictEqual(receipt.generatedWorkspace, false); assert.strictEqual(receipt.workspacePath, await fs.realpath(folder));
+        assert.deepStrictEqual(await fs.readdir(folder), ['sentinel.txt']);
+        assert.strictEqual(await fs.readFile(path.join(folder, 'sentinel.txt'), 'utf8'), 'preserve');
+        assert.strictEqual(await f.runScheduledQuit(), true);
+        state.folders = [{ uri: fileUri(await fs.realpath(folder)), name: 'user-project' }];
+        f.deps.probeNative = async () => true;
+        state.trusted = false;
+        const untrusted = parsed(await manager.get(result.preparationId));
+        assert.strictEqual(untrusted.environmentReady, false); assert.strictEqual(untrusted.status, 'workspace_untrusted');
+        state.trusted = true;
+        const ready = parsed(await manager.get(result.preparationId));
+        assert.strictEqual(ready.environmentReady, true); assert.strictEqual(ready.runtimeReady, false);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('a configured native empty window opens only the explicitly requested folder', async () => {
+    const f = await fixture({ native: true });
+    const folder = path.join(f.temp, 'project'); await fs.mkdir(folder);
+    try {
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.prepare(fileUri(folder).toString()));
+        assert.strictEqual(result.status, 'workspace_open_requested');
+        assert.strictEqual(state.calls.length, 1); assert.strictEqual(state.calls[0][0], 'vscode.openFolder');
+        assert.strictEqual(state.calls[0][1].toString(), result.workspaceUri);
+        assert.deepStrictEqual(await fs.readdir(folder), []);
+        const other = path.join(f.temp, 'other'); await fs.mkdir(other);
+        await rejectsCode(() => manager.prepare(fileUri(other).toString()), 'preparation_target_mismatch');
+        assert.strictEqual(state.calls.length, 1);
+        state.folders = [{ uri: fileUri(await fs.realpath(folder)), name: 'project' }];
+        await rejectsCode(() => manager.prepare(fileUri(other).toString()), 'workspace_mismatch');
+        assert.strictEqual(parsed(await manager.prepare(fileUri(folder).toString())).environmentReady, true);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('folder selection rejects remote, malformed, unavailable and non-directory targets before launch', async () => {
+    const f = await fixture({ restart: true });
+    const file = path.join(f.temp, 'file.txt'); await fs.writeFile(file, 'preserve');
+    try {
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        for (const uri of ['https://example.com/', 'colab://server/content', 'file://server/share', 'relative', `${fileUri(f.temp)}?q=1`, `${fileUri(f.temp)}#fragment`]) {
+            await rejectsCode(() => manager.prepare(uri), 'folder_uri_invalid');
+        }
+        await rejectsCode(() => manager.prepare(fileUri(file).toString()), 'folder_not_directory');
+        await rejectsCode(() => manager.prepare(fileUri(path.join(f.temp, 'missing')).toString()), 'folder_unavailable');
+        assert.strictEqual(f.quitCalls, 0); assert.deepStrictEqual(state.calls, []);
+        assert.deepStrictEqual(await fs.readdir(path.join(f.root, 'colab-environment-receipts')), []);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
 test('fixed helper waits for quit approval and exact original exit before acknowledging app launch', async () => {
     const beforeApproval = helperHarness({ approved: false, observations: ['exited'] });
     beforeApproval.runTimer();
@@ -473,6 +535,13 @@ test('fixed helper waits for quit approval and exact original exit before acknow
     assert.strictEqual(approved.receipt.status, 'app_launched'); assert.strictEqual(approved.receipt.launchPid, 777);
     assert.strictEqual(approved.launches[0]!.executable, 'C:\\Code.exe');
     assert.deepStrictEqual(Array.from(approved.launches[0]!.args.slice(-2)), ['--remote-debugging-port=59267', 'C:\\workspace']);
+    assert.strictEqual(approved.launches[0]!.options.windowsHide, false, 'the user-facing editor must be visible');
+    assert.strictEqual(approved.launches[0]!.options.detached, true);
+    assert.strictEqual(approved.launches[0]!.options.env.ELECTRON_RUN_AS_NODE, undefined);
+    assert.strictEqual(approved.launches[0]!.options.env.VSCODE_PID, undefined);
+    assert.strictEqual(approved.launches[0]!.options.env.VSCODE_IPC_HOOK_CLI, undefined);
+    assert.strictEqual(approved.launches[0]!.options.env.PATH, 'sentinel-path');
+    assert.strictEqual(approved.launches[0]!.options.env.JUPYTER_MCP_NATIVE_DEBUG_PORT, '59267');
 
     const failed = helperHarness({ approved: true, observations: ['exited'], spawnError: true });
     failed.runTimer(); failed.runTimer();

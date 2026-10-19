@@ -14,7 +14,7 @@ function fixture(options: {
     listings?: Array<Array<{ choiceId: string; label: string }>>;
 } = {}) {
     reset();
-    const events: string[] = []; const checkedRoots: Array<string | undefined> = []; let released = 0; let checked = 0; let enteredAlias: string; let listing = 0; let nativeBinds = 0;
+    const events: string[] = []; const headerSelections: string[][] = []; const checkedRoots: Array<string | undefined> = []; let released = 0; let checked = 0; let enteredAlias: string; let listing = 0; let nativeBinds = 0;
     let inputs = options.optional ? ['Select a machine shape', 'Select a runtime version', 'Alias your server'] : ['Alias your server'];
     const listed = options.listings ?? [[{ choiceId: 'kernel-python', label: 'Python 3 (ipykernel)' }]];
     const nativeBindingDriver = options.productionBind ? createColabNativeDriverForTest(9222, {
@@ -31,6 +31,7 @@ function fixture(options: {
             events.push('bind');
         },
         choose: async (_headers: readonly string[], labels: readonly string[], signal: AbortSignal) => {
+            headerSelections.push([..._headers]);
             events.push(labels[0]); if (options.failChoice) throw new Error('secret UI content');
             if (options.missingServerAlias && _headers[0] === 'Select a Jupyter Server' && /^m[a-f0-9]{8}$/.test(labels[0])) throw new Error('secret missing alias row');
             if (_headers[0] === 'Select a Jupyter Server' && /^m[a-f0-9]{8}$/.test(labels[0])) enteredAlias = labels[0];
@@ -67,7 +68,7 @@ function fixture(options: {
         check: async (_ref, root) => { checked++; checkedRoots.push(root); assert.strictEqual(_ref, ref); assert.ok(root?.startsWith('colab://')); if (options.checkFails) throw new Error('secret runtime'); return JSON.stringify({ verified: !options.checkFalse, checks: { nonce: true } }); },
         desktop: () => desktop
     };
-    return { deps, events, checkedRoots, get released() { return released; }, get checked() { return checked; }, get nativeBinds() { return nativeBinds; } };
+    return { deps, events, headerSelections, checkedRoots, get released() { return released; }, get checked() { return checked; }, get nativeBinds() { return nativeBinds; } };
 }
 async function waitForActionOrFinish(setupId: string): Promise<any> {
     const deadline = Date.now() + 2_000;
@@ -102,6 +103,15 @@ async function main() {
     await test('optional Standard and Latest stages are handled, never GPU/TPU/upgrade', async () => {
         const f = fixture({ optional: true }); assert.strictEqual((await result(f)).ready, true);
         assert.ok(f.events.includes('Standard')); assert.ok(f.events.includes('Latest')); assert.ok(!f.events.some((s) => /GPU|TPU|Pro/.test(s)));
+    });
+    await test('initial controller suggestions bind the exact notebook label before the source picker', async () => {
+        const f = fixture(); state.relativeNotebookLabel = 'nested/target.ipynb';
+        assert.strictEqual((await result(f, 'm7ae91d89')).ready, true);
+        assert.deepStrictEqual(f.headerSelections[0], process.platform === 'win32'
+            ? ['Select Kernel', "Select kernel for 'nested/target.ipynb'", "Change kernel for 'nested/target.ipynb'", "Select kernel for 'nested\\target.ipynb'", "Change kernel for 'nested\\target.ipynb'"]
+            : ['Select Kernel', "Select kernel for 'nested/target.ipynb'", "Change kernel for 'nested/target.ipynb'"]);
+        assert.deepStrictEqual(f.headerSelections[1], ['Select Kernel', 'Select Another Kernel']);
+        assert.ok(!f.events.includes('Python'), 'a suggested local controller is never selected');
     });
     await test('requested existing alias skips server creation and continues explicit kernel selection', async () => {
         const alias = 'm7ae91d89'; const f = fixture(); state.active = { status: 'idle' };

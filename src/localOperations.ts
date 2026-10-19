@@ -79,7 +79,7 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
         case 'close_colab_terminals':
             return closeColabTerminals(args.inventoryId as string, args.terminalRefs as string[]);
         case 'prepare_colab_environment':
-            return prepareColabEnvironment();
+            return prepareColabEnvironment(args.folderUri as string | undefined);
         case 'get_colab_environment_preparation':
             return getColabEnvironmentPreparation(args.preparationId as string);
         case 'create_notebook':

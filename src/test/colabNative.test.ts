@@ -210,6 +210,27 @@ test('existing server selection allows only one exact MCP alias row', async () =
     mount.fixture.rows = [{ label: alias, description: '', detail: '', disabled: false }];
     assert.equal(await mount.driver.choose(['Mount Server to Workspace'], [alias], SIGNAL), alias);
 });
+test('notebook-specific initial picker selects only the source action and rejects another notebook', async () => {
+    const expected = "Select kernel for 'nested\\target.ipynb'";
+    const headers = ['Select Kernel', expected, "Change kernel for 'nested\\target.ipynb'"];
+    const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
+    fixture.title = ''; fixture.placeholder = expected; fixture.ariaLabel = expected;
+    fixture.rows = [{ label: 'Python', description: '.venv\\Scripts\\python.exe', detail: '', disabled: false }, { label: 'Select Another Kernel...', description: '', detail: '', disabled: false }];
+    assert.equal(await driver.choose(headers, ['Select Another Kernel...', 'Colab'], SIGNAL), 'Select Another Kernel...');
+    assert.deepEqual(fixture.writes, ['Select Another Kernel...']); assert.equal(fixture.submits, 1);
+    const other = setup(); await other.driver.bind(MARKER, SIGNAL);
+    other.fixture.title = ''; other.fixture.placeholder = "Select kernel for 'other.ipynb'"; other.fixture.ariaLabel = other.fixture.placeholder;
+    other.fixture.rows = fixture.rows;
+    await rejects(other.driver.choose(headers, ['Select Another Kernel...', 'Colab'], SIGNAL), 'picker_timeout');
+    assert.deepEqual(other.fixture.writes, []); assert.equal(other.fixture.submits, 0);
+});
+test('source picker after controller suggestions accepts the installed Select Another Kernel title', async () => {
+    const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
+    fixture.title = 'Select Another Kernel'; fixture.placeholder = 'Type to choose a kernel source'; fixture.ariaLabel = fixture.placeholder;
+    fixture.rows = [{ label: 'Colab', description: '', detail: '', disabled: false }];
+    assert.equal(await driver.choose(['Select Kernel', 'Select Another Kernel'], ['Colab'], SIGNAL), 'Colab');
+    assert.deepEqual(fixture.writes, ['Colab']); assert.equal(fixture.submits, 1);
+});
 test('cancelled listing/selection and disposed driver never act', async () => {
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL); const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL);
     const abort = new AbortController(); abort.abort();

@@ -32,13 +32,14 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         return { content: [{ type: 'text' as const, text }] };
     });
     server.registerTool('prepare_colab_environment', {
-        description: 'Prepare a local VS Code desktop window for native Colab setup before opening a notebook. Reuse a verified native connection; an empty window gets an isolated local workspace. On the supported default Windows installation, a missing connection can trigger a tracked normal app restart from one clean empty window, preserving normal quit vetoes. This prepares only the desktop environment, never a kernel. Follow the receipt, list_notebooks, and existing open_notebooks/create_notebook tools, then configure_kernel. No arbitrary launch arguments, scripts, forced shutdown, or sign-in bypass.',
+        description: 'Prepare a local VS Code desktop window for native Colab setup before opening a notebook. In an empty window, supply folderUri for the notebook\'s existing project folder; a folder already trusted by the user can retain normal trust without prompting. Otherwise an isolated folder is generated and may require user trust before extensions start. On the supported default Windows installation, a missing native connection can trigger a tracked normal app restart from one clean empty window, preserving normal quit vetoes. This prepares only the desktop environment, never a kernel. Follow the receipt and existing notebook open/create tools, then configure_kernel. No arbitrary launch arguments, scripts, forced shutdown, trust changes or sign-in bypass.',
         inputSchema: jsonSchemaToZod({ type: 'object', properties: {
-            windowId: { type: 'string', description: 'Optional destination windowId from list_notebooks.' }
+            windowId: { type: 'string', description: 'Optional destination windowId from list_notebooks.' },
+            folderUri: { type: 'string', description: 'Optional file URI of an existing local project folder, normally the notebook\'s folder. No files or trust settings in that folder are changed. Used from an empty window; an existing workspace must match exactly.' }
         } })
     }, async (args) => {
-        const a = (args ?? {}) as { windowId?: string };
-        const text = await router.invokeWindow('prepare_colab_environment', {}, a.windowId);
+        const a = (args ?? {}) as { windowId?: string; folderUri?: string };
+        const text = await router.invokeWindow('prepare_colab_environment', { folderUri: a.folderUri }, a.windowId);
         return { content: [{ type: 'text' as const, text }] };
     });
     server.registerTool('get_colab_environment_preparation', {

@@ -205,7 +205,7 @@ async function main() {
     });
 
     await check('desktop preparation schemas reject notebook refs, launch flags and scripts', async () => {
-        for (const arguments_ of [{ notebookRef: 'file:///C:/x.ipynb' }, { args: ['--unsafe'] }, { script: 'x' }]) {
+        for (const arguments_ of [{ notebookRef: 'file:///C:/x.ipynb' }, { args: ['--unsafe'] }, { script: 'x' }, { folderUri: 42 }]) {
             const response = await client.callTool({ name: 'prepare_colab_environment', arguments: arguments_ });
             assert.ok(response.isError);
         }
@@ -225,6 +225,13 @@ async function main() {
         assert.match(malformed.content[0].text, /preparationId is malformed/);
         const wrongWindow = await client.callTool({ name: 'prepare_colab_environment', arguments: { windowId: 'absent-window' } });
         assert.ok(wrongWindow.isError);
+        const originalTrust = vscodeShim.workspace.isTrusted;
+        vscodeShim.workspace.isTrusted = true;
+        try {
+            const folder = await client.callTool({ name: 'prepare_colab_environment', arguments: { windowId: listing[0].windowId, folderUri: 'https://example.com/' } });
+            assert.ok(folder.isError);
+            assert.match(folder.content[0].text, /absolute local file URI/);
+        } finally { vscodeShim.workspace.isTrusted = originalTrust; }
     });
 
     // 2. create_notebook in an empty window -> untitled.

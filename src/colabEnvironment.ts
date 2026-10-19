@@ -106,9 +106,9 @@ export async function initializeColabEnvironment(context: vscode.ExtensionContex
 }
 
 /** Prepare this local VS Code window for bounded native Colab UI automation. */
-export async function prepareColabEnvironment(): Promise<string> {
+export async function prepareColabEnvironment(folderUri?: string): Promise<string> {
     if (!manager) throw new ColabEnvironmentError('environment_not_initialized', 'Colab environment preparation is not initialized in this VS Code window.');
-    return manager.prepare();
+    return manager.prepare(folderUri);
 }
 
 /** Read one durable preparation, proving this exact workspace before readiness. */
@@ -118,10 +118,10 @@ export async function getColabEnvironmentPreparation(preparationId: string): Pro
 }
 
 export function createColabEnvironmentForTest(context: ColabEnvironmentContextForTest, dependencies: ColabEnvironmentDependenciesForTest): {
-    initialize(): Promise<void>; prepare(): Promise<string>; get(id: string): Promise<string>;
+    initialize(): Promise<void>; prepare(folderUri?: string): Promise<string>; get(id: string): Promise<string>;
 } {
     const instance = new ColabEnvironmentManager(context, dependencies);
-    return { initialize: () => instance.initialize(), prepare: () => instance.prepare(), get: id => instance.get(id) };
+    return { initialize: () => instance.initialize(), prepare: folderUri => instance.prepare(folderUri), get: id => instance.get(id) };
 }
 
 class ColabEnvironmentManager {
@@ -162,20 +162,24 @@ class ColabEnvironmentManager {
         await this.reconcile(receipt);
     }
 
-    async prepare(): Promise<string> {
+    async prepare(folderUri?: string): Promise<string> {
         this.assertLocalHost();
+        const requestedFolder = folderUri === undefined ? undefined : await resolveRequestedFolder(folderUri);
         const currentPort = await this.findWorkingPort();
         if (currentPort) {
             const current = currentWorkspaceIdentity();
             if (current) {
+                if (requestedFolder && requestedFolder.uri !== current.uri) {
+                    throw new ColabEnvironmentError('workspace_mismatch', 'The requested folder is not this window\'s current workspace. Use an empty window or omit folderUri to prepare the current workspace.');
+                }
                 const receipt = await this.newReceipt(current, currentPort, false, 'environment_ready');
                 receipt.readyAt = this.deps.now();
                 await this.writeReceipt(receipt);
                 return this.present(receipt, true);
             }
             const active = await this.obtainActive();
-            if (active) return this.present(await this.requireReceipt(active));
-            const receipt = await this.createBootstrapReceipt(currentPort, 'workspace_open_requested');
+            if (active) return this.presentMatchingActive(await this.requireReceipt(active), requestedFolder);
+            const receipt = await this.createBootstrapReceipt(currentPort, 'workspace_open_requested', undefined, requestedFolder);
             try {
                 await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.parse(receipt.workspaceUri), {
                     forceNewWindow: true, forceLocalWindow: true, noRecentEntry: true
@@ -183,7 +187,7 @@ class ColabEnvironmentManager {
                 return this.present(receipt);
             } catch (error) {
                 await this.fail(receipt, 'workspace_open_failed');
-                throw new ColabEnvironmentError('workspace_open_failed', `VS Code could not open the isolated Colab workspace: ${safeError(error)}`);
+                throw new ColabEnvironmentError('workspace_open_failed', `VS Code could not open the Colab workspace: ${safeError(error)}`);
             }
         }
 
@@ -209,7 +213,7 @@ class ColabEnvironmentManager {
             throw new ColabEnvironmentError('main_process_unverified', 'The VS Code main process could not be identified exactly.');
         }
         const active = await this.obtainActive();
-        if (active) return this.present(await this.requireReceipt(active));
+        if (active) return this.presentMatchingActive(await this.requireReceipt(active), requestedFolder);
         const configuredPort = vscode.workspace.getConfiguration('jupyterMcp').get<number>('nativeDebugPort', 0) ?? 0;
         if (configuredPort !== 0 && !validPort(configuredPort)) throw new ColabEnvironmentError('native_port_invalid', 'The configured native debugging port is invalid.');
         const port = await this.deps.reservePort(configuredPort || undefined);
@@ -220,7 +224,7 @@ class ColabEnvironmentManager {
             userDataDir: install.userDataDir,
             extensionsDir: install.extensionsDir,
             helperToken: this.deps.uuid()
-        });
+        }, requestedFolder);
         const helperPath = path.join(this.root, HELPER);
         await fs.writeFile(helperPath, HELPER_SOURCE, { encoding: 'utf8' });
         try {
@@ -287,6 +291,7 @@ class ColabEnvironmentManager {
         }
         const current = currentWorkspaceIdentity();
         if (!current || current.uri !== receipt.workspaceUri) return false;
+        if (!vscode.workspace.isTrusted) return false;
         if (receipt.generatedWorkspace && !await this.verifyFolderMarker(receipt)) return false;
         if (!await this.deps.probeNative(receipt.port)) return false;
         if (receipt.status !== 'environment_ready') {
@@ -299,18 +304,19 @@ class ColabEnvironmentManager {
     private async createBootstrapReceipt(
         port: number,
         status: PreparationStatus,
-        restart?: Pick<Receipt, 'installedCommit' | 'main' | 'executablePath' | 'userDataDir' | 'extensionsDir' | 'helperToken'>
+        restart?: Pick<Receipt, 'installedCommit' | 'main' | 'executablePath' | 'userDataDir' | 'extensionsDir' | 'helperToken'>,
+        requestedFolder?: { uri: string; label: string; path: string }
     ): Promise<Receipt> {
         const preparationId = this.deps.uuid();
         await this.claimActive(preparationId);
         try {
-            const expectedWindowLabel = `colab-bootstrap-${preparationId.slice(0, 8)}`;
-            const workspacePath = path.join(this.workspaceRoot, expectedWindowLabel);
-            await fs.mkdir(workspacePath, { recursive: false });
+            const expectedWindowLabel = requestedFolder?.label ?? `colab-bootstrap-${preparationId.slice(0, 8)}`;
+            const workspacePath = requestedFolder?.path ?? path.join(this.workspaceRoot, expectedWindowLabel);
+            if (!requestedFolder) await fs.mkdir(workspacePath, { recursive: false });
             const identity = { uri: vscode.Uri.file(workspacePath).toString(), label: expectedWindowLabel };
-            const receipt = await this.newReceipt(identity, port, true, status, preparationId, workspacePath);
+            const receipt = await this.newReceipt(identity, port, !requestedFolder, status, preparationId, workspacePath);
             if (restart) Object.assign(receipt, restart);
-            await writeJsonAtomic(path.join(workspacePath, FOLDER_MARKER), { schema: SCHEMA, preparationId, nonce: receipt.nonce });
+            if (!requestedFolder) await writeJsonAtomic(path.join(workspacePath, FOLDER_MARKER), { schema: SCHEMA, preparationId, nonce: receipt.nonce });
             await this.writeReceipt(receipt);
             return receipt;
         } catch (error) {
@@ -349,11 +355,18 @@ class ColabEnvironmentManager {
         return !!value && value.schema === SCHEMA && value.preparationId === receipt.preparationId && value.nonce === receipt.nonce;
     }
 
+    private presentMatchingActive(receipt: Receipt, requestedFolder?: { uri: string }): string {
+        if (requestedFolder && requestedFolder.uri !== receipt.workspaceUri) {
+            throw new ColabEnvironmentError('preparation_target_mismatch', 'A preparation for a different workspace is already active. Follow its existing receipt.');
+        }
+        return this.present(receipt);
+    }
+
     private present(receipt: Receipt, freshNativeBind = false): string {
         const current = currentWorkspaceIdentity();
         const exactWindow = current?.uri === receipt.workspaceUri;
-        const ready = receipt.status === 'environment_ready' && exactWindow && freshNativeBind;
-        const status = receipt.status === 'environment_ready'
+        const ready = receipt.status === 'environment_ready' && exactWindow && vscode.workspace.isTrusted && freshNativeBind;
+        const status = receipt.status !== 'failed' && exactWindow && !vscode.workspace.isTrusted ? 'workspace_untrusted' : receipt.status === 'environment_ready'
             ? !exactWindow ? 'workspace_mismatch' : !freshNativeBind ? 'native_binding_unavailable' : 'environment_ready'
             : receipt.status;
         const next = ready
@@ -513,6 +526,33 @@ function resolveLocalGlobalStoragePath(
         throw new ColabEnvironmentError('local_storage_required', 'The VS Code user-data URI does not map to this extension in the default local profile.');
     }
     return path.win32.resolve(storagePath);
+}
+
+async function resolveRequestedFolder(value: string): Promise<{ uri: string; label: string; path: string }> {
+    if (typeof value !== 'string' || value.length > 4096 || !value.startsWith('file:///')) {
+        throw new ColabEnvironmentError('folder_uri_invalid', 'folderUri must be an absolute local file URI.');
+    }
+    let uri: vscode.Uri;
+    try { uri = vscode.Uri.parse(value, true); }
+    catch { throw new ColabEnvironmentError('folder_uri_invalid', 'folderUri is malformed.'); }
+    if (uri.scheme !== 'file' || uri.authority || uri.query || uri.fragment || !path.isAbsolute(uri.fsPath) ||
+        uri.fsPath.includes('\0') || (process.platform === 'win32' && uri.fsPath.startsWith('\\\\'))) {
+        throw new ColabEnvironmentError('folder_uri_invalid', 'folderUri must identify one local folder without an authority, query or fragment.');
+    }
+    let folderPath: string;
+    try {
+        folderPath = await fs.realpath(uri.fsPath);
+        if (process.platform === 'win32' && folderPath.startsWith('\\\\')) {
+            throw new ColabEnvironmentError('folder_uri_invalid', 'folderUri must resolve to a local directory, not a network share.');
+        }
+        if (!await fs.stat(folderPath).then(stat => stat.isDirectory())) {
+            throw new ColabEnvironmentError('folder_not_directory', 'folderUri must identify an existing directory.');
+        }
+    } catch (error) {
+        if (error instanceof ColabEnvironmentError) throw error;
+        throw new ColabEnvironmentError('folder_unavailable', 'The requested local folder is unavailable.');
+    }
+    return { uri: vscode.Uri.file(folderPath).toString(), label: path.basename(folderPath) || folderPath, path: folderPath };
 }
 
 async function assertCleanEmptyWindow(): Promise<void> {
@@ -759,7 +799,7 @@ function same(a,b){return path.resolve(a).toLowerCase()===path.resolve(b).toLowe
 let r;try{r=read();if(r.schema!==1||r.preparationId!==id||r.helperToken!==token||r.status!=='arming_restart'||!r.main||Date.now()>r.deadline||typeof r.workspacePath!=='string'||typeof r.userDataDir!=='string'||typeof r.extensionsDir!=='string'||typeof r.executablePath!=='string'||!same(r.executablePath,r.main.executablePath))throw Error('receipt mismatch');r.status='restart_requested';r.helperArmedAt=Date.now();write(r);if(process.send)process.send({type:'armed',preparationId:id,token});}catch{fail('helper_receipt_invalid');}
 function retry(){if(Date.now()>r.deadline)return fail('quit_not_confirmed');return setTimeout(poll,250);}
 function recordLaunch(child){if(Date.now()>r.deadline)return fail('app_launch_receipt_timeout');let latest;try{latest=read();}catch{return setTimeout(()=>recordLaunch(child),250);}if(latest.preparationId!==id||latest.helperToken!==token||latest.status!=='restart_requested')return process.exit(0);latest.status='app_launched';latest.launchedAt=Date.now();latest.launchPid=child.pid;try{write(latest);setTimeout(()=>process.exit(0),50);}catch{setTimeout(()=>recordLaunch(child),250);}}
-function poll(){let latest;try{latest=read();}catch{return retry();}r=latest;if(r.preparationId!==id||r.helperToken!==token||r.status!=='restart_requested')return;if(Date.now()>r.deadline)return fail('quit_not_confirmed');if(!Number.isSafeInteger(r.quitDispatchApprovedAt))return setTimeout(poll,250);const expectedDeadline=r.deadline,expectedApproval=r.quitDispatchApprovedAt;let p;try{p=inspect(r);}catch{return retry();}if(p){if(!same(p.executablePath,r.main.executablePath)||p.creationTime!==r.main.creationTime)return fail('main_process_identity_changed');return setTimeout(poll,250);}let confirmed;try{confirmed=read();}catch{return retry();}if(confirmed.preparationId!==id||confirmed.helperToken!==token||confirmed.status!=='restart_requested')return;if(confirmed.deadline!==expectedDeadline||confirmed.quitDispatchApprovedAt!==expectedApproval)return;if(Date.now()>confirmed.deadline){r=confirmed;return fail('quit_not_confirmed');}r=confirmed;const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;for(const k of Object.keys(env))if(k.startsWith('VSCODE_'))delete env[k];env.JUPYTER_MCP_NATIVE_DEBUG_PORT=String(r.port);const args=['--new-window','--user-data-dir',r.userDataDir,'--extensions-dir',r.extensionsDir,'--remote-debugging-port='+r.port,r.workspacePath];let child;try{child=cp.spawn(r.executablePath,args,{detached:true,windowsHide:true,stdio:'ignore',env,cwd:path.dirname(r.executablePath)});}catch{return fail('app_launch_failed');}let settled=false;child.once('error',()=>{if(settled)return;settled=true;fail('app_launch_failed');});child.once('spawn',()=>{if(settled)return;settled=true;child.unref();recordLaunch(child);});}
+function poll(){let latest;try{latest=read();}catch{return retry();}r=latest;if(r.preparationId!==id||r.helperToken!==token||r.status!=='restart_requested')return;if(Date.now()>r.deadline)return fail('quit_not_confirmed');if(!Number.isSafeInteger(r.quitDispatchApprovedAt))return setTimeout(poll,250);const expectedDeadline=r.deadline,expectedApproval=r.quitDispatchApprovedAt;let p;try{p=inspect(r);}catch{return retry();}if(p){if(!same(p.executablePath,r.main.executablePath)||p.creationTime!==r.main.creationTime)return fail('main_process_identity_changed');return setTimeout(poll,250);}let confirmed;try{confirmed=read();}catch{return retry();}if(confirmed.preparationId!==id||confirmed.helperToken!==token||confirmed.status!=='restart_requested')return;if(confirmed.deadline!==expectedDeadline||confirmed.quitDispatchApprovedAt!==expectedApproval)return;if(Date.now()>confirmed.deadline){r=confirmed;return fail('quit_not_confirmed');}r=confirmed;const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;for(const k of Object.keys(env))if(k.startsWith('VSCODE_'))delete env[k];env.JUPYTER_MCP_NATIVE_DEBUG_PORT=String(r.port);const args=['--new-window','--user-data-dir',r.userDataDir,'--extensions-dir',r.extensionsDir,'--remote-debugging-port='+r.port,r.workspacePath];let child;try{child=cp.spawn(r.executablePath,args,{detached:true,windowsHide:false,stdio:'ignore',env,cwd:path.dirname(r.executablePath)});}catch{return fail('app_launch_failed');}let settled=false;child.once('error',()=>{if(settled)return;settled=true;fail('app_launch_failed');});child.once('spawn',()=>{if(settled)return;settled=true;child.unref();recordLaunch(child);});}
 setTimeout(poll,250);`;
 
 const HELPER_SOURCE = HELPER_SOURCE_FOR_TEST;

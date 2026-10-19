@@ -439,8 +439,16 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
                 throw error;
             } finally { signal.removeEventListener('abort', abortStep); }
         };
-        const first = await picker((stepSignal) => driver!.choose(['Select Kernel'], ['Select Another Kernel...', 'Colab'], stepSignal));
-        if (first !== 'Colab') await picker((stepSignal) => driver!.choose(['Select Kernel'], ['Colab'], stepSignal));
+        // VS Code first shows notebook-specific suggestions when controllers are
+        // already available. Match this exact target's relative label, never a
+        // generic "Select kernel for" prefix or an inferred default controller.
+        const relativeLabel = vscode.workspace.asRelativePath(originalNotebook.uri);
+        // The public API returns slash-separated relative paths; the Windows
+        // workbench's file label uses backslashes. Both are exact target labels.
+        const notebookLabels = [...new Set([relativeLabel, relativeLabel.split('/').join(path.sep)])];
+        const initialHeaders = ['Select Kernel', ...notebookLabels.flatMap(label => [`Select kernel for '${label}'`, `Change kernel for '${label}'`])];
+        const first = await picker((stepSignal) => driver!.choose(initialHeaders, ['Select Another Kernel...', 'Colab'], stepSignal));
+        if (first !== 'Colab') await picker((stepSignal) => driver!.choose(['Select Kernel', 'Select Another Kernel'], ['Colab'], stepSignal));
         let alias: string;
         if (requestedAlias) {
             alias = requestedAlias;
