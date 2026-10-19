@@ -10,7 +10,7 @@ const ref = 'file:///test.ipynb';
 function fixture(options: {
     optional?: boolean; checkFails?: boolean; checkFalse?: boolean; failChoice?: boolean; close?: boolean;
     omitListing?: boolean; listFails?: boolean; listDelay?: boolean; selectDelay?: boolean; providerDelay?: boolean;
-    productionBind?: boolean;
+    productionBind?: boolean; missingServerAlias?: boolean;
     listings?: Array<Array<{ choiceId: string; label: string }>>;
 } = {}) {
     reset();
@@ -20,7 +20,7 @@ function fixture(options: {
     const nativeBindingDriver = options.productionBind ? createColabNativeDriverForTest(9222, {
         targets: async () => [{ id: 'owner', type: 'page', url: 'vscode-file://vscode-app/workbench/workbench.html', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/owner' }],
         connect: async () => ({
-            evaluate: async () => { nativeBinds++; return { driver: true, markers: 1, widgets: 0, inputCount: 0, title: '', placeholder: '', ariaLabel: '', value: '', active: false, incomplete: false, rows: [] }; },
+            evaluate: async () => { nativeBinds++; return { dom: true, markers: 1, widgets: 0, inputCount: 0, title: '', placeholder: '', ariaLabel: '', value: '', active: false, incomplete: false, rows: [] }; },
             dispose() {}
         })
     }) : undefined;
@@ -32,12 +32,16 @@ function fixture(options: {
         },
         choose: async (_headers: readonly string[], labels: readonly string[], signal: AbortSignal) => {
             events.push(labels[0]); if (options.failChoice) throw new Error('secret UI content');
+            if (options.missingServerAlias && _headers[0] === 'Select a Jupyter Server' && /^m[a-f0-9]{8}$/.test(labels[0])) throw new Error('secret missing alias row');
+            if (_headers[0] === 'Select a Jupyter Server' && /^m[a-f0-9]{8}$/.test(labels[0])) enteredAlias = labels[0];
             if (options.close) state.notebook.isClosed = true;
             if (options.providerDelay) await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => {
                 events.push('provider-aborted'); reject(new Error('private pending picker'));
             }, { once: true }));
             if (_headers.includes('Mount Server to Workspace') && state.mountMode !== 'noRoot') {
-                state.folders.push({ name: labels[0], uri: uri('colab://test-server/content') });
+                if (!state.folders.some((folder: any) => folder.name === labels[0] && folder.uri.scheme === 'colab')) {
+                    state.folders.push({ name: labels[0], uri: uri('colab://test-server/content') });
+                }
                 if (state.mountMode === 'ambiguous') state.folders.push({ name: 'Other', uri: uri('colab://other-server/content') });
             }
             return labels[0] === 'Select Another Kernel...' ? 'Select Another Kernel...' : labels[0];
@@ -74,12 +78,12 @@ async function waitForActionOrFinish(setupId: string): Promise<any> {
     }
     throw new Error('setup did not reach an action or terminal state');
 }
-async function start(f: ReturnType<typeof fixture>): Promise<any> {
-    const initial = JSON.parse(await configureColab(ref, { waitMs: 0 }, f.deps));
+async function start(f: ReturnType<typeof fixture>, serverAlias?: string): Promise<any> {
+    const initial = JSON.parse(await configureColab(ref, { waitMs: 0, serverAlias }, f.deps));
     return waitForActionOrFinish(initial.setupId);
 }
-async function result(f: ReturnType<typeof fixture>): Promise<any> {
-    const pending = await start(f);
+async function result(f: ReturnType<typeof fixture>, serverAlias?: string): Promise<any> {
+    const pending = await start(f, serverAlias);
     if (pending.stage === 'finished') return pending;
     const listed = JSON.parse(await listColabSetupKernels(ref, pending.setupId));
     return JSON.parse(await selectColabSetupKernel(ref, pending.setupId, listed.choices[0].choiceId, 1000));
@@ -98,6 +102,47 @@ async function main() {
     await test('optional Standard and Latest stages are handled, never GPU/TPU/upgrade', async () => {
         const f = fixture({ optional: true }); assert.strictEqual((await result(f)).ready, true);
         assert.ok(f.events.includes('Standard')); assert.ok(f.events.includes('Latest')); assert.ok(!f.events.some((s) => /GPU|TPU|Pro/.test(s)));
+    });
+    await test('requested existing alias skips server creation and continues explicit kernel selection', async () => {
+        const alias = 'm7ae91d89'; const f = fixture(); state.active = { status: 'idle' };
+        state.folders.push({ name: 'stale', uri: uri('colab://stale/content') });
+        const r = await result(f, alias);
+        assert.strictEqual(r.ready, true); assert.strictEqual(r.serverAlias, alias); assert.strictEqual(r.serverMayRemain, false);
+        assert.deepStrictEqual(f.events, ['lease', 'bind', 'Select Another Kernel...', 'Colab', alias, 'list', 'chosen:kernel-python', alias, 'dispose']);
+        assert.ok(!f.events.some((event) => ['New Colab Server', 'CPU', 'Standard', 'Latest', 'alias'].includes(event)));
+        assert.ok(state.calls.some((call: any) => call[0] === 'notebook.cell.execute'));
+        assert.ok(state.calls.some((call: any) => call[0] === 'colab.mountServer'));
+    });
+    await test('requested alias reuses only its unique mounted root with fresh verification', async () => {
+        const alias = 'm7ae91d89'; const f = fixture(); state.active = { status: 'idle' };
+        state.folders.push({ name: alias, uri: uri('colab://matching/content') }, { name: 'stale', uri: uri('colab://stale/content') });
+        const r = await result(f, alias);
+        assert.strictEqual(r.ready, true); assert.strictEqual(r.serverAlias, alias);
+        assert.deepStrictEqual(f.checkedRoots, ['colab://matching/']); assert.deepStrictEqual(f.events, []); assert.deepStrictEqual(state.calls, []);
+    });
+    await test('requested alias can rediscover its kernel while reusing an existing exact mount', async () => {
+        const alias = 'm7ae91d89'; const f = fixture();
+        state.folders.push({ name: alias, uri: uri('colab://matching/content') });
+        const r = await result(f, alias);
+        assert.strictEqual(r.ready, true); assert.deepStrictEqual(f.checkedRoots, ['colab://matching/']);
+        assert.deepStrictEqual(f.events, ['lease', 'bind', 'Select Another Kernel...', 'Colab', alias, 'list', 'chosen:kernel-python', alias, 'dispose']);
+        assert.ok(state.calls.some((call: any) => call[0] === 'notebook.cell.execute'));
+        assert.ok(state.calls.some((call: any) => call[0] === 'colab.mountServer'));
+    });
+    await test('invalid requested aliases fail before setup or UI', async () => {
+        const f = fixture();
+        for (const alias of ['', 'Colab CPU', 'mABCDEF12', 'm1234567', 'm123456789', 'm1234567g']) {
+            await assert.rejects(() => configureColab(ref, { serverAlias: alias }, f.deps), /serverAlias/);
+        }
+        assert.deepStrictEqual(f.events, []); assert.deepStrictEqual(state.calls, []); assert.strictEqual(f.checked, 0);
+    });
+    await test('missing requested alias fails without creating a fallback server', async () => {
+        const alias = 'm7ae91d89'; const f = fixture({ missingServerAlias: true });
+        const r = await result(f, alias);
+        assert.strictEqual(r.ready, false); assert.strictEqual(r.serverAlias, alias); assert.strictEqual(r.code, 'setup_failed');
+        assert.deepStrictEqual(f.events, ['lease', 'bind', 'Select Another Kernel...', 'Colab', alias, 'dispose']);
+        assert.ok(!f.events.some((event) => ['New Colab Server', 'CPU', 'Standard', 'Latest', 'alias'].includes(event)));
+        assert.ok(!state.calls.some((call: any) => ['notebook.cell.execute', 'colab.mountServer'].includes(call[0])));
     });
     await test('verified existing runtime is reused without UI, startup or a new server', async () => {
         const f = fixture(); state.active = { status: 'idle' }; state.folders.push({ uri: uri('colab://existing/content') });

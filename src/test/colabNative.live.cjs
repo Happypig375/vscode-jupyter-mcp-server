@@ -11,7 +11,7 @@ const [code, evidenceArg] = process.argv.slice(2);
 if (!code || !path.isAbsolute(code) || !evidenceArg || !path.isAbsolute(evidenceArg)) throw new Error('Explicit absolute executable and new evidence directory required.');
 const evidence = path.resolve(evidenceArg);
 const marker = 'MCP Colab setup ' + crypto.randomUUID();
-const receipt = { startedAt: new Date().toISOString(), orcaUsed: false, realColabUsed: false, marker };
+const receipt = { startedAt: new Date().toISOString(), orcaUsed: false, realColabUsed: false, smokeDriverFlag: false, marker };
 let child, control, driver;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(fn, label, timeout = 40000) {
@@ -48,7 +48,7 @@ exports.activate=async context=>{
 };`);
     const bundle=path.join(evidence,'native-driver.cjs');
     await esbuild.build({entryPoints:[path.join(__dirname,'..','colabNative.ts')],outfile:bundle,bundle:true,platform:'node',target:'node20',format:'cjs'});
-    child=spawn(code,[`--user-data-dir=${profile}`,`--extensions-dir=${extensions}`,`--extensionDevelopmentPath=${fixture}`,'--enable-smoke-test-driver','--remote-debugging-port=0','--skip-welcome','--skip-release-notes','--disable-telemetry','--new-window'],{windowsHide:true,stdio:['ignore','pipe','pipe']});
+    child=spawn(code,[`--user-data-dir=${profile}`,`--extensions-dir=${extensions}`,`--extensionDevelopmentPath=${fixture}`,'--remote-debugging-port=0','--skip-welcome','--skip-release-notes','--disable-telemetry','--new-window'],{windowsHide:true,stdio:['ignore','pipe','pipe']});
     receipt.pid=child.pid; let logs='';
     for(const stream of [child.stdout,child.stderr])stream.on('data',chunk=>{if(logs.length<200000)logs+=chunk.toString();});
     const port=await until(async()=>{try{const v=(await fs.readFile(path.join(profile,'DevToolsActivePort'),'utf8')).split('\n')[0];if(/^\d+$/.test(v))return Number(v);}catch{}const m=logs.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//);return m?Number(m[1]):false;},'no fixture debug port');
@@ -56,7 +56,10 @@ exports.activate=async context=>{
     const target=await until(async()=>{try{const list=await fetch(`http://127.0.0.1:${port}/json/list`).then(r=>r.json());return list.find(t=>t.type==='page'&&/workbench(?:\.html)?/.test(t.url));}catch{return false;}},'no fixture workbench');
     if(!target.webSocketDebuggerUrl.startsWith(`ws://127.0.0.1:${port}/`))throw new Error('unexpected fixture endpoint');
     control=await connect(target.webSocketDebuggerUrl);
-    await until(async()=>{const r=await control.command('Runtime.evaluate',{expression:`typeof window.driver?.getElements === 'function' && [...document.querySelectorAll('.statusbar-item-label')].some(e=>e.textContent.trim()===${JSON.stringify(marker)})`,returnByValue:true});return r.result?.value===true;},'fixture marker not ready');
+    const smokeProbe=await control.command('Runtime.evaluate',{expression:'typeof window.driver',returnByValue:true});
+    receipt.windowDriverType=smokeProbe.result?.value;
+    if(receipt.windowDriverType!=='undefined')throw new Error('fixture unexpectedly exposes the smoke driver');
+    await until(async()=>{const r=await control.command('Runtime.evaluate',{expression:`[...document.querySelectorAll('.statusbar-item-label')].some(e=>e.textContent.trim()===${JSON.stringify(marker)})`,returnByValue:true});return r.result?.value===true;},'fixture marker not ready');
     const {createColabNativeDriver}=require(bundle); driver=createColabNativeDriver(port); const signal=new AbortController().signal;
     await driver.bind(marker,signal);
     await driver.choose(['Select Kernel'],['Colab'],signal);

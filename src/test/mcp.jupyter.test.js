@@ -744,7 +744,12 @@ async function main() {
 
     await check('Colab tool schemas and absent filesystem reject before side effects', async () => {
         const starts = startedKernels.length, picks = pickerCalls.length, runs = executionCalls.length;
-        for (const args of [{ runtime: 'local' }, { runtime: 'colab', start: true }]) {
+        for (const args of [
+            { runtime: 'local' },
+            { runtime: 'generic', serverAlias: 'm0123abcd' },
+            { runtime: 'colab', serverAlias: 'user-server' },
+            { runtime: 'colab', start: true }
+        ]) {
             const res = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb', ...args } });
             assert.ok(res.isError);
         }
@@ -770,6 +775,14 @@ async function main() {
         assert.strictEqual(mount.operation, 'mount_colab_server');
         assert.strictEqual(mount.serverAlias, 'm0123abcd');
         assert.strictEqual(mount.status, 'failed'); assert.strictEqual(mount.code, 'workspace_untrusted');
+        assert.deepStrictEqual([startedKernels.length, pickerCalls.length, executionCalls.length], [starts, picks, runs]);
+
+        res = await client.callTool({ name: 'configure_kernel', arguments: {
+            notebookRef: 'file:///C:/inactive.ipynb', runtime: 'colab', serverAlias: 'm0123abcd', waitMs: 1000
+        } });
+        const reuse = JSON.parse(res.content[0].text);
+        assert.strictEqual(reuse.operation, 'configure_kernel'); assert.strictEqual(reuse.serverAlias, 'm0123abcd');
+        assert.strictEqual(reuse.status, 'failed'); assert.strictEqual(reuse.code, 'workspace_untrusted');
         assert.deepStrictEqual([startedKernels.length, pickerCalls.length, executionCalls.length], [starts, picks, runs]);
     });
 

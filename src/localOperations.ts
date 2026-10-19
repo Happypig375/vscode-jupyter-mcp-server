@@ -79,8 +79,8 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
         case 'get_kernel_info':
             return getKernelInfo(notebookRef(args));
         case 'configure_kernel':
-            if (args.runtime === 'colab') return configureColab(notebookRef(args), { waitMs: args.waitMs as number | undefined });
-            if (args.waitMs !== undefined) throw new Error('waitMs is supported only for runtime colab.');
+            if (args.runtime === 'colab') return configureColab(notebookRef(args), { waitMs: args.waitMs as number | undefined, serverAlias: args.serverAlias as string | undefined });
+            if (args.waitMs !== undefined || args.serverAlias !== undefined) throw new Error('waitMs and serverAlias are supported only for runtime colab.');
             return configureKernel(notebookRef(args), args.runtime as 'generic' | 'colab' | undefined);
         case 'mount_colab_server':
             return mountColabServer(notebookRef(args), args.serverAlias as string, { waitMs: args.waitMs as number | undefined });

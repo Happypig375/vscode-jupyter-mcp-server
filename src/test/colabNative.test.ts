@@ -9,18 +9,24 @@ const KERNEL_HEADER = 'Select a Kernel from m12345678';
 const TARGET = { id: 'owner', type: 'page', url: 'vscode-file://vscode-app/workbench/workbench.html', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/owner' };
 
 class Fixture implements ColabNativeSession {
-    markerCount = 1; widgets = 1; hiddenInputs = 0; driver = true; active = true; incomplete = false; busy = false;
+    markerCount = 1; widgets = 1; hiddenInputs = 0; active = true; incomplete = false; busy = false;
     title = KERNEL_HEADER; placeholder = KERNEL_HEADER; ariaLabel = KERNEL_HEADER; value = '';
     rows = [{ label: 'Kernel A', description: 'first environment', detail: '', disabled: false }, { label: 'Kernel B', description: '', detail: '', disabled: false }];
-    writes: string[] = []; submits = 0; disposed = false;
+    writes: string[] = []; inputEvents: Array<{ bubbles: boolean; cancelable: boolean }> = []; submits = 0; disposed = false; evaluations: string[] = [];
     beforeEvaluate?: (expression: string) => void;
     async evaluate(expression: string): Promise<unknown> {
+        this.evaluations.push(expression);
         this.beforeEvaluate?.(expression);
-        const input = {
-            value: this.value, getClientRects: () => [1],
+        const input: any = {
+            getClientRects: () => [1],
             getAttribute: (name: string) => name === 'placeholder' ? this.placeholder : name === 'aria-label' ? this.ariaLabel : null,
-            dispatchEvent: (event: { type: string }) => { if (event.type === 'keydown') this.submits++; return true; }
+            dispatchEvent: (event: { type: string; bubbles?: boolean; cancelable?: boolean }) => {
+                if (event.type === 'input') this.inputEvents.push({ bubbles: event.bubbles === true, cancelable: event.cancelable === true });
+                if (event.type === 'keydown') this.submits++;
+                return true;
+            }
         };
+        Object.defineProperty(input, 'value', { get: () => this.value, set: (value: string) => { this.writes.push(value); this.value = value; } });
         const selectedRows = this.rows.filter(r => !this.value || r.label.toLowerCase().includes(this.value.toLowerCase()));
         const widget = {
             getClientRects: () => [1],
@@ -37,14 +43,10 @@ class Fixture implements ColabNativeSession {
             }
         };
         return await vm.runInNewContext(expression, {
-            window: { driver: this.driver ? {
-                getElements: async () => Array.from({ length: this.markerCount }, () => ({ textContent: MARKER })),
-                setValue: async (_selector: string, value: string) => { this.writes.push(value); this.value = value; },
-                isActiveElement: async () => this.active
-            } : undefined },
             document: { querySelectorAll: (selector: string) => selector === '.statusbar-item-label' ? Array.from({ length: this.markerCount }, () => ({textContent:MARKER})) :
                 selector === '.quick-input-widget .quick-input-box input' ? [...Array.from({length:this.hiddenInputs},()=>({})),input] : Array.from({ length: this.widgets }, () => widget), activeElement: this.active ? input : undefined },
             getComputedStyle: () => ({ visibility: 'visible' }),
+            Event: class { type: string; bubbles: boolean; cancelable: boolean; constructor(type: string, options: { bubbles?: boolean; cancelable?: boolean } = {}) { this.type = type; this.bubbles = options.bubbles === true; this.cancelable = options.cancelable === true; } },
             KeyboardEvent: class { constructor(public type: string, public options: object) {} }
         });
     }
@@ -68,6 +70,10 @@ test('listing makes no input or Enter action; explicit non-first choice is selec
     assert.deepEqual(fixture.writes, []); assert.equal(fixture.submits, 0);
     await driver.chooseListed!([KERNEL_HEADER], choices[1].choiceId, SIGNAL);
     assert.deepEqual(fixture.writes, ['Kernel B']); assert.equal(fixture.submits, 1);
+    assert.deepEqual(fixture.inputEvents, [{ bubbles: true, cancelable: true }]);
+    const write = fixture.evaluations.find(expression => expression.includes("new Event('input'"));
+    assert.ok(write); assert.doesNotMatch(write!, /\basync\b|\bawait\b|window\.driver/);
+    assert.ok(fixture.evaluations.every(expression => !expression.includes('window.driver')));
 });
 test('missing native port refuses discovery', async () => {
     const driver = createColabNativeDriverForTest(0, { targets: async () => { throw new Error('should not discover'); }, connect: async () => new Fixture() });
@@ -89,9 +95,9 @@ test('two owner windows refuse binding', async () => {
     const { driver } = setup(undefined, { targets: async () => [TARGET, TARGET], connect: async () => fixtures[i++] });
     await rejects(driver.bind(MARKER, SIGNAL), 'window_binding_failed'); assert.ok(fixtures.every(f => f.disposed));
 });
-test('missing driver and duplicate marker refuse binding', async () => {
-    const fixture = new Fixture(); fixture.driver = false;
-    await rejects(setup(fixture).driver.bind(MARKER, SIGNAL), 'native_driver_unavailable');
+test('DOM-only binding needs no smoke driver and duplicate marker refuses binding', async () => {
+    const fixture = new Fixture(); await setup(fixture).driver.bind(MARKER, SIGNAL);
+    assert.ok(fixture.evaluations.every(expression => !expression.includes('window.driver')));
     const duplicate = new Fixture(); duplicate.markerCount = 2;
     await rejects(setup(duplicate).driver.bind(MARKER, SIGNAL), 'window_binding_failed');
 });
@@ -131,7 +137,7 @@ test('lost owner marker before select prevents mutation', async () => {
 });
 test('lost owner between observation and mutation is caught in renderer', async () => {
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL); const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL);
-    fixture.beforeEvaluate = expression => { if (expression.includes('await window.driver.setValue(')) fixture.markerCount = 0; };
+    fixture.beforeEvaluate = expression => { if (expression.includes("new Event('input'")) fixture.markerCount = 0; };
     await rejects(driver.chooseListed!([KERNEL_HEADER], choices[0].choiceId, SIGNAL), 'action_failed'); assert.deepEqual(fixture.writes, []);
 });
 test('inactive input never receives text or Enter', async () => {
@@ -174,6 +180,35 @@ test('CPU proof required before alias entry; exact CPU alias works', async () =>
     await rejects(driver.enter(['Alias your server'], 'm12345678', SIGNAL), 'cpu_selection_unconfirmed'); assert.deepEqual(fixture.writes, []);
     fixture.title = 'Colab CPU'; fixture.ariaLabel = 'Colab CPU - Alias your server';
     await driver.enter(['Alias your server'], 'm12345678', SIGNAL); assert.equal(fixture.submits, 1);
+});
+test('existing server selection allows only one exact MCP alias row', async () => {
+    const alias = 'm7ae91d89';
+    const one = setup(); await one.driver.bind(MARKER, SIGNAL);
+    one.fixture.title = 'Select a Jupyter Server'; one.fixture.placeholder = 'Select a Jupyter Server'; one.fixture.ariaLabel = 'Select a Jupyter Server';
+    one.fixture.rows = [{ label: alias, description: 'existing server', detail: '', disabled: false }];
+    assert.equal(await one.driver.choose(['Select a Jupyter Server'], [alias], SIGNAL), alias);
+    assert.deepEqual(one.fixture.writes, [alias]); assert.equal(one.fixture.submits, 1);
+
+    const duplicate = setup(); await duplicate.driver.bind(MARKER, SIGNAL);
+    duplicate.fixture.title = 'Select a Jupyter Server'; duplicate.fixture.placeholder = 'Select a Jupyter Server'; duplicate.fixture.ariaLabel = 'Select a Jupyter Server';
+    duplicate.fixture.rows = [
+        { label: alias, description: 'first', detail: '', disabled: false },
+        { label: alias, description: 'second', detail: '', disabled: false }
+    ];
+    await rejects(duplicate.driver.choose(['Select a Jupyter Server'], [alias], SIGNAL), 'ambiguous_picker');
+    await rejects(duplicate.driver.choose(['Select a Jupyter Server'], ['mABCDEF12'], SIGNAL), 'action_failed');
+    await rejects(duplicate.driver.choose([KERNEL_HEADER], [alias], SIGNAL), 'action_failed');
+    assert.equal(duplicate.fixture.submits, 0);
+
+    const missing = setup(); await missing.driver.bind(MARKER, SIGNAL);
+    missing.fixture.title = 'Select a Jupyter Server'; missing.fixture.placeholder = 'Select a Jupyter Server'; missing.fixture.ariaLabel = 'Select a Jupyter Server';
+    missing.fixture.rows = [{ label: 'm00000000', description: '', detail: '', disabled: false }];
+    await rejects(missing.driver.choose(['Select a Jupyter Server'], [alias], SIGNAL), 'picker_timeout');
+
+    const mount = setup(); await mount.driver.bind(MARKER, SIGNAL);
+    mount.fixture.title = 'Mount Server to Workspace'; mount.fixture.placeholder = 'Mount Server to Workspace'; mount.fixture.ariaLabel = 'Mount Server to Workspace';
+    mount.fixture.rows = [{ label: alias, description: '', detail: '', disabled: false }];
+    assert.equal(await mount.driver.choose(['Mount Server to Workspace'], [alias], SIGNAL), alias);
 });
 test('cancelled listing/selection and disposed driver never act', async () => {
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL); const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL);

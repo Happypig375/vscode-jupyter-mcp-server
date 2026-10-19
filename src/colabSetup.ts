@@ -25,7 +25,7 @@ interface Setup {
     actionReady: Promise<void>; resolveActionReady(): void;
     controller: AbortController; promise: Promise<void>;
 }
-export interface SetupOptions { waitMs?: number; }
+export interface SetupOptions { waitMs?: number; serverAlias?: string; }
 export interface SetupDeps {
     desktop(): DesktopSetupDriver;
     lease(): Promise<() => Promise<void>>;
@@ -125,17 +125,22 @@ export function assertNoColabSetup(ref: string): void {
 }
 export async function configureColab(ref: string, options: SetupOptions = {}, deps = defaults): Promise<string> {
     const wait = validateWait(options.waitMs, 1000);
-    const job = startSetup(ref, 'configure_kernel', deps);
+    if (options.serverAlias !== undefined) validateServerAlias(options.serverAlias);
+    const job = startSetup(ref, 'configure_kernel', deps, options.serverAlias);
     return waitForReceipt(job, wait);
 }
 
 export async function mountColabServer(ref: string, serverAlias: string, options: SetupOptions = {}, deps = defaults): Promise<string> {
     const wait = validateWait(options.waitMs, 1000);
+    validateServerAlias(serverAlias);
+    const job = startSetup(ref, 'mount_colab_server', deps, serverAlias);
+    return waitForReceipt(job, wait);
+}
+
+function validateServerAlias(serverAlias: unknown): asserts serverAlias is string {
     if (typeof serverAlias !== 'string' || !/^m[a-f0-9]{8}$/.test(serverAlias)) {
         throw new Error('serverAlias must be an exact MCP-generated alias such as m0123abcd.');
     }
-    const job = startSetup(ref, 'mount_colab_server', deps, serverAlias);
-    return waitForReceipt(job, wait);
 }
 
 function startSetup(ref: string, operation: SetupOperation, deps: SetupDeps, serverAlias?: string): Setup {
@@ -383,8 +388,19 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
             if (verification.verified !== true) fail('verification_failed', 'The mounted server did not pass same-kernel Colab filesystem verification.');
             job.verification = verification; job.state = 'ready'; return;
         }
+        const requestedAlias = job.serverAlias;
+        if (active && requestedAlias) {
+            const matching = workspaceAliasRoots(requestedAlias);
+            if (matching.length > 1) fail('filesystem_ambiguous', 'More than one mounted Colab workspace folder has the requested server alias.');
+            if (matching.length === 1) {
+                job.stage = 'verifying_runtime';
+                const verified = JSON.parse(await bounded(tracked(deps.check(job.notebook, matching[0], token.token)), signal));
+                if (verified.verified !== true) fail('verification_failed', 'The requested existing Colab server did not pass runtime verification.');
+                job.verification = verified; job.state = 'ready'; return;
+            }
+        }
         const oldRoots = getColabFileRoots();
-        if (active && oldRoots.length === 1) {
+        if (active && !requestedAlias && oldRoots.length === 1) {
             job.stage = 'verifying_runtime';
             const verified = JSON.parse(await bounded(tracked(deps.check(job.notebook, oldRoots[0], token.token)), signal));
             if (verified.verified !== true) fail('verification_failed', 'The existing kernel did not pass Colab verification.');
@@ -425,26 +441,32 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         };
         const first = await picker((stepSignal) => driver!.choose(['Select Kernel'], ['Select Another Kernel...', 'Colab'], stepSignal));
         if (first !== 'Colab') await picker((stepSignal) => driver!.choose(['Select Kernel'], ['Colab'], stepSignal));
-        await picker((stepSignal) => driver!.choose(['Select a Jupyter Server'], ['New Colab Server'], stepSignal)); current();
-        job.stage = 'creating_cpu_server';
-        await picker((stepSignal) => driver!.choose(['Select a variant'], ['CPU'], stepSignal));
-        let next = await picker((stepSignal) => driver!.waitForInput(['Select a machine shape', 'Select a runtime version', 'Alias your server'], stepSignal));
-        if (next === 'Select a machine shape') {
-            await picker((stepSignal) => driver!.choose([next], ['Standard'], stepSignal));
-            next = await picker((stepSignal) => driver!.waitForInput(['Select a runtime version', 'Alias your server'], stepSignal));
+        let alias: string;
+        if (requestedAlias) {
+            alias = requestedAlias;
+            await picker((stepSignal) => driver!.choose(['Select a Jupyter Server'], [alias], stepSignal)); current();
+        } else {
+            await picker((stepSignal) => driver!.choose(['Select a Jupyter Server'], ['New Colab Server'], stepSignal)); current();
+            job.stage = 'creating_cpu_server';
+            await picker((stepSignal) => driver!.choose(['Select a variant'], ['CPU'], stepSignal));
+            let next = await picker((stepSignal) => driver!.waitForInput(['Select a machine shape', 'Select a runtime version', 'Alias your server'], stepSignal));
+            if (next === 'Select a machine shape') {
+                await picker((stepSignal) => driver!.choose([next], ['Standard'], stepSignal));
+                next = await picker((stepSignal) => driver!.waitForInput(['Select a runtime version', 'Alias your server'], stepSignal));
+            }
+            if (next === 'Select a runtime version') {
+                await picker((stepSignal) => driver!.choose([next], ['Latest'], stepSignal));
+                await picker((stepSignal) => driver!.waitForInput(['Alias your server'], stepSignal));
+            }
+            // Colab 0.9.7 rejects aliases longer than ten characters. Nine also
+            // satisfies its user-facing "less than 10" validation message.
+            alias = 'm' + crypto.randomBytes(4).toString('hex');
+            job.serverAlias = alias;
+            // The provider can finish a non-cancellable assignment after a cancelled setup.
+            job.serverMayRemain = true;
+            job.stage = 'naming_server';
+            await picker((stepSignal) => driver!.enter(['Alias your server'], alias, stepSignal)); current();
         }
-        if (next === 'Select a runtime version') {
-            await picker((stepSignal) => driver!.choose([next], ['Latest'], stepSignal));
-            await picker((stepSignal) => driver!.waitForInput(['Alias your server'], stepSignal));
-        }
-        // Colab 0.9.7 rejects aliases longer than ten characters. Nine also
-        // satisfies its user-facing "less than 10" validation message.
-        const alias = 'm' + crypto.randomBytes(4).toString('hex');
-        job.serverAlias = alias;
-        // The provider can finish a non-cancellable assignment after a cancelled setup.
-        job.serverMayRemain = true;
-        job.stage = 'naming_server';
-        await picker((stepSignal) => driver!.enter(['Alias your server'], alias, stepSignal)); current();
         job.kernelHeader = 'Select a Kernel from ' + alias;
         job.kernelChoices = undefined;
         job.stage = 'awaiting_kernel_selection';
@@ -487,6 +509,7 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         job.stage = 'mounting_filesystem';
         const rootsBefore = new Set(getColabFileRoots());
         const mounting = command('colab.mountServer');
+        let mountingDone = false; void mounting.then(() => { mountingDone = true; }, () => undefined);
         const mountChoice = new AbortController();
         const abortMount = () => mountChoice.abort(); signal.addEventListener('abort', abortMount, { once: true });
         // A single server mounts directly. With several, select only our exact alias.
@@ -500,7 +523,18 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
                 current();
                 const added = getColabFileRoots().filter((candidate) => !rootsBefore.has(candidate));
                 if (added.length > 1) fail('filesystem_ambiguous', 'More than one Colab filesystem appeared during setup.');
-                if (added.length === 1) { root = added[0]; break; }
+                if (added.length === 1) {
+                    if (requestedAlias) {
+                        const mounted = workspaceAliasRoots(alias);
+                        if (mounted.length !== 1 || mounted[0] !== added[0]) fail('filesystem_alias_mismatch', 'The newly mounted Colab filesystem did not match the requested server alias.');
+                    }
+                    root = added[0]; break;
+                }
+                if (requestedAlias && mountingDone) {
+                    const mounted = workspaceAliasRoots(alias);
+                    if (mounted.length > 1) fail('filesystem_ambiguous', 'More than one mounted Colab workspace folder has the requested server alias.');
+                    if (mounted.length === 1) { root = mounted[0]; break; }
+                }
                 await Promise.race([pause(signal), choosing.then(() => pause(signal)), mounting.then(() => pause(signal))]);
             }
         } finally { mountChoice.abort(); signal.removeEventListener('abort', abortMount); await choosing.catch(() => undefined); }

@@ -11,7 +11,7 @@ const TIMING: Timing = { commandMs: 10_000, pickerMs: 90_000, pollMs: 200 };
 interface NativeTarget { id: string; type: string; url: string; webSocketDebuggerUrl?: string; }
 interface Row { label: string; description: string; detail: string; disabled: boolean; }
 interface Snapshot {
-    driver: boolean; markers: number; widgets: number; inputCount: number; title: string; placeholder: string;
+    dom: boolean; markers: number; widgets: number; inputCount: number; title: string; placeholder: string;
     ariaLabel: string; value: string; active: boolean; incomplete: boolean; rows: Row[];
 }
 export interface ColabNativeSession {
@@ -50,16 +50,14 @@ function validateDebuggerUrl(value: string, port: number): void {
 
 // Fixed, bounded projections only. No caller-supplied script, selector, or CDP method is exposed.
 function snapshotExpression(marker: string): string {
-    return `(async () => {
-        const driver = window.driver;
-        if (!driver || typeof driver.getElements !== 'function' || typeof driver.setValue !== 'function' || typeof driver.isActiveElement !== 'function') return {driver:false};
-        const markers = (await driver.getElements('.statusbar-item-label', false)).filter(e => e.textContent.trim() === ${JSON.stringify(marker)}).length;
+    return `(() => {
         const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const text = e => (e?.textContent || '').trim();
+        const markers = [...document.querySelectorAll('.statusbar-item-label')].filter(e => text(e) === ${JSON.stringify(marker)}).length;
         const widgets = [...document.querySelectorAll('.quick-input-widget')].filter(visible);
         const w = widgets.length === 1 ? widgets[0] : null;
         const inputs = w ? [...w.querySelectorAll('.quick-input-box input')].filter(visible) : [];
         const input = inputs.length === 1 ? inputs[0] : null;
-        const text = e => (e?.textContent || '').trim();
         const rows = w ? [...w.querySelectorAll('.quick-input-list .monaco-list-row')].map(e => ({
             label: text(e.querySelector('.label-name')), description: text(e.querySelector('.label-description')),
             detail: text(e.querySelector('.label-detail')), disabled: e.getAttribute('aria-disabled') === 'true'
@@ -67,7 +65,7 @@ function snapshotExpression(marker: string): string {
         const incomplete = !!w && (inputs.length !== 1 || rows.length > 128 ||
             !!w.querySelector('.monaco-progress-container.active') ||
             [...w.querySelectorAll('.quick-input-list .monaco-scrollable-element')].some(e => e.scrollHeight > e.clientHeight + 2));
-        return {driver:true, markers, widgets:widgets.length, inputCount:document.querySelectorAll(${JSON.stringify(INPUT)}).length, title:text(w?.querySelector('.quick-input-title')),
+        return {dom:true, markers, widgets:widgets.length, inputCount:document.querySelectorAll(${JSON.stringify(INPUT)}).length, title:text(w?.querySelector('.quick-input-title')),
             placeholder:input?.getAttribute('placeholder') || '', ariaLabel:input?.getAttribute('aria-label') || '',
             value:input?.value || '', active:!!input && document.activeElement === input, incomplete,
             rows:rows.slice(0,129)};
@@ -76,7 +74,7 @@ function snapshotExpression(marker: string): string {
 function parseSnapshot(raw: unknown): Snapshot {
     if (!raw || typeof raw !== 'object') throw failed();
     const v = raw as Partial<Snapshot>;
-    if (v.driver !== true) throw new DesktopSetupError('native_driver_unavailable');
+    if (v.dom !== true) throw failed();
     if (!Number.isInteger(v.markers) || !Number.isInteger(v.widgets) || !Number.isInteger(v.inputCount) ||
         !['title', 'placeholder', 'ariaLabel', 'value'].every(k => boundedString(v[k as keyof Snapshot])) ||
         typeof v.active !== 'boolean' || typeof v.incomplete !== 'boolean' || !Array.isArray(v.rows) || v.rows.length > 128 ||
@@ -113,7 +111,6 @@ class NativeDriver implements DesktopSetupDriver {
         const targets = await this.transport.targets(this.port, signal);
         if (!Array.isArray(targets) || targets.length > MAX_TARGETS) throw new DesktopSetupError('window_binding_failed');
         const matches: ColabNativeSession[] = [];
-        let nativeMissing = false;
         try {
             for (const target of targets) {
                 alive(signal);
@@ -124,14 +121,13 @@ class NativeDriver implements DesktopSetupDriver {
                 let keep = false;
                 try {
                     const raw = await session.evaluate(snapshotExpression(marker), signal);
-                    if (raw && typeof raw === 'object' && (raw as { driver?: boolean }).driver === false) { nativeMissing = true; continue; }
                     const snapshot = parseSnapshot(raw);
                     if (snapshot.markers > 1) throw new DesktopSetupError('window_binding_failed');
                     if (snapshot.markers === 1) { matches.push(session); keep = true; }
                 } finally { if (!keep) session.dispose(); }
             }
             alive(signal);
-            if (matches.length !== 1) throw new DesktopSetupError(nativeMissing && !matches.length ? 'native_driver_unavailable' : 'window_binding_failed');
+            if (matches.length !== 1) throw new DesktopSetupError('window_binding_failed');
             this.marker = marker; this.session = matches[0];
             await this.snapshot(signal); // exact marker still owns this renderer
         } catch (error) {
@@ -145,7 +141,8 @@ class NativeDriver implements DesktopSetupDriver {
     }
     async choose(inputLabels: readonly string[], optionLabels: readonly string[], signal: AbortSignal): Promise<string> {
         const inputs = labels(inputLabels), options = labels(optionLabels);
-        if (options.some(o => !SAFE_OPTIONS.has(o) && !(inputs.length === 1 && inputs[0] === 'Mount Server to Workspace' && /^m[a-f0-9]{8}$/.test(o)))) throw failed();
+        const aliasPicker = inputs.length === 1 && ['Select a Jupyter Server', 'Mount Server to Workspace'].includes(inputs[0]);
+        if (options.some(o => !SAFE_OPTIONS.has(o) && !(aliasPicker && /^m[a-f0-9]{8}$/.test(o)))) throw failed();
         const found = await this.poll(inputs, signal, s => s.rows.some(r => options.includes(r.label) && !r.disabled));
         const rows = found.snapshot.rows.filter(r => options.includes(r.label) && !r.disabled);
         if (rows.length !== 1) throw new DesktopSetupError('ambiguous_picker');
@@ -206,16 +203,30 @@ class NativeDriver implements DesktopSetupDriver {
         if (s.ariaLabel !== 'Colab CPU - Alias your server' && !(s.title === 'Colab CPU' && s.placeholder === 'Alias your server')) throw new DesktopSetupError('cpu_selection_unconfirmed');
     }
     private async setValue(value: string, inputs: readonly string[], signal: AbortSignal, row?: Row, cpu = false): Promise<void> {
-        await this.snapshot(signal);
-        const expression = `(async () => {
-            const s = await ${snapshotExpression(this.marker!)};
-            const labels = ${JSON.stringify(inputs)};
-            if (!s.driver || s.markers !== 1 || s.widgets !== 1 || s.inputCount !== 1 || !s.active ||
-                labels.filter(label => [s.title,s.placeholder,s.ariaLabel].some(name => name === label || name.endsWith(' - ' + label))).length !== 1) return false;
-            const row = ${JSON.stringify(row ?? null)};
-            if (row && s.rows.filter(r => JSON.stringify(r) === JSON.stringify(row) && !r.disabled).length !== 1) return false;
-            if (${cpu} && s.ariaLabel !== 'Colab CPU - Alias your server' && !(s.title === 'Colab CPU' && s.placeholder === 'Alias your server')) return false;
-            await window.driver.setValue(${JSON.stringify(INPUT)}, ${JSON.stringify(value)}); return true;
+        const expression = `(() => {
+            const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+            const text = e => (e?.textContent || '').trim();
+            const markers = [...document.querySelectorAll('.statusbar-item-label')].filter(e => text(e) === ${JSON.stringify(this.marker)});
+            const widgets = [...document.querySelectorAll('.quick-input-widget')].filter(visible);
+            const allInputs = [...document.querySelectorAll(${JSON.stringify(INPUT)})];
+            if (markers.length !== 1 || widgets.length !== 1 || allInputs.length !== 1) return false;
+            const widget = widgets[0], input = allInputs[0];
+            const widgetInputs = [...widget.querySelectorAll('.quick-input-box input')].filter(visible);
+            if (widgetInputs.length !== 1 || widgetInputs[0] !== input || document.activeElement !== input || !visible(input)) return false;
+            const labels = ${JSON.stringify(inputs)}, expectedRow = ${JSON.stringify(row ?? null)};
+            const title = text(widget.querySelector('.quick-input-title')), placeholder = input.getAttribute('placeholder') || '', aria = input.getAttribute('aria-label') || '';
+            if (labels.filter(label => [title,placeholder,aria].some(name => name === label || name.endsWith(' - ' + label))).length !== 1) return false;
+            if (expectedRow) {
+                const rows = [...widget.querySelectorAll('.quick-input-list .monaco-list-row')].map(e => ({
+                    label:text(e.querySelector('.label-name')),description:text(e.querySelector('.label-description')),
+                    detail:text(e.querySelector('.label-detail')),disabled:e.getAttribute('aria-disabled') === 'true'
+                })).filter(r => r.label);
+                if (rows.filter(r => JSON.stringify(r) === JSON.stringify(expectedRow) && !r.disabled).length !== 1) return false;
+            }
+            if (${cpu} && aria !== 'Colab CPU - Alias your server' && !(title === 'Colab CPU' && placeholder === 'Alias your server')) return false;
+            input.value = ${JSON.stringify(value)};
+            input.dispatchEvent(new Event('input', {bubbles:true,cancelable:true}));
+            return input.value === ${JSON.stringify(value)};
         })()`;
         alive(signal); if (await this.session!.evaluate(expression, signal) !== true) throw failed();
     }

@@ -23,8 +23,8 @@ export type DesktopSetupErrorCode =
     | 'cancelled';
 
 const ERROR_MESSAGES: Record<DesktopSetupErrorCode, string> = {
-    native_debug_unavailable: 'Native Colab setup requires VS Code launched with a loopback remote-debugging port and --enable-smoke-test-driver. Set jupyterMcp.nativeDebugPort to that port; reloading a window cannot enable the port in an already running app.',
-    native_driver_unavailable: 'This VS Code window does not expose the required native smoke-test driver. Launch this window with --enable-smoke-test-driver; no Orca fallback is used.',
+    native_debug_unavailable: 'Native Colab setup requires VS Code launched with a loopback remote-debugging port. Set jupyterMcp.nativeDebugPort to that port; reloading a window cannot enable the port in an already running app.',
+    native_driver_unavailable: 'This VS Code window does not expose the required native renderer transport. A loopback Chromium debugging connection is required; no Orca fallback is used.',
     kernel_choices_incomplete: 'The kernel picker is filtered, still loading, or too large to enumerate completely. No partial listing or default kernel was selected.',
     kernel_choice_stale: 'The listed kernel choice no longer matches the owned picker. List its kernels again before selecting.',
     orca_missing: 'Colab desktop automation is unavailable because Orca is not configured.',

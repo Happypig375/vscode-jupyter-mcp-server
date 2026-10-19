@@ -2,6 +2,8 @@
 
 ## 0.5.0
 
+- Allow `configure_kernel(runtime: "colab")` to take an exact prior MCP `serverAlias`. It reuses a uniquely mounted verified match or selects only that existing server, without creating a fallback, then retains the explicit kernel/startup/mount/nonce lifecycle.
+
 - Detect failed Colab extension activation before opening its picker, including a cached failure in an extension reported as active. Return a sanitized activation blocker with normal recovery guidance.
 
 - Add `mount_colab_server` recovery for a previously generated Colab alias when its Python kernel is already active but the filesystem was not mounted. The tracked operation neither starts/selects a kernel nor runs cells or creates servers, and requires an exact new or uniquely named existing mount plus fresh same-kernel verification. Setup receipts retain the generated alias after later failures.
@@ -9,7 +11,7 @@
 - Bind the uniquely identified VS Code owner window and recheck its marker before opening the first Colab picker. Native input actions validate and submit in that exact renderer without depending on operating-system foreground focus.
 
 - Add Colab initialization with `configure_kernel({ notebookRef, runtime: "colab" })`: create a standard CPU server through the installed Colab 0.9.7 picker, pause for an explicit kernel choice, run/remove an owned temporary startup cell, mount the same server and verify runtime/filesystem identity. An already active verified Colab runtime is reused.
-- Use VS Code's native Chromium/smoke-test driver without Orca. Require an explicitly configured loopback debugging port (or `JUPYTER_MCP_NATIVE_DEBUG_PORT` supplied at app launch), bind the exact window marker and picker, and fail safely on unavailable or unsupported UI. The app must have started with the debugging port; a window reload cannot enable it.
+- Use a loopback Chromium debugging connection without Orca or VS Code's smoke-test driver. Fixed DOM projections bind the exact window marker and picker; input writes synchronously recheck ownership, focus and semantic state before dispatching the same bubbling input event used by VS Code 1.142.0. The app must have started with the debugging port; a window reload cannot enable it.
 - Add `list_setup_kernels` and `select_setup_kernel`. Listing observes actual choices from the exact setup-owned picker without selecting a default. Selection accepts only one ID from the latest listing, rechecks the picker, and requires VS Code's kernel-selection acknowledgement before startup. Cancellation and a closed provider picker cannot silently continue setup.
 - Add tracked `get_kernel_setup` and `cancel_kernel_setup`, bounded waits/deadline, exact-window marker binding, cross-window desktop exclusion, and explicit retained-cell/server/cleanup status. Normal sign-in/consent/MFA and unsupported UI remain blockers; no authentication bypass or private credential access.
 - Add `check_colab`: verify the current idle Python kernel against the active Colab filesystem using a fresh private nonce, validate Linux/Python/Colab module diagnostics, and confirm cleanup through both surfaces. Missing, ambiguous, stale, busy, replaced, or unresponsive runtimes fail without a verified result. Verification applies only at the time of the call.

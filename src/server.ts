@@ -125,14 +125,15 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         );
 
         server.registerTool('configure_kernel', {
-            description: 'Set up the exact notebook. runtime colab uses the bounded local VS Code Chromium adapter to request a Standard CPU server, then pauses for an explicit list_setup_kernels and select_setup_kernel choice. After exact VS Code selection it runs/removes a temporary pass cell, mounts its filesystem, and verifies both surfaces with a fresh nonce. An already active verified Colab runtime is reused. Poll get_kernel_setup or cancel_kernel_setup. No automatic kernel choice, local/GPU/paid-upgrade fallback, or caller-side click. The generic default invokes Jupyter setup without claiming runtime readiness.',
+            description: 'Set up the exact notebook. runtime colab uses the bounded local VS Code Chromium adapter to request a Standard CPU server, or selects one exact prior MCP serverAlias without creating another server, then pauses for an explicit list_setup_kernels and select_setup_kernel choice. After exact VS Code selection it runs/removes a temporary pass cell, mounts its filesystem, and verifies both surfaces with a fresh nonce. An already active verified matching runtime is reused. Poll get_kernel_setup or cancel_kernel_setup. No automatic kernel choice, alias fallback, local/GPU/paid-upgrade fallback, or caller-side click. The generic default invokes Jupyter setup without claiming runtime readiness.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {
                 notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                 runtime: { type: 'string', enum: ['generic', 'colab'], description: 'Requested runtime. Use colab for automatic Colab setup; generic is the compatibility default.' },
+                serverAlias: { type: 'string', description: 'Colab only: optional exact prior MCP-generated alias matching m followed by eight lowercase hexadecimal characters. Selects that existing server and never creates a fallback.' },
                 waitMs: { type: 'number', description: 'Colab only: wait 0–60000 ms for a setup receipt (default 1000). The bounded background setup continues after this request returns.' }
             }, required: ['notebookRef'] })
         }, async (args) => {
-            const a = (args ?? {}) as { notebookRef?: string; runtime?: 'generic' | 'colab'; waitMs?: number };
+            const a = (args ?? {}) as { notebookRef?: string; runtime?: 'generic' | 'colab'; serverAlias?: string; waitMs?: number };
             if (!a.notebookRef) throw new Error('notebookRef is required');
             const text = await router.invokeNotebook('configure_kernel', a.notebookRef, a as Record<string, unknown>);
             return { content: [{ type: 'text' as const, text }] };

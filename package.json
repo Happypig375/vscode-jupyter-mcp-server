@@ -72,7 +72,7 @@
           "minimum": 0,
           "maximum": 65535,
           "scope": "machine",
-          "description": "Loopback Chromium debugging port of this VS Code app, launched with --remote-debugging-port=<port> and --enable-smoke-test-driver. 0 uses JUPYTER_MCP_NATIVE_DEBUG_PORT from the app launch environment, otherwise native setup is unavailable. Colab setup uses this native driver without Orca; existing verified runtimes can still be reused."
+          "description": "Loopback Chromium debugging port of this VS Code app, launched with --remote-debugging-port=<port>. 0 uses JUPYTER_MCP_NATIVE_DEBUG_PORT from the app launch environment, otherwise native setup is unavailable. Colab setup uses bounded DOM automation without Orca or the VS Code smoke-test driver; existing verified runtimes can still be reused."
         }
       }
     },
