@@ -39,7 +39,9 @@ let control;
 let client;
 let launchOutput = '';
 let initialTargetId;
-const closeMarker = `MCP isolated fixture close ${crypto.randomUUID()}`;
+const cleanupNonce = crypto.randomUUID();
+const closeMarker = `MCP isolated fixture close ${cleanupNonce}`;
+const cleanupAcknowledgementPath = path.join(evidence, 'cleanup-command-ack.json');
 
 const pause = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -193,9 +195,18 @@ async function main() {
     await fs.writeFile(path.join(cleanupExtension, 'extension.cjs'), [
         "'use strict';",
         "const vscode = require('vscode');",
+        "const fs = require('node:fs');",
+        `const acknowledgementPath = ${JSON.stringify(cleanupAcknowledgementPath)};`,
+        `const nonce = ${JSON.stringify(cleanupNonce)};`,
         'exports.activate = context => {',
         "  const command = 'jupyterMcp.colabEnvironmentLiveFixtureQuit';",
-        "  context.subscriptions.push(vscode.commands.registerCommand(command, () => vscode.commands.executeCommand('workbench.action.closeWindow')));",
+        "  context.subscriptions.push(vscode.commands.registerCommand(command, () => {",
+        "    const acknowledgement = { schema: 'colab-environment-live-cleanup-v1', nonce, sessionId: vscode.env.sessionId, extensionHostPid: process.pid, requestedAt: new Date().toISOString(), command: 'workbench.action.quit' };",
+        "    const temporary = acknowledgementPath + '.tmp-' + process.pid;",
+        "    fs.writeFileSync(temporary, JSON.stringify(acknowledgement));",
+        "    fs.renameSync(temporary, acknowledgementPath);",
+        "    return vscode.commands.executeCommand('workbench.action.quit');",
+        "  }));",
         '  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 999999);',
         `  item.text = ${JSON.stringify(closeMarker)};`,
         '  item.command = command;',
@@ -213,8 +224,10 @@ async function main() {
         'workbench.startupEditor': 'none',
         'window.restoreWindows': 'none',
         'window.confirmBeforeClose': 'never',
+        'window.confirmSaveUntitledWorkspace': false,
         'telemetry.telemetryLevel': 'off'
     }, null, 2));
+    receipt.temporaryProfileSettings = { confirmSaveUntitledWorkspace: false };
 
     const diskNotebook = path.join(evidence, 'fixture-open.ipynb');
     await fs.writeFile(diskNotebook, JSON.stringify({
@@ -409,43 +422,53 @@ main().catch(error => {
     if (child && initialTargetId) {
         try {
             const targets = await fetch(`http://127.0.0.1:${receipt.debugPort}/json/list`).then(response => response.json());
-            const pages = targets
-                .filter(item => item.type === 'page' && /workbench(?:\.html)?/.test(item.url))
-                .sort((left, right) => Number(left.id === initialTargetId) - Number(right.id === initialTargetId));
+            const pages = targets.filter(item => item.type === 'page' && /workbench(?:\.html)?/.test(item.url));
             if (pages.length < 1 || pages.filter(page => page.id === initialTargetId).length !== 1) throw new Error('owned workbench targets changed before close');
-            const requested = [];
-            for (const page of pages) {
-                const windowControl = await connectDebugger(page.webSocketDebuggerUrl);
-                const close = await windowControl.command('Runtime.evaluate', {
-                    expression: `(() => {
-                        const marker = ${JSON.stringify(closeMarker)};
-                        const visible = element => {
-                            const style = getComputedStyle(element);
-                            const rect = element.getBoundingClientRect();
-                            return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-                        };
-                        const items = [...document.querySelectorAll('.statusbar-item')].filter(element => visible(element) && element.textContent.trim() === marker);
-                        if (items.length > 1) return { ok: false, reason: 'fixture_close_marker_not_unique', count: items.length };
-                        if (items.length === 1) {
-                            const actions = [...items[0].querySelectorAll('a,button,[role="button"]')].filter(visible);
-                            const action = actions.length === 1 ? actions[0] : items[0].matches('a,button,[role="button"]') ? items[0] : undefined;
-                            if (!action) return { ok: false, reason: 'fixture_close_action_not_unique', count: actions.length };
-                            action.click();
-                            return { ok: true, method: 'fixture_close_command' };
-                        }
-                        return { ok: false, reason: 'fixture_close_marker_missing', count: 0 };
-                    })()`,
-                    returnByValue: true
-                });
-                const value = close.result?.value;
-                if (!value?.ok) throw new Error(value?.reason ?? 'fixture close command unavailable');
-                requested.push({ targetId: page.id, method: value.method });
-                await pause(400);
-                windowControl.close();
-            }
-            receipt.closeRequested = { windows: requested };
+            const quitPage = pages.find(page => page.id === initialTargetId);
+            const windowControl = await connectDebugger(quitPage.webSocketDebuggerUrl);
+            const quit = await windowControl.command('Runtime.evaluate', {
+                expression: `(() => {
+                    const marker = ${JSON.stringify(closeMarker)};
+                    const visible = element => {
+                        const style = getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+                    };
+                    const items = [...document.querySelectorAll('.statusbar-item')].filter(element => visible(element) && element.textContent.trim() === marker);
+                    if (items.length !== 1) return { ok: false, reason: 'fixture_quit_marker_not_unique', count: items.length };
+                    const actions = [...items[0].querySelectorAll('a,button,[role="button"]')].filter(visible);
+                    const action = actions.length === 1 ? actions[0] : items[0].matches('a,button,[role="button"]') ? items[0] : undefined;
+                    if (!action) return { ok: false, reason: 'fixture_quit_action_not_unique', count: actions.length };
+                    action.click();
+                    return { ok: true };
+                })()`,
+                returnByValue: true
+            });
+            if (!quit.result?.value?.ok) throw new Error(quit.result?.value?.reason ?? 'fixture quit command unavailable');
+            receipt.quitDomClick = { targetId: quitPage.id, returned: true };
+            const acknowledgement = await until(async () => {
+                try {
+                    return JSON.parse(await fs.readFile(cleanupAcknowledgementPath, 'utf8'));
+                } catch {
+                    return false;
+                }
+            }, 'Fixture normal quit command was not acknowledged.', 5_000);
+            assert.deepStrictEqual(Object.keys(acknowledgement).sort(), ['command', 'extensionHostPid', 'nonce', 'requestedAt', 'schema', 'sessionId']);
+            assert.strictEqual(acknowledgement.schema, 'colab-environment-live-cleanup-v1');
+            assert.strictEqual(acknowledgement.nonce, cleanupNonce);
+            assert.strictEqual(acknowledgement.command, 'workbench.action.quit');
+            assert.strictEqual(typeof acknowledgement.sessionId, 'string');
+            assert.ok(acknowledgement.sessionId.length > 0, 'fixture cleanup acknowledgement must identify the exact VS Code session');
+            assert.strictEqual(Number.isInteger(acknowledgement.extensionHostPid), true);
+            assert.ok(acknowledgement.extensionHostPid > 0);
+            assert.strictEqual(Number.isNaN(Date.parse(acknowledgement.requestedAt)), false);
+            receipt.quitDispatchAcknowledgement = acknowledgement;
+            windowControl.close();
         } catch {
-            receipt.closeRequested = 'unconfirmed';
+            receipt.quitDispatchAcknowledgement = 'unconfirmed';
+            receipt.passed = false;
+            receipt.error = receipt.error ?? 'Fixture normal quit dispatch was not acknowledged.';
+            process.exitCode = 1;
         }
     } else if (child) {
         child.kill();
@@ -461,7 +484,7 @@ main().catch(error => {
             child.kill();
             receipt.ownedProcessKillRequested = true;
             receipt.passed = false;
-            receipt.error = receipt.error ?? 'Owned isolated VS Code did not exit after normal window-close commands.';
+            receipt.error = receipt.error ?? 'Owned isolated VS Code did not exit after normal application quit.';
             process.exitCode = 1;
         }
     }
