@@ -35,7 +35,11 @@ export class CancellationTokenSource {
 export const workspace = {
     get isTrusted() { return state.trusted; }, get workspaceFolders() { return state.folders; },
     get notebookDocuments() { return [state.notebook]; }, textDocuments: [],
-    asRelativePath: (target: any) => { if (target !== state.notebook.uri) throw new Error('Wrong notebook label target'); return state.relativeNotebookLabel; },
+    asRelativePath: (target: any, includeWorkspace?: boolean) => {
+        if (target !== state.notebook.uri || includeWorkspace !== false) throw new Error('Wrong notebook label target or prefix mode');
+        return state.relativeNotebookLabel;
+    },
+    getWorkspaceFolder: (target: any) => { if (target !== state.notebook.uri) throw new Error('Wrong notebook folder target'); return state.folders.find((folder: any) => folder.uri.scheme === 'file'); },
     getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
     applyEdit: async (edit: WorkspaceEdit) => {
         if (state.editFailure) return false;

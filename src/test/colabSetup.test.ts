@@ -123,6 +123,14 @@ async function main() {
         assert.ok(state.calls.some((call: any) => call[0] === 'notebook.cell.execute'));
         assert.ok(state.calls.some((call: any) => call[0] === 'colab.mountServer'));
     });
+    await test('multi-folder recovery uses the notebook folder name and workbench bullet separator', async () => {
+        const f = fixture(); state.relativeNotebookLabel = 'nested/target.ipynb';
+        state.folders.push({ name: 'm7ae91d89', uri: uri('colab://matching/content') });
+        assert.strictEqual((await result(f, 'm7ae91d89')).ready, true);
+        assert.deepStrictEqual(f.headerSelections[0], process.platform === 'win32'
+            ? ['Select Kernel', "Select kernel for 'workspace • nested/target.ipynb'", "Change kernel for 'workspace • nested/target.ipynb'", "Select kernel for 'workspace • nested\\target.ipynb'", "Change kernel for 'workspace • nested\\target.ipynb'"]
+            : ['Select Kernel', "Select kernel for 'workspace • nested/target.ipynb'", "Change kernel for 'workspace • nested/target.ipynb'"]);
+    });
     await test('requested alias reuses only its unique mounted root with fresh verification', async () => {
         const alias = 'm7ae91d89'; const f = fixture(); state.active = { status: 'idle' };
         state.folders.push({ name: alias, uri: uri('colab://matching/content') }, { name: 'stale', uri: uri('colab://stale/content') });

@@ -231,6 +231,18 @@ test('source picker after controller suggestions accepts the installed Select An
     assert.equal(await driver.choose(['Select Kernel', 'Select Another Kernel'], ['Colab'], SIGNAL), 'Colab');
     assert.deepEqual(fixture.writes, ['Colab']); assert.equal(fixture.submits, 1);
 });
+test('multi-folder initial picker refuses a different folder with the same relative notebook path', async () => {
+    const header = "Change kernel for 'research • nested\\target.ipynb'";
+    const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
+    fixture.title = ''; fixture.placeholder = header; fixture.ariaLabel = header;
+    fixture.rows = [{ label: 'Select Another Kernel...', description: '', detail: '', disabled: false }];
+    assert.equal(await driver.choose([header], ['Select Another Kernel...', 'Colab'], SIGNAL), 'Select Another Kernel...');
+    const other = setup(); await other.driver.bind(MARKER, SIGNAL);
+    other.fixture.title = ''; other.fixture.placeholder = "Change kernel for 'other • nested\\target.ipynb'"; other.fixture.ariaLabel = other.fixture.placeholder;
+    other.fixture.rows = fixture.rows;
+    await rejects(other.driver.choose([header], ['Select Another Kernel...', 'Colab'], SIGNAL), 'picker_timeout');
+    assert.equal(other.fixture.submits, 0);
+});
 test('cancelled listing/selection and disposed driver never act', async () => {
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL); const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL);
     const abort = new AbortController(); abort.abort();
