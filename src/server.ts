@@ -125,7 +125,7 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
         );
 
         server.registerTool('configure_kernel', {
-            description: 'Set up the exact notebook. runtime colab automates the installed Colab 0.9.7 picker through the local Orca computer CLI, requests a Standard CPU server, selects Python, runs/removes a temporary pass cell, mounts its filesystem, and verifies both surfaces with a fresh nonce. An already active verified Colab runtime is reused. Returns a tracked setupId; poll get_kernel_setup or cancel_kernel_setup. Sign-in/MFA/consent remains normal provider UI and may need the user. No local/GPU/paid-upgrade fallback. The generic default invokes Jupyter setup without claiming runtime readiness.',
+            description: 'Set up the exact notebook. runtime colab uses the bounded local VS Code Chromium adapter to request a Standard CPU server, then pauses for an explicit list_setup_kernels and select_setup_kernel choice. After exact VS Code selection it runs/removes a temporary pass cell, mounts its filesystem, and verifies both surfaces with a fresh nonce. An already active verified Colab runtime is reused. Poll get_kernel_setup or cancel_kernel_setup. No automatic kernel choice, local/GPU/paid-upgrade fallback, or caller-side click. The generic default invokes Jupyter setup without claiming runtime readiness.',
             inputSchema: jsonSchemaToZod({ type: 'object', properties: {
                 notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
                 runtime: { type: 'string', enum: ['generic', 'colab'], description: 'Requested runtime. Use colab for automatic Colab setup; generic is the compatibility default.' },
@@ -150,6 +150,35 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             const a = (args ?? {}) as { notebookRef?: string; setupId?: string; waitMs?: number };
             if (!a.notebookRef) throw new Error('notebookRef is required');
             return { content: [{ type: 'text' as const, text: await router.invokeNotebook(operation, a.notebookRef, a as Record<string, unknown>) }] };
+        });
+
+        server.registerTool('list_setup_kernels', {
+            description: 'List the bounded kernel choices currently shown by one exact Colab setup after its owned CPU server is created. This is read-only UI observation tied to setupId. It is separate from list_kernels, which lists already registered VS Code controllers. A fresh call invalidates ids from an earlier setup-choice listing.',
+            inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+                notebookRef: { type: 'string', description: 'Exact notebook URI or notebookRef owned by the setup.' },
+                setupId: { type: 'string', description: 'Exact active setupId returned by configure_kernel.' }
+            }, required: ['notebookRef', 'setupId'] })
+        }, async (args) => {
+            const a = (args ?? {}) as { notebookRef?: string; setupId?: string };
+            if (!a.notebookRef) throw new Error('notebookRef is required');
+            if (!a.setupId) throw new Error('setupId is required');
+            return { content: [{ type: 'text' as const, text: await router.invokeNotebook('list_setup_kernels', a.notebookRef, a as Record<string, unknown>) }] };
+        });
+
+        server.registerTool('select_setup_kernel', {
+            description: 'Select one exact kernelChoiceId from the latest list_setup_kernels result for the same notebook and setupId. No default is selected. The setup then requires VS Code to confirm selection before its owned startup cell, mount, and nonce verification continue. This is separate from select_kernel for already registered controller ids.',
+            inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+                notebookRef: { type: 'string', description: 'Exact notebook URI or notebookRef owned by the setup.' },
+                setupId: { type: 'string', description: 'Exact active setupId returned by configure_kernel.' },
+                kernelChoiceId: { type: 'string', description: 'Exact id from the latest list_setup_kernels call for this setup.' },
+                waitMs: { type: 'number', description: 'Wait 0–60000 ms for a later setup receipt (default 1000). The bounded setup continues after this request returns.' }
+            }, required: ['notebookRef', 'setupId', 'kernelChoiceId'] })
+        }, async (args) => {
+            const a = (args ?? {}) as { notebookRef?: string; setupId?: string; kernelChoiceId?: string; waitMs?: number };
+            if (!a.notebookRef) throw new Error('notebookRef is required');
+            if (!a.setupId) throw new Error('setupId is required');
+            if (!a.kernelChoiceId) throw new Error('kernelChoiceId is required');
+            return { content: [{ type: 'text' as const, text: await router.invokeNotebook('select_setup_kernel', a.notebookRef, a as Record<string, unknown>) }] };
         });
 
         server.registerTool('check_colab', {

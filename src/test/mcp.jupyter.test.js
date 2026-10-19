@@ -286,7 +286,7 @@ async function main() {
 
     // 1. With Jupyter present, kernel tools ARE exposed.
     await check('kernel tools exposed when Jupyter present', async () => {
-        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'get_kernel_setup', 'cancel_kernel_setup', 'check_colab', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
+        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'get_kernel_setup', 'cancel_kernel_setup', 'list_setup_kernels', 'select_setup_kernel', 'check_colab', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
         const editTool = tools.find((tool) => tool.name === 'edit_cells');
         assert.match(editTool.description, /anchor.*after it/i);
@@ -748,6 +748,12 @@ async function main() {
             const res = await client.callTool({ name: 'configure_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb', ...args } });
             assert.ok(res.isError);
         }
+        for (const request of [
+            { name: 'list_setup_kernels', arguments: { notebookRef: 'file:///C:/nb.ipynb' } },
+            { name: 'list_setup_kernels', arguments: { notebookRef: 'file:///C:/nb.ipynb', setupId: 'setup_missing', extra: true } },
+            { name: 'select_setup_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb', setupId: 'setup_missing' } },
+            { name: 'select_setup_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb', setupId: 'setup_missing', kernelChoiceId: 'choice', waitMs: 60001 } }
+        ]) assert.ok((await client.callTool(request)).isError);
         let res = await client.callTool({ name: 'check_colab', arguments: { notebookRef: 'file:///C:/nb.ipynb', start: true } });
         assert.ok(res.isError);
         res = await client.callTool({ name: 'check_colab', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });

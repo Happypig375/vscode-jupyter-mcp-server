@@ -22,7 +22,7 @@ import {
     searchCells
 } from './notebookOps';
 import { checkColabRuntime, downloadFile, uploadFile } from './kernelFiles';
-import { assertNoColabSetup, configureColab, getColabSetup } from './colabSetup';
+import { assertNoColabSetup, configureColab, getColabSetup, listColabSetupKernels, selectColabSetupKernel } from './colabSetup';
 
 export type LocalOperation =
     | 'create_notebook'
@@ -34,6 +34,8 @@ export type LocalOperation =
     | 'check_colab'
     | 'get_kernel_setup'
     | 'cancel_kernel_setup'
+    | 'list_setup_kernels'
+    | 'select_setup_kernel'
     | 'list_kernels'
     | 'select_kernel'
     | 'read_cell_outputs'
@@ -82,6 +84,10 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
         case 'get_kernel_setup':
         case 'cancel_kernel_setup':
             return getColabSetup(notebookRef(args), args.setupId as string | undefined, args.waitMs as number | undefined, operation === 'cancel_kernel_setup');
+        case 'list_setup_kernels':
+            return listColabSetupKernels(notebookRef(args), args.setupId as string);
+        case 'select_setup_kernel':
+            return selectColabSetupKernel(notebookRef(args), args.setupId as string, args.kernelChoiceId as string, args.waitMs as number | undefined);
         case 'check_colab':
             return checkColabRuntime({ notebookRef: notebookRef(args), colabFileUri: args.colabFileUri as string | undefined });
         case 'list_kernels':

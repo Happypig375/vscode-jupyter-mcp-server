@@ -66,11 +66,13 @@
           "default": true,
           "description": "Save dirty notebooks before running/editing so tools operate on current contents."
         },
-        "jupyterMcp.orcaPath": {
-          "type": "string",
-          "default": "",
+        "jupyterMcp.nativeDebugPort": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 65535,
           "scope": "machine",
-          "description": "Absolute path to the optional Orca computer CLI for automatic Colab setup. Empty uses a known local installation when available. No shell commands or extra arguments are accepted."
+          "description": "Loopback Chromium debugging port of this VS Code app, launched with --remote-debugging-port=<port> and --enable-smoke-test-driver. 0 uses JUPYTER_MCP_NATIVE_DEBUG_PORT from the app launch environment, otherwise native setup is unavailable. Colab setup uses this native driver without Orca; existing verified runtimes can still be reused."
         }
       }
     },
@@ -89,7 +91,7 @@
   },
   "scripts": {
     "compile": "esbuild src/extension.ts --bundle --external:vscode --format=cjs --platform=node --target=node20 --sourcemap --outfile=dist/extension.js",
-    "compile:test": "esbuild src/test/broker.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/broker.test.cjs && esbuild src/test/kernelFiles.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.test.cjs && esbuild src/test/notebookMetadata.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/notebookMetadataStub.ts --outfile=.vscode-test/notebookMetadata.test.cjs && esbuild src/test/kernelFiles.python.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.python.test.cjs && esbuild src/test/colabDesktop.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/colabDesktop.test.cjs && esbuild src/test/colabSetup.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/colabSetupStub.ts --outfile=.vscode-test/colabSetup.test.cjs",
+    "compile:test": "esbuild src/test/broker.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/broker.test.cjs && esbuild src/test/kernelFiles.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.test.cjs && esbuild src/test/notebookMetadata.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/notebookMetadataStub.ts --outfile=.vscode-test/notebookMetadata.test.cjs && esbuild src/test/kernelFiles.python.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/vscodeStub.ts --outfile=.vscode-test/kernelFiles.python.test.cjs && esbuild src/test/colabDesktop.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/colabDesktop.test.cjs && esbuild src/test/colabNative.test.ts --bundle --platform=node --target=node20 --sourcemap --outfile=.vscode-test/colabNative.test.cjs && esbuild src/test/colabSetup.test.ts --bundle --platform=node --target=node20 --sourcemap --alias:vscode=./src/test/colabSetupStub.ts --outfile=.vscode-test/colabSetup.test.cjs",
     "watch": "esbuild src/extension.ts --bundle --external:vscode --format=cjs --platform=node --target=node20 --sourcemap --outfile=dist/extension.js --watch",
     "typecheck": "tsc --noEmit",
     "test": "npm run compile && npm run compile:test && node src/test/runTest.js",

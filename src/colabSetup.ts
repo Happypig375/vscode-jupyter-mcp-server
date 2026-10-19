@@ -3,19 +3,24 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { createColabDesktopDriver, DesktopSetupDriver, DesktopSetupError } from './colabDesktop';
+import { DesktopSetupChoice, DesktopSetupDriver, DesktopSetupError } from './colabDesktop';
+import { createColabNativeDriver } from './colabNative';
 import { checkColabRuntime, getColabFileRoots } from './kernelFiles';
 import { findNotebook, getExecution } from './notebookOps';
 
 const SETUP_TIMEOUT_MS = 300_000;
 const MAX_HISTORY = 16;
-type Stage = 'preflight' | 'binding_window' | 'selecting_provider' | 'creating_cpu_server' | 'naming_server' | 'selecting_python' | 'starting_kernel' | 'mounting_filesystem' | 'verifying_runtime' | 'finished';
+type Stage = 'preflight' | 'binding_window' | 'selecting_provider' | 'creating_cpu_server' | 'naming_server' | 'awaiting_kernel_selection' | 'selecting_python' | 'starting_kernel' | 'mounting_filesystem' | 'verifying_runtime' | 'finished';
 type State = 'running' | 'ready' | 'failed' | 'cancelled';
 interface Setup {
     id: string; notebook: string; state: State; stage: Stage; startedAt: string;
     endedAt?: string; reason?: string; code?: string; verification?: unknown; failedStage?: Stage;
     startupCellRetained?: boolean; serverMayRemain?: boolean; cleanupPending?: boolean;
     desktopOperation?: string; desktopError?: string;
+    driver?: DesktopSetupDriver; kernelHeader?: string; kernelChoices?: Map<string, DesktopSetupChoice>;
+    kernelListingVersion: number; kernelChoiceQueue: Promise<void>;
+    kernelChoiceGate: Promise<string>; resolveKernelChoice(choiceId: string): void;
+    actionReady: Promise<void>; resolveActionReady(): void;
     controller: AbortController; promise: Promise<void>;
 }
 export interface SetupOptions { waitMs?: number; }
@@ -27,7 +32,7 @@ export interface SetupDeps {
     cleanupWaitMs?: number;
 }
 const defaults: SetupDeps = {
-    desktop: () => createColabDesktopDriver(vscode.workspace.getConfiguration('jupyterMcp').get<string>('orcaPath') || undefined),
+    desktop: () => createColabNativeDriver(vscode.workspace.getConfiguration('jupyterMcp').get<number>('nativeDebugPort', 0) ?? 0),
     lease: acquireDesktopLease,
     check: (notebookRef, colabFileUri, token) => checkColabRuntime({ notebookRef, colabFileUri }, token)
 };
@@ -48,22 +53,32 @@ async function bounded<T>(promise: PromiseLike<T>, signal: AbortSignal): Promise
 }
 async function pause(signal: AbortSignal): Promise<void> { await bounded(new Promise<void>((resolve) => setTimeout(resolve, 200)), signal); }
 function receipt(job: Setup): string {
+    const actionRequired = job.stage === 'awaiting_kernel_selection' ? {
+        kind: 'kernel_selection',
+        listTool: 'list_setup_kernels',
+        selectTool: 'select_setup_kernel',
+        choicesListed: !!job.kernelChoices,
+        listingVersion: job.kernelChoices ? job.kernelListingVersion : undefined
+    } : undefined;
     return JSON.stringify({ setupId: job.id, notebook: job.notebook, runtime: 'colab', status: job.endedAt ? job.state : 'running', stage: job.stage,
         ready: !!job.endedAt && job.state === 'ready', startedAt: job.startedAt, endedAt: job.endedAt,
         code: job.code, reason: job.reason, failedStage: job.failedStage, desktopOperation: job.desktopOperation,
         desktopError: job.desktopError, verification: job.verification,
         startupCellRetained: job.startupCellRetained ?? false, serverMayRemain: job.serverMayRemain ?? false,
-        cleanupPending: job.cleanupPending ?? false }, null, 2);
+        cleanupPending: job.cleanupPending ?? false, actionRequired }, null, 2);
 }
 function validateWait(value: number | undefined, fallback: number): number {
     const wait = value ?? fallback;
     if (!Number.isSafeInteger(wait) || wait < 0 || wait > 60_000) throw new Error('waitMs must be an integer from 0 to 60000.');
     return wait;
 }
-async function waitForReceipt(job: Setup, wait: number): Promise<string> {
+async function waitForReceipt(job: Setup, wait: number, stopAtAction = true): Promise<string> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     if (wait && !job.endedAt) {
-        try { await Promise.race([job.promise, new Promise<void>((resolve) => { timer = setTimeout(resolve, wait); })]); }
+        const actionTransition = !stopAtAction ? job.promise : job.stage === 'awaiting_kernel_selection'
+            ? Promise.resolve()
+            : job.actionReady.then(() => job.stage === 'awaiting_kernel_selection' ? undefined : job.promise);
+        try { await Promise.race([job.promise, actionTransition, new Promise<void>((resolve) => { timer = setTimeout(resolve, wait); })]); }
         finally { if (timer) clearTimeout(timer); }
     }
     return receipt(job);
@@ -115,7 +130,15 @@ export async function configureColab(ref: string, options: SetupOptions = {}, de
         if (!oldest) throw new Error('Colab setup history is full.');
         setups.delete(oldest.id);
     }
-    const job: Setup = { id: 'setup_' + crypto.randomUUID(), notebook: ref, state: 'running', stage: 'preflight', startedAt: new Date().toISOString(), controller: new AbortController(), promise: Promise.resolve() };
+    let resolveKernelChoice!: (choiceId: string) => void;
+    const kernelChoiceGate = new Promise<string>((resolve) => { resolveKernelChoice = resolve; });
+    let resolveActionReady!: () => void;
+    const actionReady = new Promise<void>((resolve) => { resolveActionReady = resolve; });
+    const job: Setup = {
+        id: 'setup_' + crypto.randomUUID(), notebook: ref, state: 'running', stage: 'preflight', startedAt: new Date().toISOString(),
+        kernelListingVersion: 0, kernelChoiceQueue: Promise.resolve(), kernelChoiceGate, resolveKernelChoice,
+        actionReady, resolveActionReady, controller: new AbortController(), promise: Promise.resolve()
+    };
     setups.set(job.id, job);
     job.promise = performSetup(job, deps).catch(() => {
         job.state = 'failed'; job.code = 'setup_internal_failure';
@@ -129,9 +152,95 @@ export async function getColabSetup(ref: string, setupId?: string, waitMs?: numb
     const job = setupId ? setups.get(setupId) : [...setups.values()].reverse().find((value) => value.notebook === ref);
     if (!job || job.notebook !== ref) throw new Error('No matching Colab setup exists in this window lifetime.');
     if (cancel && !job.endedAt) job.controller.abort();
+    return waitForReceipt(job, wait, !cancel);
+}
+
+/** Observe only the exact setup-owned post-alias kernel picker. A fresh listing invalidates earlier ids. */
+export async function listColabSetupKernels(ref: string, setupId: string): Promise<string> {
+    const job = requireSetup(ref, setupId);
+    return withKernelChoiceLock(job, async () => {
+        requireAwaitingKernelChoice(job);
+        const driver = job.driver;
+        const header = job.kernelHeader;
+        if (!driver?.listChoices || !header) throw new Error('This setup cannot list kernel choices safely.');
+        job.kernelChoices = undefined;
+        let observed: DesktopSetupChoice[];
+        try { observed = await driver.listChoices([header], job.controller.signal); }
+        catch (error) {
+            if (error instanceof DesktopSetupError) throw error;
+            throw new Error(job.controller.signal.aborted
+                ? 'The Colab setup was cancelled before kernel choices could be listed.'
+                : 'The setup-owned kernel choices could not be listed safely.');
+        }
+        const choices = validateKernelChoices(observed);
+        requireAwaitingKernelChoice(job);
+        job.kernelListingVersion++;
+        job.kernelChoices = new Map(choices.map((choice) => [choice.choiceId, choice]));
+        return JSON.stringify({
+            setupId: job.id,
+            notebook: job.notebook,
+            status: 'awaiting_kernel_selection',
+            stage: job.stage,
+            listingVersion: job.kernelListingVersion,
+            choices
+        }, null, 2);
+    });
+}
+
+/** Accept exactly one id from the latest setup-owned listing; the background workflow performs the action. */
+export async function selectColabSetupKernel(ref: string, setupId: string, choiceId: string, waitMs?: number): Promise<string> {
+    const wait = validateWait(waitMs, 1000);
+    const job = requireSetup(ref, setupId);
+    if (typeof choiceId !== 'string' || !choiceId) throw new Error('kernelChoiceId is required');
+    await withKernelChoiceLock(job, async () => {
+        requireAwaitingKernelChoice(job);
+        const choice = job.kernelChoices?.get(choiceId);
+        if (!choice) throw new Error('kernelChoiceId is stale or was not returned by the latest list_setup_kernels call.');
+        job.kernelChoices = undefined;
+        job.stage = 'selecting_python';
+        job.resolveKernelChoice(choice.choiceId);
+    });
     return waitForReceipt(job, wait);
 }
+
 export function disposeColabSetups(): void { for (const job of setups.values()) if (!job.endedAt) job.controller.abort(); }
+
+function requireSetup(ref: string, setupId: string): Setup {
+    const job = setups.get(setupId);
+    if (!job || job.notebook !== ref) throw new Error('No matching Colab setup exists in this window lifetime.');
+    return job;
+}
+
+function requireAwaitingKernelChoice(job: Setup): void {
+    if (job.endedAt || job.controller.signal.aborted || job.state !== 'running' || job.stage !== 'awaiting_kernel_selection') {
+        throw new Error('This Colab setup is not awaiting kernel selection.');
+    }
+}
+
+async function withKernelChoiceLock<T>(job: Setup, work: () => Promise<T>): Promise<T> {
+    const previous = job.kernelChoiceQueue;
+    let release!: () => void;
+    job.kernelChoiceQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await work(); }
+    finally { release(); }
+}
+
+function validateKernelChoices(observed: DesktopSetupChoice[]): DesktopSetupChoice[] {
+    if (!Array.isArray(observed) || observed.length === 0 || observed.length > 32) {
+        throw new Error('The setup kernel choice listing is empty or exceeds its safe bound.');
+    }
+    const ids = new Set<string>();
+    return observed.map((choice) => {
+        if (!choice || typeof choice.choiceId !== 'string' || typeof choice.label !== 'string' ||
+            !choice.choiceId || choice.choiceId.length > 160 || !choice.label || choice.label.length > 256 ||
+            /[\r\n\0]/.test(choice.choiceId) || /[\r\n\0]/.test(choice.label) || ids.has(choice.choiceId)) {
+            throw new Error('The setup kernel choice listing is malformed or ambiguous.');
+        }
+        ids.add(choice.choiceId);
+        return { choiceId: choice.choiceId, label: choice.label };
+    });
+}
 
 async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
     const signal = job.controller.signal;
@@ -194,6 +303,10 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         }
         release = await deps.lease(); alive(signal);
         driver = deps.desktop();
+        if (typeof driver.listChoices !== 'function' || typeof driver.chooseListed !== 'function') {
+            fail('kernel_choice_unsupported', 'The desktop adapter cannot list and select setup-owned kernel choices safely.');
+        }
+        job.driver = driver;
         const editor = await bounded(vscode.window.showNotebookDocument(current(), { preview: false, preserveFocus: false }), signal);
         if (editor.notebook !== current()) fail('notebook_changed', 'VS Code revealed another notebook.');
         const markerText = 'MCP Colab setup ' + crypto.randomUUID();
@@ -202,19 +315,38 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         job.stage = 'binding_window'; await driver.bind(markerText, signal); current();
         job.stage = 'selecting_provider';
         const selection = command('notebook.selectKernel', { notebookEditor: editor });
-        const first = await driver.choose(['Select Kernel'], ['Select Another Kernel...', 'Colab'], signal);
-        if (first !== 'Colab') await driver.choose(['Select Kernel'], ['Colab'], signal);
-        await driver.choose(['Select a Jupyter Server'], ['New Colab Server'], signal); current();
+        // A rejected/false command means VS Code has already closed this picker. Race
+        // every provider step against that outcome, while deliberately ignoring an
+        // early true until an explicitly listed choice has been selected below.
+        const selectionFailure: Promise<void> = selection.then(
+            (confirmed) => confirmed === true ? new Promise<void>(() => undefined) : undefined,
+            () => undefined
+        );
+        const picker = async <T>(work: (stepSignal: AbortSignal) => Promise<T>): Promise<T> => {
+            const step = new AbortController();
+            const abortStep = () => step.abort();
+            signal.addEventListener('abort', abortStep, { once: true });
+            let selectionEnded = false;
+            const ended = selectionFailure.then(() => { selectionEnded = true; step.abort(); fail('kernel_selection_unconfirmed', 'VS Code closed the notebook kernel picker before an explicit setup kernel was selected.'); });
+            try { return await bounded(Promise.race([work(step.signal), ended]), signal); }
+            catch (error) {
+                if (selectionEnded) fail('kernel_selection_unconfirmed', 'VS Code closed the notebook kernel picker before an explicit setup kernel was selected.');
+                throw error;
+            } finally { signal.removeEventListener('abort', abortStep); }
+        };
+        const first = await picker((stepSignal) => driver!.choose(['Select Kernel'], ['Select Another Kernel...', 'Colab'], stepSignal));
+        if (first !== 'Colab') await picker((stepSignal) => driver!.choose(['Select Kernel'], ['Colab'], stepSignal));
+        await picker((stepSignal) => driver!.choose(['Select a Jupyter Server'], ['New Colab Server'], stepSignal)); current();
         job.stage = 'creating_cpu_server';
-        await driver.choose(['Select a variant'], ['CPU'], signal);
-        let next = await driver.waitForInput(['Select a machine shape', 'Select a runtime version', 'Alias your server'], signal);
+        await picker((stepSignal) => driver!.choose(['Select a variant'], ['CPU'], stepSignal));
+        let next = await picker((stepSignal) => driver!.waitForInput(['Select a machine shape', 'Select a runtime version', 'Alias your server'], stepSignal));
         if (next === 'Select a machine shape') {
-            await driver.choose([next], ['Standard'], signal);
-            next = await driver.waitForInput(['Select a runtime version', 'Alias your server'], signal);
+            await picker((stepSignal) => driver!.choose([next], ['Standard'], stepSignal));
+            next = await picker((stepSignal) => driver!.waitForInput(['Select a runtime version', 'Alias your server'], stepSignal));
         }
         if (next === 'Select a runtime version') {
-            await driver.choose([next], ['Latest'], signal);
-            await driver.waitForInput(['Alias your server'], signal);
+            await picker((stepSignal) => driver!.choose([next], ['Latest'], stepSignal));
+            await picker((stepSignal) => driver!.waitForInput(['Alias your server'], stepSignal));
         }
         // Colab 0.9.7 rejects aliases longer than ten characters. Nine also
         // satisfies its user-facing "less than 10" validation message.
@@ -222,9 +354,17 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         // The provider can finish a non-cancellable assignment after a cancelled setup.
         job.serverMayRemain = true;
         job.stage = 'naming_server';
-        await driver.enter(['Alias your server'], alias, signal); current();
-        job.stage = 'selecting_python';
-        await driver.choose(['Select a Kernel from ' + alias], ['Python 3 (ipykernel)', 'Python 3', 'python3'], signal);
+        await picker((stepSignal) => driver!.enter(['Alias your server'], alias, stepSignal)); current();
+        job.kernelHeader = 'Select a Kernel from ' + alias;
+        job.kernelChoices = undefined;
+        job.stage = 'awaiting_kernel_selection';
+        job.resolveActionReady();
+        const kernelChoiceId = await bounded(Promise.race([
+            job.kernelChoiceGate,
+            selectionFailure.then(() => fail('kernel_selection_unconfirmed', 'VS Code closed the notebook kernel picker before an explicit setup kernel was selected.'))
+        ]), signal);
+        current();
+        await driver.chooseListed!([job.kernelHeader], kernelChoiceId, signal);
         if (await bounded(selection, signal) !== true) fail('kernel_selection_unconfirmed', 'VS Code did not confirm the exact notebook kernel selection.');
         current(); job.stage = 'starting_kernel';
         const source = '# jupyter-mcp-colab-startup ' + crypto.randomUUID() + '\npass';
@@ -291,7 +431,7 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         // Never delete a queued/running or user-modified cell. A failed setup leaves it visible.
         await cleanupWait(removeStartup()).catch(() => { job.startupCellRetained = true; });
         if (marker) await cleanupWait(tracked(vscode.commands.executeCommand('workbench.action.closeQuickOpen'))).catch(() => undefined);
-        marker?.dispose(); driver?.dispose();
+        marker?.dispose(); driver?.dispose(); job.driver = undefined; job.kernelChoices = undefined;
         const settled = Promise.allSettled(commands);
         let complete = false; void settled.then(() => { complete = true; });
         await Promise.race([settled, new Promise<void>((resolve) => setTimeout(resolve, 50))]);

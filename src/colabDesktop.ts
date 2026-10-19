@@ -8,6 +8,10 @@ const PICKER_TIMEOUT_MS = 90_000;
 const POLL_MS = 350;
 
 export type DesktopSetupErrorCode =
+    | 'native_debug_unavailable'
+    | 'native_driver_unavailable'
+    | 'kernel_choices_incomplete'
+    | 'kernel_choice_stale'
     | 'orca_missing'
     | 'version_unsupported'
     | 'capability_unsupported'
@@ -19,6 +23,10 @@ export type DesktopSetupErrorCode =
     | 'cancelled';
 
 const ERROR_MESSAGES: Record<DesktopSetupErrorCode, string> = {
+    native_debug_unavailable: 'Native Colab setup requires VS Code launched with a loopback remote-debugging port and --enable-smoke-test-driver. Set jupyterMcp.nativeDebugPort to that port; reloading a window cannot enable the port in an already running app.',
+    native_driver_unavailable: 'This VS Code window does not expose the required native smoke-test driver. Launch this window with --enable-smoke-test-driver; no Orca fallback is used.',
+    kernel_choices_incomplete: 'The kernel picker is filtered, still loading, or too large to enumerate completely. No partial listing or default kernel was selected.',
+    kernel_choice_stale: 'The listed kernel choice no longer matches the owned picker. List its kernels again before selecting.',
     orca_missing: 'Colab desktop automation is unavailable because Orca is not configured.',
     version_unsupported: 'The installed Orca desktop protocol is not supported.',
     capability_unsupported: 'The installed Orca desktop provider lacks a required semantic capability.',
@@ -44,8 +52,12 @@ export interface DesktopSetupDriver {
     waitForInput(inputLabels: readonly string[], signal: AbortSignal): Promise<string>;
     choose(inputLabels: readonly string[], optionLabels: readonly string[], signal: AbortSignal): Promise<string>;
     enter(inputLabels: readonly string[], value: string, signal: AbortSignal): Promise<void>;
+    listChoices?(inputLabels: readonly string[], signal: AbortSignal): Promise<DesktopSetupChoice[]>;
+    chooseListed?(inputLabels: readonly string[], choiceId: string, signal: AbortSignal): Promise<void>;
     dispose(): void;
 }
+
+export interface DesktopSetupChoice { choiceId: string; label: string; }
 
 /** A raw-output boundary used by deterministic tests. Production always uses spawn without a shell. */
 export interface OrcaCommandRunner {
