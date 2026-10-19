@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { configureColab, getColabSetup, listColabSetupKernels, selectColabSetupKernel, assertNoColabSetup, acquireDesktopLease, SetupDeps } from '../colabSetup';
+import { configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel, assertNoColabSetup, acquireDesktopLease, SetupDeps } from '../colabSetup';
 import { state, reset, uri } from './colabSetupStub';
 
 const ref = 'file:///test.ipynb';
@@ -12,7 +12,7 @@ function fixture(options: {
     listings?: Array<Array<{ choiceId: string; label: string }>>;
 } = {}) {
     reset();
-    const events: string[] = []; let released = 0; let checked = 0; let enteredAlias: string; let listing = 0;
+    const events: string[] = []; const checkedRoots: Array<string | undefined> = []; let released = 0; let checked = 0; let enteredAlias: string; let listing = 0;
     let inputs = options.optional ? ['Select a machine shape', 'Select a runtime version', 'Alias your server'] : ['Alias your server'];
     const listed = options.listings ?? [[{ choiceId: 'kernel-python', label: 'Python 3 (ipykernel)' }]];
     const desktop: any = {
@@ -23,6 +23,10 @@ function fixture(options: {
             if (options.providerDelay) await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => {
                 events.push('provider-aborted'); reject(new Error('private pending picker'));
             }, { once: true }));
+            if (_headers.includes('Mount Server to Workspace') && state.mountMode !== 'noRoot') {
+                state.folders.push({ name: labels[0], uri: uri('colab://test-server/content') });
+                if (state.mountMode === 'ambiguous') state.folders.push({ name: 'Other', uri: uri('colab://other-server/content') });
+            }
             return labels[0] === 'Select Another Kernel...' ? 'Select Another Kernel...' : labels[0];
         },
         waitForInput: async (headers: readonly string[]) => { const result = inputs.shift()!; assert.ok(headers.includes(result)); return result; },
@@ -43,10 +47,10 @@ function fixture(options: {
     const deps: SetupDeps = {
         timeoutMs: 500,
         lease: async () => { events.push('lease'); return async () => { released++; }; },
-        check: async (_ref, root) => { checked++; assert.strictEqual(_ref, ref); assert.ok(root?.startsWith('colab://')); if (options.checkFails) throw new Error('secret runtime'); return JSON.stringify({ verified: !options.checkFalse, checks: { nonce: true } }); },
+        check: async (_ref, root) => { checked++; checkedRoots.push(root); assert.strictEqual(_ref, ref); assert.ok(root?.startsWith('colab://')); if (options.checkFails) throw new Error('secret runtime'); return JSON.stringify({ verified: !options.checkFalse, checks: { nonce: true } }); },
         desktop: () => desktop
     };
-    return { deps, events, get released() { return released; }, get checked() { return checked; } };
+    return { deps, events, checkedRoots, get released() { return released; }, get checked() { return checked; } };
 }
 async function waitForActionOrFinish(setupId: string): Promise<any> {
     const deadline = Date.now() + 2_000;
@@ -75,7 +79,7 @@ async function main() {
         assert.strictEqual(r.ready, true); assert.strictEqual(f.checked, 1); assert.strictEqual(f.released, 1);
         assert.deepStrictEqual(state.notebook.getCells().map((c: any) => c.document.getText()), before);
         assert.deepStrictEqual(f.events, ['lease', 'bind', 'Select Another Kernel...', 'Colab', 'New Colab Server', 'CPU', 'alias', 'list', 'chosen:kernel-python', f.events[9], 'dispose']);
-        assert.match(f.events[9], /^m[a-f0-9]{8}$/); assert.strictEqual(r.startupCellRetained, false);
+        assert.match(f.events[9], /^m[a-f0-9]{8}$/); assert.strictEqual(r.serverAlias, f.events[9]); assert.strictEqual(r.operation, 'configure_kernel'); assert.strictEqual(r.startupCellRetained, false);
         assert.ok(state.calls.find((c: any) => c[0] === 'notebook.selectKernel')[1].notebookEditor.notebook === state.notebook);
     });
     await test('optional Standard and Latest stages are handled, never GPU/TPU/upgrade', async () => {
@@ -103,6 +107,76 @@ async function main() {
         assert.strictEqual(r.ready, false); assert.strictEqual(r.failedStage, 'preflight');
         assert.doesNotMatch(JSON.stringify(r), /secret/); assert.deepStrictEqual(f.events, []);
         assert.deepStrictEqual(state.calls, []); assert.strictEqual(f.checked, 0);
+    });
+    await test('mount recovery requires an exact generated alias before starting a lifecycle', async () => {
+        const f = fixture();
+        for (const alias of ['', 'Colab CPU', 'mABCDEF12', 'm1234567', 'm123456789', 'm1234567g']) {
+            await assert.rejects(() => mountColabServer(ref, alias, {}, f.deps), /serverAlias/);
+        }
+        assert.deepStrictEqual(f.events, []); assert.deepStrictEqual(state.calls, []); assert.strictEqual(f.checked, 0);
+    });
+    for (const [name, active, code] of [
+        ['missing', undefined, 'active_kernel_required'],
+        ['busy', { language: 'python', status: 'busy', executeCode() {} }, 'kernel_busy'],
+        ['wrong language', { language: 'julia', status: 'idle', executeCode() {} }, 'kernel_language_unsupported'],
+        ['missing public execution', { language: 'python', status: 'idle' }, 'jupyter_api_unavailable']
+    ] as const) await test('mount recovery rejects ' + name + ' active kernel before UI', async () => {
+        const f = fixture(); state.active = active;
+        const r = JSON.parse(await mountColabServer(ref, 'm0123abcd', { waitMs: 1000 }, f.deps));
+        assert.strictEqual(r.code, code); assert.strictEqual(r.ready, false); assert.deepStrictEqual(f.events, []);
+        assert.ok(!state.calls.some((call: any) => ['notebook.selectKernel', 'notebook.cell.execute', 'colab.mountServer'].includes(call[0])));
+    });
+    await test('mount recovery selects only the exact alias and performs no kernel or cell action', async () => {
+        const f = fixture(); state.active = { language: 'python', status: 'idle', executeCode() {} };
+        state.folders.push({ name: 'stale', uri: uri('colab://stale-server/content') });
+        const before = state.notebook.getCells().map((cell: any) => cell.document.getText());
+        const r = JSON.parse(await mountColabServer(ref, 'm0123abcd', { waitMs: 1000 }, f.deps));
+        assert.strictEqual(r.ready, true); assert.strictEqual(r.operation, 'mount_colab_server'); assert.strictEqual(r.serverAlias, 'm0123abcd');
+        assert.deepStrictEqual(f.events, ['lease', 'bind', 'm0123abcd', 'dispose']);
+        assert.deepStrictEqual(f.checkedRoots, ['colab://test-server/']); assert.strictEqual(f.released, 1);
+        assert.deepStrictEqual(state.notebook.getCells().map((cell: any) => cell.document.getText()), before);
+        assert.deepStrictEqual(state.calls.map((call: any) => call[0]), ['colab.mountServer', 'workbench.action.closeQuickOpen']);
+    });
+    await test('mount recovery verifies one existing alias-named Colab workspace without UI', async () => {
+        const f = fixture(); state.active = { language: 'python', status: 'idle', executeCode() {} };
+        state.folders.push({ name: 'm0123abcd', uri: uri('colab://existing-server/content') });
+        const r = JSON.parse(await mountColabServer(ref, 'm0123abcd', { waitMs: 1000 }, f.deps));
+        assert.strictEqual(r.ready, true); assert.deepStrictEqual(f.checkedRoots, ['colab://existing-server/']);
+        assert.deepStrictEqual(f.events, []); assert.deepStrictEqual(state.calls, []); assert.strictEqual(f.released, 0);
+    });
+    await test('mount recovery rejects ambiguous existing alias mounts before verification or UI', async () => {
+        const f = fixture(); state.active = { language: 'python', status: 'idle', executeCode() {} };
+        state.folders.push({ name: 'm0123abcd', uri: uri('colab://one/content') }, { name: 'm0123abcd', uri: uri('colab://two/content') });
+        const r = JSON.parse(await mountColabServer(ref, 'm0123abcd', { waitMs: 1000 }, f.deps));
+        assert.strictEqual(r.code, 'filesystem_ambiguous'); assert.strictEqual(f.checked, 0);
+        assert.deepStrictEqual(f.events, []); assert.deepStrictEqual(state.calls, []);
+    });
+    await test('mount recovery never claims readiness when fresh verification is negative', async () => {
+        const f = fixture({ checkFalse: true }); state.active = { language: 'python', status: 'idle', executeCode() {} };
+        const r = JSON.parse(await mountColabServer(ref, 'm0123abcd', { waitMs: 1000 }, f.deps));
+        assert.strictEqual(r.code, 'verification_failed'); assert.strictEqual(r.ready, false); assert.strictEqual(f.checked, 1);
+    });
+    await test('cancelled mount command retains the desktop lease until the command settles', async () => {
+        const f = fixture(); state.active = { language: 'python', status: 'idle', executeCode() {} }; state.mountCommandHang = true;
+        const initial = JSON.parse(await mountColabServer(ref, 'm0123abcd', { waitMs: 0 }, f.deps));
+        while (!f.events.includes('m0123abcd')) await new Promise((resolve) => setTimeout(resolve, 1));
+        const cancelled = JSON.parse(await getColabSetup(ref, initial.setupId, 1000, true));
+        assert.strictEqual(cancelled.status, 'cancelled'); assert.strictEqual(cancelled.cleanupPending, true); assert.strictEqual(f.released, 0);
+        assert.throws(() => assertNoColabSetup(ref), /still active/);
+        state.finishMountCommand(); await new Promise((resolve) => setTimeout(resolve, 5));
+        assert.strictEqual(f.released, 1); assertNoColabSetup(ref);
+    });
+    await test('cancelled mount verification retains its guard and lease until verification settles', async () => {
+        const f = fixture(); state.active = { language: 'python', status: 'idle', executeCode() {} };
+        let finishCheck!: (value: string) => void;
+        f.deps.check = () => new Promise<string>((resolve) => { finishCheck = resolve; });
+        const initial = JSON.parse(await mountColabServer(ref, 'm0123abcd', { waitMs: 0 }, f.deps));
+        while (!f.events.includes('m0123abcd')) await new Promise((resolve) => setTimeout(resolve, 1));
+        while (JSON.parse(await getColabSetup(ref, initial.setupId)).stage !== 'verifying_runtime') await new Promise((resolve) => setTimeout(resolve, 1));
+        const cancelled = JSON.parse(await getColabSetup(ref, initial.setupId, 1000, true));
+        assert.strictEqual(cancelled.status, 'cancelled'); assert.strictEqual(cancelled.cleanupPending, true); assert.strictEqual(f.released, 0);
+        finishCheck(JSON.stringify({ verified: true })); await new Promise((resolve) => setTimeout(resolve, 5));
+        assert.strictEqual(f.released, 1); assertNoColabSetup(ref);
     });
     await test('wrong revealed notebook prevents picker and startup', async () => {
         const f = fixture(); state.editorMismatch = true; const r = await result(f); assert.strictEqual(r.code, 'notebook_changed'); assert.strictEqual(f.released, 1); assert.deepStrictEqual(state.calls, []);

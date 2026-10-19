@@ -286,7 +286,7 @@ async function main() {
 
     // 1. With Jupyter present, kernel tools ARE exposed.
     await check('kernel tools exposed when Jupyter present', async () => {
-        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'get_kernel_setup', 'cancel_kernel_setup', 'list_setup_kernels', 'select_setup_kernel', 'check_colab', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
+        const expected = ['create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'list_kernels', 'select_kernel', 'configure_kernel', 'mount_colab_server', 'get_kernel_setup', 'cancel_kernel_setup', 'list_setup_kernels', 'select_setup_kernel', 'check_colab', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'open_notebooks', 'save_notebooks', 'upload_file', 'download_file'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
         const editTool = tools.find((tool) => tool.name === 'edit_cells');
         assert.match(editTool.description, /anchor.*after it/i);
@@ -749,6 +749,9 @@ async function main() {
             assert.ok(res.isError);
         }
         for (const request of [
+            { name: 'mount_colab_server', arguments: { notebookRef: 'file:///C:/nb.ipynb' } },
+            { name: 'mount_colab_server', arguments: { notebookRef: 'file:///C:/nb.ipynb', serverAlias: 'user-server' } },
+            { name: 'mount_colab_server', arguments: { notebookRef: 'file:///C:/nb.ipynb', serverAlias: 'm0123abcd', extra: true } },
             { name: 'list_setup_kernels', arguments: { notebookRef: 'file:///C:/nb.ipynb' } },
             { name: 'list_setup_kernels', arguments: { notebookRef: 'file:///C:/nb.ipynb', setupId: 'setup_missing', extra: true } },
             { name: 'select_setup_kernel', arguments: { notebookRef: 'file:///C:/nb.ipynb', setupId: 'setup_missing' } },
@@ -758,6 +761,15 @@ async function main() {
         assert.ok(res.isError);
         res = await client.callTool({ name: 'check_colab', arguments: { notebookRef: 'file:///C:/nb.ipynb' } });
         assert.ok(res.isError); assert.match(res.content[0].text, /No registered Colab filesystem root/);
+        assert.deepStrictEqual([startedKernels.length, pickerCalls.length, executionCalls.length], [starts, picks, runs]);
+
+        res = await client.callTool({ name: 'mount_colab_server', arguments: {
+            notebookRef: 'file:///C:/inactive.ipynb', serverAlias: 'm0123abcd', waitMs: 1000
+        } });
+        const mount = JSON.parse(res.content[0].text);
+        assert.strictEqual(mount.operation, 'mount_colab_server');
+        assert.strictEqual(mount.serverAlias, 'm0123abcd');
+        assert.strictEqual(mount.status, 'failed'); assert.strictEqual(mount.code, 'workspace_untrusted');
         assert.deepStrictEqual([startedKernels.length, pickerCalls.length, executionCalls.length], [starts, picks, runs]);
     });
 

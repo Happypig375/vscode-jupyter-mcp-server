@@ -22,7 +22,7 @@ import {
     searchCells
 } from './notebookOps';
 import { checkColabRuntime, downloadFile, uploadFile } from './kernelFiles';
-import { assertNoColabSetup, configureColab, getColabSetup, listColabSetupKernels, selectColabSetupKernel } from './colabSetup';
+import { assertNoColabSetup, configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel } from './colabSetup';
 
 export type LocalOperation =
     | 'create_notebook'
@@ -31,6 +31,7 @@ export type LocalOperation =
     | 'clear_cell_outputs'
     | 'get_kernel_info'
     | 'configure_kernel'
+    | 'mount_colab_server'
     | 'check_colab'
     | 'get_kernel_setup'
     | 'cancel_kernel_setup'
@@ -63,7 +64,7 @@ function notebookRef(args: Args): string {
 /** Execute one validated tool operation against notebooks owned by this VS Code window. */
 export async function executeLocalOperation(operation: LocalOperation, args: Args): Promise<string> {
     const ids = args.cellIds as Array<string | number> | undefined;
-    if (['configure_kernel', 'select_kernel', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'clear_cell_outputs', 'upload_file', 'download_file', 'check_colab'].includes(operation)) {
+    if (['configure_kernel', 'mount_colab_server', 'select_kernel', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'clear_cell_outputs', 'upload_file', 'download_file', 'check_colab'].includes(operation)) {
         for (const ref of typeof args.notebookRef === 'string' ? [args.notebookRef] : Array.isArray(args.notebookRefs) ? args.notebookRefs : []) assertNoColabSetup(String(ref));
     }
     switch (operation) {
@@ -81,6 +82,8 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
             if (args.runtime === 'colab') return configureColab(notebookRef(args), { waitMs: args.waitMs as number | undefined });
             if (args.waitMs !== undefined) throw new Error('waitMs is supported only for runtime colab.');
             return configureKernel(notebookRef(args), args.runtime as 'generic' | 'colab' | undefined);
+        case 'mount_colab_server':
+            return mountColabServer(notebookRef(args), args.serverAlias as string, { waitMs: args.waitMs as number | undefined });
         case 'get_kernel_setup':
         case 'cancel_kernel_setup':
             return getColabSetup(notebookRef(args), args.setupId as string | undefined, args.waitMs as number | undefined, operation === 'cancel_kernel_setup');

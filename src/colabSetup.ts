@@ -12,8 +12,10 @@ const SETUP_TIMEOUT_MS = 300_000;
 const MAX_HISTORY = 16;
 type Stage = 'preflight' | 'binding_window' | 'selecting_provider' | 'creating_cpu_server' | 'naming_server' | 'awaiting_kernel_selection' | 'selecting_python' | 'starting_kernel' | 'mounting_filesystem' | 'verifying_runtime' | 'finished';
 type State = 'running' | 'ready' | 'failed' | 'cancelled';
+type SetupOperation = 'configure_kernel' | 'mount_colab_server';
+interface SetupKernel { language?: string; status?: string; executeCode?: unknown; }
 interface Setup {
-    id: string; notebook: string; state: State; stage: Stage; startedAt: string;
+    id: string; notebook: string; operation: SetupOperation; serverAlias?: string; state: State; stage: Stage; startedAt: string;
     endedAt?: string; reason?: string; code?: string; verification?: unknown; failedStage?: Stage;
     startupCellRetained?: boolean; serverMayRemain?: boolean; cleanupPending?: boolean;
     desktopOperation?: string; desktopError?: string;
@@ -60,7 +62,8 @@ function receipt(job: Setup): string {
         choicesListed: !!job.kernelChoices,
         listingVersion: job.kernelChoices ? job.kernelListingVersion : undefined
     } : undefined;
-    return JSON.stringify({ setupId: job.id, notebook: job.notebook, runtime: 'colab', status: job.endedAt ? job.state : 'running', stage: job.stage,
+    return JSON.stringify({ setupId: job.id, notebook: job.notebook, operation: job.operation, serverAlias: job.serverAlias,
+        runtime: 'colab', status: job.endedAt ? job.state : 'running', stage: job.stage,
         ready: !!job.endedAt && job.state === 'ready', startedAt: job.startedAt, endedAt: job.endedAt,
         code: job.code, reason: job.reason, failedStage: job.failedStage, desktopOperation: job.desktopOperation,
         desktopError: job.desktopError, verification: job.verification,
@@ -122,6 +125,20 @@ export function assertNoColabSetup(ref: string): void {
 }
 export async function configureColab(ref: string, options: SetupOptions = {}, deps = defaults): Promise<string> {
     const wait = validateWait(options.waitMs, 1000);
+    const job = startSetup(ref, 'configure_kernel', deps);
+    return waitForReceipt(job, wait);
+}
+
+export async function mountColabServer(ref: string, serverAlias: string, options: SetupOptions = {}, deps = defaults): Promise<string> {
+    const wait = validateWait(options.waitMs, 1000);
+    if (typeof serverAlias !== 'string' || !/^m[a-f0-9]{8}$/.test(serverAlias)) {
+        throw new Error('serverAlias must be an exact MCP-generated alias such as m0123abcd.');
+    }
+    const job = startSetup(ref, 'mount_colab_server', deps, serverAlias);
+    return waitForReceipt(job, wait);
+}
+
+function startSetup(ref: string, operation: SetupOperation, deps: SetupDeps, serverAlias?: string): Setup {
     if (!findNotebook(ref)) throw new Error('The target notebook is no longer open.');
     assertNoColabSetup(ref);
     if ([...setups.values()].some((job) => !job.endedAt || job.cleanupPending)) throw new Error('This VS Code window already has an active Colab setup.');
@@ -135,7 +152,7 @@ export async function configureColab(ref: string, options: SetupOptions = {}, de
     let resolveActionReady!: () => void;
     const actionReady = new Promise<void>((resolve) => { resolveActionReady = resolve; });
     const job: Setup = {
-        id: 'setup_' + crypto.randomUUID(), notebook: ref, state: 'running', stage: 'preflight', startedAt: new Date().toISOString(),
+        id: 'setup_' + crypto.randomUUID(), notebook: ref, operation, serverAlias, state: 'running', stage: 'preflight', startedAt: new Date().toISOString(),
         kernelListingVersion: 0, kernelChoiceQueue: Promise.resolve(), kernelChoiceGate, resolveKernelChoice,
         actionReady, resolveActionReady, controller: new AbortController(), promise: Promise.resolve()
     };
@@ -145,7 +162,7 @@ export async function configureColab(ref: string, options: SetupOptions = {}, de
         job.reason = 'Colab setup could not complete its lifecycle cleanup; no readiness is claimed.';
         job.endedAt = new Date().toISOString();
     });
-    return waitForReceipt(job, wait);
+    return job;
 }
 export async function getColabSetup(ref: string, setupId?: string, waitMs?: number, cancel = false): Promise<string> {
     const wait = validateWait(waitMs, 0);
@@ -242,6 +259,12 @@ function validateKernelChoices(observed: DesktopSetupChoice[]): DesktopSetupChoi
     });
 }
 
+function workspaceAliasRoots(alias: string): string[] {
+    return (vscode.workspace.workspaceFolders ?? [])
+        .filter((folder) => folder.name === alias && folder.uri.scheme === 'colab' && !!folder.uri.authority && !folder.uri.query && !folder.uri.fragment)
+        .map((folder) => folder.uri.with({ path: '/', query: '', fragment: '' }).toString());
+}
+
 async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
     const signal = job.controller.signal;
     const timer = setTimeout(() => job.controller.abort(), deps.timeoutMs ?? SETUP_TIMEOUT_MS);
@@ -287,7 +310,7 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
             const run = JSON.parse(await getExecution(job.notebook, {}));
             if (['requested', 'running'].includes(run.status)) fail('execution_active', 'Wait for the notebook execution to finish before Colab setup.');
         } catch (error) { if (error instanceof SetupFailure) throw error; }
-        const jupyterExtension = vscode.extensions.getExtension<{ kernels?: { getKernel(uri: vscode.Uri): Thenable<{ status?: string } | undefined> } }>('ms-toolsai.jupyter');
+        const jupyterExtension = vscode.extensions.getExtension<{ kernels?: { getKernel(uri: vscode.Uri): Thenable<SetupKernel | undefined> } }>('ms-toolsai.jupyter');
         if (!jupyterExtension) fail('jupyter_api_unavailable', 'The public Jupyter kernel API is unavailable.');
         const jupyter = await bounded(jupyterExtension.activate(), signal);
         if (!jupyter?.kernels?.getKernel) fail('jupyter_api_unavailable', 'The public Jupyter kernel API is unavailable.');
@@ -299,6 +322,66 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         catch {
             alive(signal);
             fail('colab_activation_failed', 'The Colab extension failed to activate. Check its Output log and restore connectivity, then reload this VS Code window before retrying. No kernel picker was opened.');
+        }
+        if (job.operation === 'mount_colab_server') {
+            if (!active) fail('active_kernel_required', 'Mount recovery requires an already active Colab kernel; no kernel was selected or started.');
+            if ((active.language ?? '').toLowerCase() !== 'python') fail('kernel_language_unsupported', 'Mount recovery requires the already active kernel to use Python.');
+            if ((active.status ?? '').toLowerCase() !== 'idle') fail('kernel_busy', 'Wait for the active Python kernel to become idle before mounting its Colab server.');
+            if (typeof active.executeCode !== 'function') fail('jupyter_api_unavailable', 'The active Python kernel lacks the public execution API required for Colab verification.');
+            const expectedKernel = active;
+            const sameKernel = async () => {
+                const observed = await bounded(jupyter.kernels!.getKernel(originalNotebook!.uri), signal);
+                if (observed !== expectedKernel || (observed.status ?? '').toLowerCase() !== 'idle' || (observed.language ?? '').toLowerCase() !== 'python') {
+                    fail('kernel_changed', 'The active Python kernel changed or became unavailable during mount recovery.');
+                }
+            };
+            await sameKernel();
+            const alias = job.serverAlias!;
+            const existing = workspaceAliasRoots(alias);
+            if (existing.length > 1) fail('filesystem_ambiguous', 'More than one mounted Colab workspace folder has the requested server alias.');
+            let root: string;
+            if (existing.length === 1) {
+                root = existing[0];
+            } else {
+                release = await deps.lease(); alive(signal);
+                driver = deps.desktop(); job.driver = driver;
+                const editor = await bounded(vscode.window.showNotebookDocument(current(), { preview: false, preserveFocus: false }), signal);
+                if (editor.notebook !== current()) fail('notebook_changed', 'VS Code revealed another notebook.');
+                const markerText = 'MCP Colab mount ' + crypto.randomUUID();
+                marker = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1_000_000);
+                marker.text = markerText; marker.show();
+                job.stage = 'binding_window'; await driver.bind(markerText, signal); current(); await sameKernel();
+                job.stage = 'mounting_filesystem';
+                const rootsBefore = new Set(getColabFileRoots());
+                const mounting = command('colab.mountServer');
+                const mountChoice = new AbortController();
+                const abortMount = () => mountChoice.abort(); signal.addEventListener('abort', abortMount, { once: true });
+                const choosing = driver.choose(['Mount Server to Workspace'], [alias], mountChoice.signal).catch((error) => {
+                    if (!mountChoice.signal.aborted) throw error;
+                });
+                void choosing.catch(() => undefined);
+                try {
+                    while (true) {
+                        current(); await sameKernel();
+                        const added = getColabFileRoots().filter((candidate) => !rootsBefore.has(candidate));
+                        if (added.length > 1) fail('filesystem_ambiguous', 'More than one Colab filesystem appeared during mount recovery.');
+                        if (added.length === 1) {
+                            const mounted = workspaceAliasRoots(alias);
+                            if (mounted.length !== 1 || mounted[0] !== added[0]) {
+                                fail('filesystem_alias_mismatch', 'The newly mounted Colab filesystem did not match the requested server alias.');
+                            }
+                            root = added[0]; break;
+                        }
+                        await Promise.race([pause(signal), choosing.then(() => pause(signal)), mounting.then(() => pause(signal))]);
+                    }
+                } finally { mountChoice.abort(); signal.removeEventListener('abort', abortMount); await choosing.catch(() => undefined); }
+                await bounded(mounting, signal); current(); await sameKernel();
+            }
+            job.stage = 'verifying_runtime';
+            const verification = JSON.parse(await bounded(tracked(deps.check(job.notebook, root!, token.token)), signal));
+            await sameKernel();
+            if (verification.verified !== true) fail('verification_failed', 'The mounted server did not pass same-kernel Colab filesystem verification.');
+            job.verification = verification; job.state = 'ready'; return;
         }
         const oldRoots = getColabFileRoots();
         if (active && oldRoots.length === 1) {
@@ -357,6 +440,7 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         // Colab 0.9.7 rejects aliases longer than ten characters. Nine also
         // satisfies its user-facing "less than 10" validation message.
         const alias = 'm' + crypto.randomBytes(4).toString('hex');
+        job.serverAlias = alias;
         // The provider can finish a non-cancellable assignment after a cancelled setup.
         job.serverMayRemain = true;
         job.stage = 'naming_server';

@@ -99,6 +99,15 @@ async function main(): Promise<void> {
         );
         assert.ok(Date.now() - longWaitStarted >= 1_500, 'operation RPC must outlive the short control-plane deadline');
 
+        assert.strictEqual(
+            await originalBroker.invokeNotebook('mount_colab_server', routed.notebookRef, { serverAlias: 'm0123abcd', waitMs: 60_000 }),
+            'window-b:mount_colab_server'
+        );
+        assert.deepStrictEqual(invocations.get('window-b')!.at(-1), {
+            operation: 'mount_colab_server',
+            args: { notebookRef: shared, serverAlias: 'm0123abcd', waitMs: 60_000 }
+        });
+
         for (const calls of invocations.values()) calls.length = 0;
         await originalBroker.invokeNotebooks('save_notebooks', [
             'file:///C:/a.ipynb',

@@ -9,7 +9,7 @@ function cell(value: string, index: number, identity: string): any {
 }
 export function reset(): void {
     Object.assign(state, { remoteName: undefined, trusted: true, version: '0.9.7', installed: true, activationFailure: false, colabIsActive: false, activationCalls: 0, editorMismatch: false,
-        active: undefined, calls: [], markers: [], startupMode: 'success', mountMode: 'single', selection: true, editFailure: false, cleanupFailure: false, cleanupHang: false });
+        active: undefined, calls: [], markers: [], startupMode: 'success', mountMode: 'single', mountCommandHang: false, selection: true, editFailure: false, cleanupFailure: false, cleanupHang: false });
     const cells = [cell('never_execute_user_code()', 0, 'vscode-notebook-cell:///one'), cell('second_user_cell()', 1, 'vscode-notebook-cell:///two')];
     state.notebook = { notebookType: 'jupyter-notebook', uri: uri('file:///test.ipynb'), isClosed: false, metadata: {},
         get cellCount() { return cells.length; }, getCells: () => cells, cellAt: (i: number) => cells[i] };
@@ -73,7 +73,6 @@ export const commands = { executeCommand: async (id: string, ...args: any[]) => 
     }
     if (id === 'colab.mountServer') {
         if (state.mountMode === 'failure') throw new Error('secret mount token');
-        state.folders.push({ name: 'Colab', uri: uri('colab://test-server/content') });
-        if (state.mountMode === 'ambiguous') state.folders.push({ name: 'Other', uri: uri('colab://other-server/content') });
+        if (state.mountCommandHang) await new Promise<void>((resolve) => { state.finishMountCommand = resolve; });
     }
 } };

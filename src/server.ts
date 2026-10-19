@@ -138,6 +138,19 @@ export function registerNotebookTools(server: McpServer, router: NotebookRouter,
             return { content: [{ type: 'text' as const, text }] };
         });
 
+        server.registerTool('mount_colab_server', {
+            description: 'Recover filesystem mounting for an already selected active idle Python Colab kernel. Accepts only an exact MCP-generated serverAlias from a prior setup receipt, mounts that exact existing server without selecting or starting a kernel or creating a server, and requires fresh same-kernel filesystem verification. Poll or cancel the returned setupId with get_kernel_setup/cancel_kernel_setup.',
+            inputSchema: jsonSchemaToZod({ type: 'object', properties: {
+                notebookRef: { type: 'string', description: 'Notebook URI or notebookRef from list_notebooks.' },
+                serverAlias: { type: 'string', description: 'Exact prior MCP-generated alias matching m followed by eight lowercase hexadecimal characters.' },
+                waitMs: { type: 'number', description: 'How long to wait for a receipt (default 1000, maximum 60000); mounting continues in the tracked setup.' }
+            }, required: ['notebookRef', 'serverAlias'] })
+        }, async (args) => {
+            const a = args as { notebookRef: string; serverAlias: string; waitMs?: number };
+            const text = await router.invokeNotebook('mount_colab_server', a.notebookRef, a as Record<string, unknown>);
+            return { content: [{ type: 'text' as const, text }] };
+        });
+
         for (const operation of ['get_kernel_setup', 'cancel_kernel_setup'] as const) server.registerTool(operation, {
             description: operation === 'get_kernel_setup'
                 ? 'Read the current or specified Colab setup receipt without dispatching setup. Readiness is point-in-time evidence from its completed nonce check.'

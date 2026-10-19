@@ -4,6 +4,8 @@
 
 - Detect failed Colab extension activation before opening its picker, including a cached failure in an extension reported as active. Return a sanitized activation blocker with normal recovery guidance.
 
+- Add `mount_colab_server` recovery for a previously generated Colab alias when its Python kernel is already active but the filesystem was not mounted. The tracked operation neither starts/selects a kernel nor runs cells or creates servers, and requires an exact new or uniquely named existing mount plus fresh same-kernel verification. Setup receipts retain the generated alias after later failures.
+
 - Bind the uniquely identified VS Code owner window and recheck its marker before opening the first Colab picker. Native input actions validate and submit in that exact renderer without depending on operating-system foreground focus.
 
 - Add Colab initialization with `configure_kernel({ notebookRef, runtime: "colab" })`: create a standard CPU server through the installed Colab 0.9.7 picker, pause for an explicit kernel choice, run/remove an owned temporary startup cell, mount the same server and verify runtime/filesystem identity. An already active verified Colab runtime is reused.
