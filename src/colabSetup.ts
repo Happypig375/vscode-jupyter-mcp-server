@@ -347,7 +347,7 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
                 driver = deps.desktop(); job.driver = driver;
                 const editor = await bounded(vscode.window.showNotebookDocument(current(), { preview: false, preserveFocus: false }), signal);
                 if (editor.notebook !== current()) fail('notebook_changed', 'VS Code revealed another notebook.');
-                const markerText = 'MCP Colab mount ' + crypto.randomUUID();
+                const markerText = 'MCP Colab setup ' + crypto.randomUUID();
                 marker = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1_000_000);
                 marker.text = markerText; marker.show();
                 job.stage = 'binding_window'; await driver.bind(markerText, signal); current(); await sameKernel();

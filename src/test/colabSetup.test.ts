@@ -3,20 +3,33 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel, assertNoColabSetup, acquireDesktopLease, SetupDeps } from '../colabSetup';
+import { createColabNativeDriverForTest } from '../colabNative';
 import { state, reset, uri } from './colabSetupStub';
 
 const ref = 'file:///test.ipynb';
 function fixture(options: {
     optional?: boolean; checkFails?: boolean; checkFalse?: boolean; failChoice?: boolean; close?: boolean;
     omitListing?: boolean; listFails?: boolean; listDelay?: boolean; selectDelay?: boolean; providerDelay?: boolean;
+    productionBind?: boolean;
     listings?: Array<Array<{ choiceId: string; label: string }>>;
 } = {}) {
     reset();
-    const events: string[] = []; const checkedRoots: Array<string | undefined> = []; let released = 0; let checked = 0; let enteredAlias: string; let listing = 0;
+    const events: string[] = []; const checkedRoots: Array<string | undefined> = []; let released = 0; let checked = 0; let enteredAlias: string; let listing = 0; let nativeBinds = 0;
     let inputs = options.optional ? ['Select a machine shape', 'Select a runtime version', 'Alias your server'] : ['Alias your server'];
     const listed = options.listings ?? [[{ choiceId: 'kernel-python', label: 'Python 3 (ipykernel)' }]];
+    const nativeBindingDriver = options.productionBind ? createColabNativeDriverForTest(9222, {
+        targets: async () => [{ id: 'owner', type: 'page', url: 'vscode-file://vscode-app/workbench/workbench.html', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/owner' }],
+        connect: async () => ({
+            evaluate: async () => { nativeBinds++; return { driver: true, markers: 1, widgets: 0, inputCount: 0, title: '', placeholder: '', ariaLabel: '', value: '', active: false, incomplete: false, rows: [] }; },
+            dispose() {}
+        })
+    }) : undefined;
     const desktop: any = {
-        bind: async (marker: string) => { assert.ok(state.markers.some((m: any) => m.text === marker)); events.push('bind'); },
+        bind: async (marker: string, signal: AbortSignal) => {
+            assert.ok(state.markers.some((m: any) => m.text === marker));
+            if (nativeBindingDriver) await nativeBindingDriver.bind(marker, signal);
+            events.push('bind');
+        },
         choose: async (_headers: readonly string[], labels: readonly string[], signal: AbortSignal) => {
             events.push(labels[0]); if (options.failChoice) throw new Error('secret UI content');
             if (options.close) state.notebook.isClosed = true;
@@ -41,7 +54,7 @@ function fixture(options: {
             assert.deepStrictEqual(headers, ['Select a Kernel from ' + enteredAlias]); events.push('chosen:' + choiceId);
             if (options.selectDelay) await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('private cancelled selection')), { once: true }));
         },
-        dispose: () => { events.push('dispose'); }
+        dispose: () => { nativeBindingDriver?.dispose(); events.push('dispose'); }
     };
     if (options.omitListing) { delete desktop.listChoices; delete desktop.chooseListed; }
     const deps: SetupDeps = {
@@ -50,7 +63,7 @@ function fixture(options: {
         check: async (_ref, root) => { checked++; checkedRoots.push(root); assert.strictEqual(_ref, ref); assert.ok(root?.startsWith('colab://')); if (options.checkFails) throw new Error('secret runtime'); return JSON.stringify({ verified: !options.checkFalse, checks: { nonce: true } }); },
         desktop: () => desktop
     };
-    return { deps, events, checkedRoots, get released() { return released; }, get checked() { return checked; } };
+    return { deps, events, checkedRoots, get released() { return released; }, get checked() { return checked; }, get nativeBinds() { return nativeBinds; } };
 }
 async function waitForActionOrFinish(setupId: string): Promise<any> {
     const deadline = Date.now() + 2_000;
@@ -127,12 +140,13 @@ async function main() {
         assert.ok(!state.calls.some((call: any) => ['notebook.selectKernel', 'notebook.cell.execute', 'colab.mountServer'].includes(call[0])));
     });
     await test('mount recovery selects only the exact alias and performs no kernel or cell action', async () => {
-        const f = fixture(); state.active = { language: 'python', status: 'idle', executeCode() {} };
+        const f = fixture({ productionBind: true }); state.active = { language: 'python', status: 'idle', executeCode() {} };
         state.folders.push({ name: 'stale', uri: uri('colab://stale-server/content') });
         const before = state.notebook.getCells().map((cell: any) => cell.document.getText());
         const r = JSON.parse(await mountColabServer(ref, 'm0123abcd', { waitMs: 1000 }, f.deps));
         assert.strictEqual(r.ready, true); assert.strictEqual(r.operation, 'mount_colab_server'); assert.strictEqual(r.serverAlias, 'm0123abcd');
         assert.deepStrictEqual(f.events, ['lease', 'bind', 'm0123abcd', 'dispose']);
+        assert.strictEqual(f.nativeBinds, 2, 'mount marker must pass production native bind validation and its ownership recheck');
         assert.deepStrictEqual(f.checkedRoots, ['colab://test-server/']); assert.strictEqual(f.released, 1);
         assert.deepStrictEqual(state.notebook.getCells().map((cell: any) => cell.document.getText()), before);
         assert.deepStrictEqual(state.calls.map((call: any) => call[0]), ['colab.mountServer', 'workbench.action.closeQuickOpen']);
