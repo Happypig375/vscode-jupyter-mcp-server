@@ -9,6 +9,7 @@ const KERNEL_HEADER = 'Select a Kernel from m12345678';
 const TARGET = { id: 'owner', type: 'page', url: 'vscode-file://vscode-app/workbench/workbench.html', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/owner' };
 
 class Fixture implements ColabNativeSession {
+    focused = true; focusCalls = 0; focusSucceeds = true;
     markerCount = 1; widgets = 1; hiddenInputs = 0; active = true; incomplete = false; busy = false;
     title = KERNEL_HEADER; placeholder = KERNEL_HEADER; ariaLabel = KERNEL_HEADER; value = '';
     rows = [{ label: 'Kernel A', description: 'first environment', detail: '', disabled: false }, { label: 'Kernel B', description: '', detail: '', disabled: false }];
@@ -43,13 +44,14 @@ class Fixture implements ColabNativeSession {
             }
         };
         return await vm.runInNewContext(expression, {
-            document: { querySelectorAll: (selector: string) => selector === '.statusbar-item-label' ? Array.from({ length: this.markerCount }, () => ({textContent:MARKER})) :
+            document: { hasFocus: () => this.focused, querySelectorAll: (selector: string) => selector === '.statusbar-item-label' ? Array.from({ length: this.markerCount }, () => ({textContent:MARKER})) :
                 selector === '.quick-input-widget .quick-input-box input' ? [...Array.from({length:this.hiddenInputs},()=>({})),input] : Array.from({ length: this.widgets }, () => widget), activeElement: this.active ? input : undefined },
             getComputedStyle: () => ({ visibility: 'visible' }),
             Event: class { type: string; bubbles: boolean; cancelable: boolean; constructor(type: string, options: { bubbles?: boolean; cancelable?: boolean } = {}) { this.type = type; this.bubbles = options.bubbles === true; this.cancelable = options.cancelable === true; } },
             KeyboardEvent: class { constructor(public type: string, public options: object) {} }
         });
     }
+    async bringToFront(): Promise<void> { this.focusCalls++; if (this.focusSucceeds) this.focused = true; }
     dispose(): void { this.disposed = true; }
 }
 function setup(fixture = new Fixture(), overrides: Partial<ColabNativeTransport> = {}) {
@@ -74,6 +76,26 @@ test('listing makes no input or Enter action; explicit non-first choice is selec
     const write = fixture.evaluations.find(expression => expression.includes("new Event('input'"));
     assert.ok(write); assert.doesNotMatch(write!, /\basync\b|\bawait\b|window\.driver/);
     assert.ok(fixture.evaluations.every(expression => !expression.includes('window.driver')));
+});
+test('binding and kernel listing stay read-only while explicit selection focuses the exact owned page', async () => {
+    const { fixture, driver } = setup(); fixture.focused = false;
+    await driver.bind(MARKER, SIGNAL); const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL);
+    assert.equal(fixture.focusCalls, 0); assert.equal(fixture.focused, false);
+    await driver.chooseListed!([KERNEL_HEADER], choices[1].choiceId, SIGNAL);
+    assert.equal(fixture.focusCalls, 1); assert.equal(fixture.focused, true);
+    assert.deepEqual(fixture.writes, ['Kernel B']); assert.equal(fixture.submits, 1);
+});
+test('unconfirmed page focus and focus lost during a guarded input write cause no input', async () => {
+    const unavailable = setup(); unavailable.fixture.focused = false; unavailable.fixture.focusSucceeds = false;
+    await unavailable.driver.bind(MARKER, SIGNAL);
+    const choices = await unavailable.driver.listChoices!([KERNEL_HEADER], SIGNAL);
+    await rejects(unavailable.driver.chooseListed!([KERNEL_HEADER], choices[0].choiceId, SIGNAL), 'action_failed');
+    assert.equal(unavailable.fixture.focusCalls, 1); assert.deepEqual(unavailable.fixture.writes, []); assert.equal(unavailable.fixture.submits, 0);
+    const raced = setup(); await raced.driver.bind(MARKER, SIGNAL);
+    const other = await raced.driver.listChoices!([KERNEL_HEADER], SIGNAL);
+    raced.fixture.beforeEvaluate = expression => { if (expression.includes("new Event('input'")) raced.fixture.focused = false; };
+    await rejects(raced.driver.chooseListed!([KERNEL_HEADER], other[0].choiceId, SIGNAL), 'action_failed');
+    assert.deepEqual(raced.fixture.writes, []); assert.equal(raced.fixture.submits, 0);
 });
 test('missing native port refuses discovery', async () => {
     const driver = createColabNativeDriverForTest(0, { targets: async () => { throw new Error('should not discover'); }, connect: async () => new Fixture() });
@@ -150,7 +172,7 @@ test('a hidden stale input prevents all text mutation', async () => {
     await rejects(driver.chooseListed!([KERNEL_HEADER],choices[0].choiceId,SIGNAL),'action_failed'); assert.deepEqual(fixture.writes,[]); assert.equal(fixture.submits,0);
 });
 test('picker or focus changes after final proof are rejected at submission', async () => {
-    for (const change of [(f:Fixture)=>{f.active=false;},(f:Fixture)=>{f.placeholder='Other';f.ariaLabel='Other';f.title='Other';},(f:Fixture)=>{f.rows[0].description='changed';}]) {
+    for (const change of [(f:Fixture)=>{f.active=false;},(f:Fixture)=>{f.focused=false;},(f:Fixture)=>{f.placeholder='Other';f.ariaLabel='Other';f.title='Other';},(f:Fixture)=>{f.rows[0].description='changed';}]) {
         const {fixture,driver}=setup();await driver.bind(MARKER,SIGNAL);const choices=await driver.listChoices!([KERNEL_HEADER],SIGNAL);
         fixture.beforeEvaluate=expression=>{if(expression.includes("new KeyboardEvent('keydown'"))change(fixture);};
         await rejects(driver.chooseListed!([KERNEL_HEADER],choices[0].choiceId,SIGNAL),'action_failed');assert.equal(fixture.submits,0);

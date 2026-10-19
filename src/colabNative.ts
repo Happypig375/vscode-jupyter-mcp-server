@@ -12,10 +12,11 @@ interface NativeTarget { id: string; type: string; url: string; webSocketDebugge
 interface Row { label: string; description: string; detail: string; disabled: boolean; }
 interface Snapshot {
     dom: boolean; markers: number; widgets: number; inputCount: number; title: string; placeholder: string;
-    ariaLabel: string; value: string; active: boolean; incomplete: boolean; rows: Row[];
+    ariaLabel: string; value: string; active: boolean; focused: boolean; incomplete: boolean; rows: Row[];
 }
 export interface ColabNativeSession {
     evaluate(expression: string, signal: AbortSignal): Promise<unknown>;
+    bringToFront(signal: AbortSignal): Promise<void>;
     dispose(): void;
 }
 export interface ColabNativeTransport {
@@ -67,7 +68,7 @@ function snapshotExpression(marker: string): string {
             [...w.querySelectorAll('.quick-input-list .monaco-scrollable-element')].some(e => e.scrollHeight > e.clientHeight + 2));
         return {dom:true, markers, widgets:widgets.length, inputCount:document.querySelectorAll(${JSON.stringify(INPUT)}).length, title:text(w?.querySelector('.quick-input-title')),
             placeholder:input?.getAttribute('placeholder') || '', ariaLabel:input?.getAttribute('aria-label') || '',
-            value:input?.value || '', active:!!input && document.activeElement === input, incomplete,
+            value:input?.value || '', active:!!input && document.activeElement === input, focused:document.hasFocus(), incomplete,
             rows:rows.slice(0,129)};
     })()`;
 }
@@ -77,7 +78,7 @@ function parseSnapshot(raw: unknown): Snapshot {
     if (v.dom !== true) throw failed();
     if (!Number.isInteger(v.markers) || !Number.isInteger(v.widgets) || !Number.isInteger(v.inputCount) ||
         !['title', 'placeholder', 'ariaLabel', 'value'].every(k => boundedString(v[k as keyof Snapshot])) ||
-        typeof v.active !== 'boolean' || typeof v.incomplete !== 'boolean' || !Array.isArray(v.rows) || v.rows.length > 128 ||
+        typeof v.active !== 'boolean' || typeof v.focused !== 'boolean' || typeof v.incomplete !== 'boolean' || !Array.isArray(v.rows) || v.rows.length > 128 ||
         v.rows.some(r => !r || !boundedString(r.label, 256) || !r.label || !boundedString(r.description) ||
             !boundedString(r.detail) || typeof r.disabled !== 'boolean')) throw failed();
     return v as Snapshot;
@@ -154,6 +155,7 @@ class NativeDriver implements DesktopSetupDriver {
         if (inputs.length !== 1 || inputs[0] !== 'Alias your server' || !/^m[a-f0-9]{8}$/.test(value)) throw failed();
         const first = await this.poll(inputs, signal);
         this.requireCpu(first.snapshot);
+        await this.focusOwnedWindow(signal);
         await this.setValue(value, inputs, signal, undefined, true);
         const proof = await this.snapshot(signal);
         this.requireCpu(proof);
@@ -190,6 +192,17 @@ class NativeDriver implements DesktopSetupDriver {
         if (s.markers !== 1) throw new DesktopSetupError('window_binding_failed');
         return s;
     }
+    private async focusOwnedWindow(signal: AbortSignal): Promise<Snapshot> {
+        // Binding/listing stay read-only. Only an explicit input action may bring
+        // the exact marker-owned page forward, then revalidate the binding.
+        let snapshot = await this.snapshot(signal);
+        if (!snapshot.focused) {
+            await this.session!.bringToFront(signal);
+            snapshot = await this.snapshot(signal);
+            if (!snapshot.focused) throw failed();
+        }
+        return snapshot;
+    }
     private async poll(inputs: readonly string[], signal: AbortSignal, ready: (s: Snapshot) => boolean = () => true): Promise<{ snapshot: Snapshot; name: string }> {
         const deadline = Date.now() + this.timing.pickerMs;
         while (true) {
@@ -212,7 +225,7 @@ class NativeDriver implements DesktopSetupDriver {
             if (markers.length !== 1 || widgets.length !== 1 || allInputs.length !== 1) return false;
             const widget = widgets[0], input = allInputs[0];
             const widgetInputs = [...widget.querySelectorAll('.quick-input-box input')].filter(visible);
-            if (widgetInputs.length !== 1 || widgetInputs[0] !== input || document.activeElement !== input || !visible(input)) return false;
+            if (widgetInputs.length !== 1 || widgetInputs[0] !== input || document.activeElement !== input || !document.hasFocus() || !visible(input)) return false;
             const labels = ${JSON.stringify(inputs)}, expectedRow = ${JSON.stringify(row ?? null)};
             const title = text(widget.querySelector('.quick-input-title')), placeholder = input.getAttribute('placeholder') || '', aria = input.getAttribute('aria-label') || '';
             if (labels.filter(label => [title,placeholder,aria].some(name => name === label || name.endsWith(' - ' + label))).length !== 1) return false;
@@ -231,7 +244,7 @@ class NativeDriver implements DesktopSetupDriver {
         alive(signal); if (await this.session!.evaluate(expression, signal) !== true) throw failed();
     }
     private async select(inputs: readonly string[], row: Row, signal: AbortSignal): Promise<void> {
-        const before = await this.snapshot(signal);
+        const before = await this.focusOwnedWindow(signal);
         if (!header(before, inputs) || before.rows.filter(r => rowKey(r) === rowKey(row) && !r.disabled).length !== 1) throw new DesktopSetupError('kernel_choice_stale');
         await this.setValue(row.label, inputs, signal, row);
         // Filtering is asynchronous. Do not press Enter while another item could be active.
@@ -243,6 +256,7 @@ class NativeDriver implements DesktopSetupDriver {
     }
     private async submit(inputs: readonly string[], value: string, signal: AbortSignal, row?: Row, cpu = false): Promise<void> {
         alive(signal);
+        await this.focusOwnedWindow(signal);
         // Validate and dispatch synchronously in one renderer turn. The event is
         // targeted to the proved input object, never to whichever control has focus
         // when a later generic CDP key command eventually arrives.
@@ -258,7 +272,7 @@ class NativeDriver implements DesktopSetupDriver {
                 const currentWidgets = [...document.querySelectorAll('.quick-input-widget')].filter(visible);
                 const currentInputs = [...document.querySelectorAll(${JSON.stringify(INPUT)})];
                 if (markers.length !== 1 || currentWidgets.length !== 1 || currentWidgets[0] !== widget ||
-                    currentInputs.length !== 1 || currentInputs[0] !== input || document.activeElement !== input ||
+                    currentInputs.length !== 1 || currentInputs[0] !== input || document.activeElement !== input || !document.hasFocus() ||
                     !visible(input) || input.value !== ${JSON.stringify(value)}) return false;
                 const title = text(widget.querySelector('.quick-input-title')), placeholder = input.getAttribute('placeholder') || '', aria = input.getAttribute('aria-label') || '';
                 if (labels.filter(label => [title,placeholder,aria].some(name => name === label || name.endsWith(' - ' + label))).length !== 1) return false;
@@ -321,6 +335,9 @@ class CdpSession implements ColabNativeSession {
         const response = await this.command('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, signal) as { exceptionDetails?: unknown; result?: { value?: unknown } };
         if (!response || response.exceptionDetails || !response.result || !Object.hasOwn(response.result, 'value')) throw failed();
         return response.result.value;
+    }
+    async bringToFront(signal: AbortSignal): Promise<void> {
+        await this.command('Page.bringToFront', {}, signal);
     }
     dispose(): void {
         if (this.closed) return;

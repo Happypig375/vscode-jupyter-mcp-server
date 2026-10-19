@@ -14,7 +14,9 @@ Tool schemas are strict. Unknown or obsolete keys fail validation. `list_kernels
 
 ## Colab setup in 0.5.0
 
-Initial controller suggestions can use the exact notebook's relative label in **Select/Change kernel for '…'**, followed by **Select Another Kernel**. Bind those labels to the target notebook and preserve exact synchronous header/row checks; do not select a local suggestion or broadly match another notebook's label.
+Native input actions may use only the fixed `Page.bringToFront` call on the exact marker-bound CDP page, followed by fresh binding/focus verification. Binding and listing must not focus or write. Preserve synchronous `document.hasFocus()` and exact active-input checks for every input write and Enter dispatch.
+
+Initial controller suggestions can use the exact notebook's relative label in **Select/Change kernel for '…'**, followed by **Select Another Kernel**. Match the platform separators and, in multi-folder windows, the exact owning folder name plus the workbench bullet separator. Bind those labels to the target notebook and preserve exact synchronous header/row checks; do not select a local suggestion or broadly match another notebook's label. First-server mounting can refresh the extension host: retain the server alias, re-list window/notebook handles and reconfigure that exact server with explicit kernel selection and fresh verification. An interrupted in-memory setup receipt is not readiness.
 
 `list_colab_terminals` and `close_colab_terminals` inspect and explicitly close selected authorized terminals before environment preparation. References bind the latest short-lived per-window inventory and exact live objects. Metadata is not proof of idleness or ownership. Never auto-close restored terminals, expose arguments/environment/history, execute arbitrary shell text, or imply that disposal guarantees graceful command completion. Validate all targets before closure and retain partial/uncertain outcomes.
 

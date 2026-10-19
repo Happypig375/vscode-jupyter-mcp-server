@@ -2,7 +2,9 @@
 
 ## 0.5.0
 
-- Handle VS Code's notebook-specific initial controller suggestions and subsequent **Select Another Kernel** provider picker. The initial label is derived from the exact notebook; a suggested local kernel is never selected by default.
+- Bring only the exact bound VS Code page forward through Chromium before input actions, then verify window and input focus. Read-only binding/listing do not move focus; lost focus prevents input.
+
+- Handle VS Code's notebook-specific initial controller suggestions and subsequent **Select Another Kernel** provider picker, including platform separators and exact folder names after mounting creates a multi-folder workspace. Document same-server MCP recovery after the resulting extension-host refresh. A suggested local kernel is never selected by default.
 
 - Add window-scoped terminal inspection and explicit closure for Colab preparation blockers. Short-lived references bind exact terminal objects and metadata; closure never infers idleness or ownership, selects all terminals implicitly, or reads command/history/environment content. Partial and uncertain closure remain explicit.
 

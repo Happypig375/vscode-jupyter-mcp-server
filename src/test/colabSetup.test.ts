@@ -20,7 +20,8 @@ function fixture(options: {
     const nativeBindingDriver = options.productionBind ? createColabNativeDriverForTest(9222, {
         targets: async () => [{ id: 'owner', type: 'page', url: 'vscode-file://vscode-app/workbench/workbench.html', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/owner' }],
         connect: async () => ({
-            evaluate: async () => { nativeBinds++; return { dom: true, markers: 1, widgets: 0, inputCount: 0, title: '', placeholder: '', ariaLabel: '', value: '', active: false, incomplete: false, rows: [] }; },
+            evaluate: async () => { nativeBinds++; return { dom: true, markers: 1, widgets: 0, inputCount: 0, title: '', placeholder: '', ariaLabel: '', value: '', active: false, focused: true, incomplete: false, rows: [] }; },
+            bringToFront: async () => { throw new Error('Binding must not focus the page'); },
             dispose() {}
         })
     }) : undefined;
