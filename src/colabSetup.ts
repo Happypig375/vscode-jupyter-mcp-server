@@ -449,7 +449,9 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         // The public API returns slash-separated relative paths; the Windows
         // workbench's file label uses backslashes. Both are exact target labels.
         const notebookLabels = [...new Set([relativeLabel, relativeLabel.split('/').join(path.sep)].map(label => folderPrefix + label))];
-        const initialHeaders = ['Select Kernel', ...notebookLabels.flatMap(label => [`Select kernel for '${label}'`, `Change kernel for '${label}'`])];
+        // A remembered controller can open the source picker directly after a
+        // workspace/extension-host refresh, without the suggestions screen.
+        const initialHeaders = ['Select Kernel', 'Select Another Kernel', ...notebookLabels.flatMap(label => [`Select kernel for '${label}'`, `Change kernel for '${label}'`])];
         const first = await picker((stepSignal) => driver!.choose(initialHeaders, ['Select Another Kernel...', 'Colab'], stepSignal));
         if (first !== 'Colab') await picker((stepSignal) => driver!.choose(['Select Kernel', 'Select Another Kernel'], ['Colab'], stepSignal));
         let alias: string;

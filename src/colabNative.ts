@@ -248,7 +248,7 @@ class NativeDriver implements DesktopSetupDriver {
         if (!header(before, inputs) || before.rows.filter(r => rowKey(r) === rowKey(row) && !r.disabled).length !== 1) throw new DesktopSetupError('kernel_choice_stale');
         await this.setValue(row.label, inputs, signal, row);
         // Filtering is asynchronous. Do not press Enter while another item could be active.
-        const filtered = await this.poll(inputs, signal, s => s.value === row.label && s.rows.length === 1 && rowKey(s.rows[0]) === rowKey(row));
+        const filtered = await this.poll(inputs, signal, s => !s.incomplete && s.value === row.label && s.rows.length === 1 && rowKey(s.rows[0]) === rowKey(row));
         if (!filtered.snapshot.active || filtered.snapshot.incomplete) throw failed();
         const proof = await this.snapshot(signal);
         if (!header(proof, inputs) || proof.value !== row.label || !proof.active || proof.rows.length !== 1 || rowKey(proof.rows[0]) !== rowKey(row)) throw new DesktopSetupError('kernel_choice_stale');

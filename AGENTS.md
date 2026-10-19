@@ -14,7 +14,7 @@ Tool schemas are strict. Unknown or obsolete keys fail validation. `list_kernels
 
 ## Colab setup in 0.5.0
 
-Native input actions may use only the fixed `Page.bringToFront` call on the exact marker-bound CDP page, followed by fresh binding/focus verification. Binding and listing must not focus or write. Preserve synchronous `document.hasFocus()` and exact active-input checks for every input write and Enter dispatch.
+Native input actions may use only the fixed `Page.bringToFront` call on the exact marker-bound CDP page, followed by fresh binding/focus verification. Binding and listing must not focus or write. Preserve synchronous `document.hasFocus()` and exact active-input checks for every input write and Enter dispatch. Wait for filtered picker loading to settle before submission; a loading row is not ready. The source picker can open directly at **Select Another Kernel** after a refresh; accept that exact entry point without assuming a preceding suggestions action.
 
 Initial controller suggestions can use the exact notebook's relative label in **Select/Change kernel for '…'**, followed by **Select Another Kernel**. Match the platform separators and, in multi-folder windows, the exact owning folder name plus the workbench bullet separator. Bind those labels to the target notebook and preserve exact synchronous header/row checks; do not select a local suggestion or broadly match another notebook's label. First-server mounting can refresh the extension host: retain the server alias, re-list window/notebook handles and reconfigure that exact server with explicit kernel selection and fresh verification. An interrupted in-memory setup receipt is not readiness.
 

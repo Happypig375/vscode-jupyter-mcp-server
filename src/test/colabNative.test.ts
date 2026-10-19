@@ -152,6 +152,26 @@ test('duplicate kernel labels are ambiguous even with distinct descriptions', as
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL); fixture.rows[1].label = fixture.rows[0].label;
     await rejects(driver.listChoices!([KERNEL_HEADER], SIGNAL), 'ambiguous_picker');
 });
+test('selection waits for a filtered picker to settle before Enter', async () => {
+    const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
+    const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL); let settling = 0;
+    fixture.beforeEvaluate = expression => {
+        if (expression.includes("new Event('input'")) fixture.busy = true;
+        if (fixture.value && expression.includes('return {dom:true')) {
+            assert.equal(fixture.submits, 0); settling++;
+            if (settling >= 3) fixture.busy = false;
+        }
+    };
+    await driver.chooseListed!([KERNEL_HEADER], choices[0].choiceId, SIGNAL);
+    assert.ok(settling >= 3); assert.equal(fixture.submits, 1);
+});
+test('a permanently busy filtered picker times out without Enter', async () => {
+    const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
+    const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL);
+    fixture.beforeEvaluate = expression => { if (expression.includes("new Event('input'")) fixture.busy = true; };
+    await rejects(driver.chooseListed!([KERNEL_HEADER], choices[0].choiceId, SIGNAL), 'picker_timeout');
+    assert.equal(fixture.submits, 0);
+});
 test('lost owner marker before select prevents mutation', async () => {
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
     const choices = await driver.listChoices!([KERNEL_HEADER], SIGNAL); fixture.markerCount = 0;

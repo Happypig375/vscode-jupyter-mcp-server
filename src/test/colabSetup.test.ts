@@ -10,7 +10,7 @@ const ref = 'file:///test.ipynb';
 function fixture(options: {
     optional?: boolean; checkFails?: boolean; checkFalse?: boolean; failChoice?: boolean; close?: boolean;
     omitListing?: boolean; listFails?: boolean; listDelay?: boolean; selectDelay?: boolean; providerDelay?: boolean;
-    productionBind?: boolean; missingServerAlias?: boolean;
+    productionBind?: boolean; missingServerAlias?: boolean; directSourcePicker?: boolean;
     listings?: Array<Array<{ choiceId: string; label: string }>>;
 } = {}) {
     reset();
@@ -33,6 +33,10 @@ function fixture(options: {
         },
         choose: async (_headers: readonly string[], labels: readonly string[], signal: AbortSignal) => {
             headerSelections.push([..._headers]);
+            if (options.directSourcePicker && headerSelections.length === 1) {
+                assert.ok(_headers.includes('Select Another Kernel'));
+                assert.ok(labels.includes('Colab')); events.push('Colab'); return 'Colab';
+            }
             events.push(labels[0]); if (options.failChoice) throw new Error('secret UI content');
             if (options.missingServerAlias && _headers[0] === 'Select a Jupyter Server' && /^m[a-f0-9]{8}$/.test(labels[0])) throw new Error('secret missing alias row');
             if (_headers[0] === 'Select a Jupyter Server' && /^m[a-f0-9]{8}$/.test(labels[0])) enteredAlias = labels[0];
@@ -109,8 +113,8 @@ async function main() {
         const f = fixture(); state.relativeNotebookLabel = 'nested/target.ipynb';
         assert.strictEqual((await result(f, 'm7ae91d89')).ready, true);
         assert.deepStrictEqual(f.headerSelections[0], process.platform === 'win32'
-            ? ['Select Kernel', "Select kernel for 'nested/target.ipynb'", "Change kernel for 'nested/target.ipynb'", "Select kernel for 'nested\\target.ipynb'", "Change kernel for 'nested\\target.ipynb'"]
-            : ['Select Kernel', "Select kernel for 'nested/target.ipynb'", "Change kernel for 'nested/target.ipynb'"]);
+            ? ['Select Kernel', 'Select Another Kernel', "Select kernel for 'nested/target.ipynb'", "Change kernel for 'nested/target.ipynb'", "Select kernel for 'nested\\target.ipynb'", "Change kernel for 'nested\\target.ipynb'"]
+            : ['Select Kernel', 'Select Another Kernel', "Select kernel for 'nested/target.ipynb'", "Change kernel for 'nested/target.ipynb'"]);
         assert.deepStrictEqual(f.headerSelections[1], ['Select Kernel', 'Select Another Kernel']);
         assert.ok(!f.events.includes('Python'), 'a suggested local controller is never selected');
     });
@@ -124,13 +128,22 @@ async function main() {
         assert.ok(state.calls.some((call: any) => call[0] === 'notebook.cell.execute'));
         assert.ok(state.calls.some((call: any) => call[0] === 'colab.mountServer'));
     });
+    await test('a direct source picker recovers the exact server without a suggestions action', async () => {
+        const alias = 'm7ae91d89'; const f = fixture({ directSourcePicker: true });
+        state.folders.push({ name: alias, uri: uri('colab://matching/content') });
+        const r = await result(f, alias);
+        assert.strictEqual(r.ready, true); assert.strictEqual(r.serverAlias, alias);
+        assert.deepStrictEqual(f.events, ['lease', 'bind', 'Colab', alias, 'list', 'chosen:kernel-python', alias, 'dispose']);
+        assert.ok(!f.events.includes('Select Another Kernel...'));
+        assert.deepStrictEqual(f.checkedRoots, ['colab://matching/']);
+    });
     await test('multi-folder recovery uses the notebook folder name and workbench bullet separator', async () => {
         const f = fixture(); state.relativeNotebookLabel = 'nested/target.ipynb';
         state.folders.push({ name: 'm7ae91d89', uri: uri('colab://matching/content') });
         assert.strictEqual((await result(f, 'm7ae91d89')).ready, true);
         assert.deepStrictEqual(f.headerSelections[0], process.platform === 'win32'
-            ? ['Select Kernel', "Select kernel for 'workspace • nested/target.ipynb'", "Change kernel for 'workspace • nested/target.ipynb'", "Select kernel for 'workspace • nested\\target.ipynb'", "Change kernel for 'workspace • nested\\target.ipynb'"]
-            : ['Select Kernel', "Select kernel for 'workspace • nested/target.ipynb'", "Change kernel for 'workspace • nested/target.ipynb'"]);
+            ? ['Select Kernel', 'Select Another Kernel', "Select kernel for 'workspace • nested/target.ipynb'", "Change kernel for 'workspace • nested/target.ipynb'", "Select kernel for 'workspace • nested\\target.ipynb'", "Change kernel for 'workspace • nested\\target.ipynb'"]
+            : ['Select Kernel', 'Select Another Kernel', "Select kernel for 'workspace • nested/target.ipynb'", "Change kernel for 'workspace • nested/target.ipynb'"]);
     });
     await test('requested alias reuses only its unique mounted root with fresh verification', async () => {
         const alias = 'm7ae91d89'; const f = fixture(); state.active = { status: 'idle' };

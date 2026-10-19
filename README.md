@@ -91,7 +91,7 @@ The package declares `ms-toolsai.jupyter` as a dependency. Kernel-backed tools (
 
 ### Colab setup and checking
 
-If VS Code initially suggests local kernels for the notebook, setup chooses **Select Another Kernel... → Colab**. It does not accept a suggested local kernel as a default.
+If VS Code initially suggests local kernels for the notebook, setup chooses **Select Another Kernel... → Colab**. If the source picker opens directly, setup chooses **Colab** there. It does not accept a suggested local kernel as a default.
 
 Before an input action, MCP brings its exact bound VS Code page to the foreground through Chromium and verifies focus. Binding and kernel listing remain read-only; input guards check focus again before typing or submitting.
 
