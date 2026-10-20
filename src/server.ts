@@ -9,6 +9,12 @@ async function invokeMany(router: NotebookRouter, operation: LocalOperation, not
 }
 /** Register the notebook MCP server's tools on a given McpServer. */
 export function registerNotebookTools(server: McpServer, router: NotebookRouter, hasJupyter: boolean): void {
+    server.registerTool('inspect_colab_environment_preflight', {
+        description: 'Read a bounded, app-wide Colab environment preflight across connected VS Code peers. Reports only counts, boolean state, sanitized process/install/version corroboration, loopback native-listener candidates, blocker codes, and the currently supported next operation. It never exposes document contents, terminal commands/history/environment, broad launch arguments, authentication state, or exact peer-to-app-window mapping; it does not save, close, focus, reload, restart, or select a runtime.',
+        inputSchema: jsonSchemaToZod({ type: 'object', properties: {} })
+    }, async () => {
+        return { content: [{ type: 'text' as const, text: await router.inspectColabEnvironmentPreflight() }] };
+    });
     server.registerTool('list_colab_terminals', {
         description: 'Inspect integrated terminals in one VS Code window before Colab environment preparation. Returns short-lived opaque references and bounded metadata, never commands, history or environment. This cannot establish that a shell is idle or owned by the caller. No terminal is closed.',
         inputSchema: jsonSchemaToZod({ type: 'object', properties: {

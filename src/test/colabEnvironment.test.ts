@@ -62,6 +62,7 @@ async function fixture(options: { native?: boolean; restart?: boolean } = {}): P
             env: { APPDATA: appData, LOCALAPPDATA: localAppData, USERPROFILE: profile, VSCODE_PID: String(PID) },
             vscodeVersion: '1.142.0',
             probeNative: async () => options.native === true,
+            inspectNative: async () => ({ listenerAvailable: options.native === true, workbenchPageCount: options.native ? 1 : null }),
             runCodeStatus: async () => status(),
             inspectProcess: async () => identity,
             reservePort: async () => 59267,
@@ -182,6 +183,137 @@ test('default Windows installation/profile derivation accepts only the pinned or
     assert.strictEqual(actual.userDataDir, path.resolve(appData, 'Code'));
     assert.throws(() => validateDefaultWindowsInstallForTest({ ...input, globalStoragePath: path.join(temp, 'profile', 'globalStorage', 'hadrian.jupyter-mcp') }), /default stable VS Code profile/);
     assert.throws(() => validateDefaultWindowsInstallForTest({ ...input, env: { ...input.env, VSCODE_PORTABLE: '1' } }), /Portable VS Code/);
+});
+
+test('read-only preflight reports bounded state and sanitized exact application corroboration', async () => {
+    const f = await fixture({ restart: true, native: true });
+    try {
+        let probeCalls = 0;
+        f.deps.probeNative = async () => { probeCalls++; return true; };
+        state.folders = [{ name: 'private-project-name', uri: fileUri(path.join(f.temp, 'private-project')) }];
+        state.workspaceFile = rawUri('untitled:private-workspace-identity');
+        state.notebooks = [
+            { uri: fileUri(path.join(f.temp, 'secret-notebook.ipynb')), isUntitled: false, isDirty: true },
+            { uri: rawUri('untitled:private-draft.ipynb'), isUntitled: true, isDirty: false }
+        ];
+        state.documents = [
+            { uri: fileUri(path.join(f.temp, 'secret.txt')), isUntitled: false, isDirty: false, getText: () => 'TOP SECRET CONTENT' },
+            { uri: rawUri('untitled:private-text'), isUntitled: true, isDirty: true, getText: () => 'ANOTHER SECRET' }
+        ];
+        state.visibleEditors = [{}];
+        state.activeEditor = {};
+        state.visibleNotebooks = [{ notebook: state.notebooks[0] }];
+        state.activeNotebook = { notebook: state.notebooks[0] };
+        state.tabs = [{ label: 'private-tab-title', input: { secret: 'PRIVATE TAB INPUT' }, isDirty: true }];
+        state.terminals = [{ name: 'private-shell', creationOptions: { shellPath: 'secret-command' } }];
+        state.activeDebugSession = { name: 'private-debug-name' };
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.readOnly, true);
+        assert.deepStrictEqual(result.window.workspace, { kind: 'workspace', folderCount: 1 });
+        assert.deepStrictEqual(result.window.notebooks, { total: 2, fileBacked: 1, untitled: 1, dirty: 1, visibleEditors: 1, activeEditor: true });
+        assert.deepStrictEqual(result.window.textDocuments, { total: 2, fileBacked: 1, untitled: 1, dirty: 1, blocking: 2, visibleEditors: 1, activeEditor: true });
+        assert.deepStrictEqual(result.window.tabs, { total: 1, dirty: 1, benignWelcomeOnly: false });
+        assert.deepStrictEqual(result.window.terminals, { total: 1 });
+        assert.strictEqual(result.window.debugging.active, true);
+        assert.strictEqual(result.nativeBinding.listenerAvailable, true);
+        assert.strictEqual(result.nativeBinding.workbenchPageCount, 1);
+        assert.strictEqual(result.nativeBinding.exactWindowBinding, 'not-established');
+        assert.strictEqual(result.application.status, 'verified');
+        assert.strictEqual(result.application.commit, COMMIT);
+        assert.strictEqual(result.application.mainProcessPid, PID);
+        assert.strictEqual(result.application.actualWindowCount, 1);
+        assert.ok(result.blockers.includes('automatic_restart_workspace_present'));
+        assert.ok(result.blockers.includes('open_document_present'));
+        assert.ok(result.blockers.includes('terminal_present'));
+        const serialized = JSON.stringify(result);
+        for (const secret of ['private-project-name', 'private-workspace-identity', 'secret-notebook', 'TOP SECRET CONTENT', 'ANOTHER SECRET', 'private-tab-title', 'PRIVATE TAB INPUT', 'private-shell', 'secret-command', 'private-debug-name', '--crash-reporter-id']) {
+            assert.ok(!serialized.includes(secret), `preflight leaked ${secret}`);
+        }
+        assert.deepStrictEqual(state.calls, []);
+        assert.deepStrictEqual(state.workspaceUpdates, []);
+        assert.strictEqual(probeCalls, 0, 'read-only inspection must not run the marker-binding native probe');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('preflight reports an invalid configured native port without probing or mutating', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        state.configuredPort = 70000;
+        let nativeInspections = 0, probeCalls = 0;
+        f.deps.inspectNative = async () => { nativeInspections++; return { listenerAvailable: true, workbenchPageCount: 1 }; };
+        f.deps.probeNative = async () => { probeCalls++; return true; };
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.nativeBinding.source, 'invalid');
+        assert.strictEqual(result.nativeBinding.port, null);
+        assert.ok(result.blockers.includes('native_port_invalid'));
+        assert.ok(result.blockers.includes('native_binding_unavailable'));
+        assert.strictEqual(nativeInspections, 0);
+        assert.strictEqual(probeCalls, 0);
+        assert.strictEqual(f.quitCalls, 0);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('preflight editor-only blockers match the automatic empty-window checks', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        state.visibleNotebooks = [{}];
+        let result = parsed(await manager.inspect());
+        assert.strictEqual(result.window.notebooks.total, 0);
+        assert.strictEqual(result.window.notebooks.visibleEditors, 1);
+        assert.ok(result.blockers.includes('open_notebook_present'));
+
+        state.visibleNotebooks = []; state.activeNotebook = {};
+        result = parsed(await manager.inspect());
+        assert.strictEqual(result.window.notebooks.activeEditor, true);
+        assert.ok(result.blockers.includes('open_notebook_present'));
+
+        state.activeNotebook = undefined; state.activeEditor = {};
+        result = parsed(await manager.inspect());
+        assert.strictEqual(result.window.textDocuments.total, 0);
+        assert.strictEqual(result.window.textDocuments.activeEditor, true);
+        assert.ok(result.blockers.includes('open_document_present'));
+        assert.deepStrictEqual(state.calls, []);
+        assert.deepStrictEqual(state.workspaceUpdates, []);
+        assert.strictEqual(f.quitCalls, 0);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('preflight reports unsupported identity without invoking restart or exposing paths', async () => {
+    const f = await fixture();
+    try {
+        let statusCalls = 0; f.deps.runCodeStatus = async () => { statusCalls++; return status(); };
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.application.status, 'unsupported');
+        assert.strictEqual(result.application.defaultInstall, 'unsupported');
+        assert.strictEqual(statusCalls, 0, 'unsupported installation must fail before running the status command');
+        assert.strictEqual(f.quitCalls, 0);
+        const serialized = JSON.stringify(result);
+        assert.ok(!serialized.includes(f.temp));
+        assert.ok(result.blockers.includes(result.application.failureCode));
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('preflight rejects a recycled main process across status corroboration', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        let inspections = 0;
+        f.deps.inspectProcess = async () => ({
+            pid: PID,
+            executablePath: f.identity.executablePath,
+            creationTime: ++inspections === 1 ? '20261021010101.000000+000' : '20261021010202.000000+000'
+        });
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.application.status, 'mismatch');
+        assert.strictEqual(result.application.mainProcessIdentity, 'mismatch');
+        assert.strictEqual(result.application.failureCode, 'main_process_unverified');
+        assert.strictEqual(inspections, 2);
+        assert.strictEqual(f.quitCalls, 0);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
 });
 
 test('local vscode-userdata global storage maps only to the exact default-profile extension root', async () => {

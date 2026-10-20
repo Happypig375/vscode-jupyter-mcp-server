@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import * as vm from 'vm';
-import { createColabNativeDriverForTest, connectColabNativeSessionForTest, ColabNativeSession, ColabNativeTransport } from '../colabNative';
+import { createColabNativeDriverForTest, connectColabNativeSessionForTest, ColabNativeSession, ColabNativeTransport, inspectColabNativeEndpointForTest } from '../colabNative';
 import { DesktopSetupErrorCode } from '../colabDesktop';
 
 const MARKER = 'MCP Colab setup 12345678-1234-1234-1234-123456789abc';
@@ -67,6 +67,23 @@ async function rejects(promise: Promise<unknown>, code: DesktopSetupErrorCode) {
 }
 const cases: Array<[string, () => Promise<void>]> = [];
 function test(name: string, fn: () => Promise<void>) { cases.push([name, fn]); }
+
+test('endpoint inspection reads only the bounded target catalog and establishes no window binding', async () => {
+    let connects = 0;
+    const transport: ColabNativeTransport = {
+        targets: async () => [TARGET, { id: 'other', type: 'worker', url: 'vscode-file://vscode-app/worker.js' }],
+        connect: async () => { connects++; throw new Error('inspection must not connect'); }
+    };
+    assert.deepStrictEqual(await inspectColabNativeEndpointForTest(9222, transport, SIGNAL), {
+        listenerAvailable: true, workbenchPageCount: 1
+    });
+    assert.strictEqual(connects, 0);
+    const malformed: ColabNativeTransport = { targets: async () => [{ ...TARGET, webSocketDebuggerUrl: 'ws://example.com/devtools/page/owner' }], connect: transport.connect };
+    assert.deepStrictEqual(await inspectColabNativeEndpointForTest(9222, malformed, SIGNAL), {
+        listenerAvailable: false, workbenchPageCount: null
+    });
+    assert.strictEqual(connects, 0);
+});
 
 test('listing makes no input or Enter action; explicit non-first choice is selected', async () => {
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);

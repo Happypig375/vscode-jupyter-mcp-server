@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { BrokerCoordinator, BrokerRole, NotebookRouter } from './broker';
+import { aggregateColabEnvironmentPreflight, BrokerCoordinator, BrokerRole, NotebookRouter } from './broker';
 import { executeLocalOperation } from './localOperations';
 import { listOpenNotebooks } from './notebookOps';
 import { registerNotebookTools } from './server';
@@ -38,6 +38,10 @@ function localRouter(): NotebookRouter {
         async listNotebooks() {
             return [{ windowId, windowLabel: windowLabelValue,
                 notebooks: listOpenNotebooks().map((uri) => ({ notebookRef: notebookRefFor(windowId, uri), uri })) }];
+        },
+        async inspectColabEnvironmentPreflight() {
+            const text = await executeLocalOperation('inspect_colab_environment_preflight', {}).catch(() => undefined);
+            return aggregateColabEnvironmentPreflight([{ windowId, text }]);
         },
         async invokeNotebook(operation, notebookRef, args) {
             const uri = await resolveLocalNotebook(notebookRef);

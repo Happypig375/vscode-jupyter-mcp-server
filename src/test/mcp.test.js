@@ -51,8 +51,11 @@ function makeDoc(type, data) {
 }
 
 const vscodeShim = {
+    version: '1.142.0',
     workspace: {
-        getConfiguration: () => ({ get: (k, d) => {
+        getConfiguration: (section) => ({ get: (k, d) => {
+            if (section === 'window' && k === 'confirmBeforeClose') return 'never';
+            if (section === 'window' && k === 'restoreWindows') return 'all';
             if (k === 'transport') return 'http';
             if (k === 'port') return PORT;
             if (k === 'enabled') return true;
@@ -60,7 +63,10 @@ const vscodeShim = {
             return d;
         }}),
         workspaceFolders: undefined, // empty window
+        workspaceFile: undefined,
+        isTrusted: true,
         notebookDocuments: openNotebooks,
+        textDocuments: [],
         fs: { writeFile: async () => {} },
         applyEdit: async (edit) => {
             // Mutate the target notebook's cells based on NotebookEdit ops recorded by the shim's WorkspaceEdit.set.
@@ -89,6 +95,11 @@ const vscodeShim = {
     },
     window: {
         terminals: [],
+        visibleNotebookEditors: [],
+        activeNotebookEditor: undefined,
+        visibleTextEditors: [],
+        activeTextEditor: undefined,
+        tabGroups: { all: [{ tabs: [] }], close: async () => true },
         onDidOpenTerminal: () => ({ dispose() {} }),
         onDidCloseTerminal: () => ({ dispose() {} }),
         onDidChangeTerminalState: () => ({ dispose() {} }),
@@ -119,7 +130,8 @@ const vscodeShim = {
             if (cmd === 'notebook.interruptKernel') interrupted.push(args[0]);
         }
     },
-    env: { clipboard: { writeText: async () => {} } },
+    env: { clipboard: { writeText: async () => {} }, appHost: 'desktop', remoteName: undefined },
+    debug: { activeDebugSession: undefined },
     StatusBarAlignment: { Right: 1 },
     WorkspaceEdit: class { constructor() { this._ops = []; } set(uri, edits) { this._ops.push([String(uri), edits]); } },
     NotebookEdit: {
@@ -188,8 +200,26 @@ async function main() {
 
     // 1. No Jupyter -> kernel tools absent, document tools present.
     await check('tool set (no Jupyter)', async () => {
-        const expected = ['list_colab_terminals', 'close_colab_terminals', 'prepare_colab_environment', 'get_colab_environment_preparation', 'create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks'];
+        const expected = ['inspect_colab_environment_preflight', 'list_colab_terminals', 'close_colab_terminals', 'prepare_colab_environment', 'get_colab_environment_preparation', 'create_notebook', 'list_notebooks', 'search_cells', 'clear_cell_outputs', 'get_kernel_info', 'read_notebook', 'get_execution', 'export_notebook', 'edit_cells', 'move_cells', 'open_notebooks', 'save_notebooks'];
         assert.deepStrictEqual([...names].sort(), expected.sort());
+    });
+
+    await check('preflight boundary is strict, read-only, bounded and sanitized', async () => {
+        const response = await client.callTool({ name: 'inspect_colab_environment_preflight', arguments: {} });
+        assert.ok(!response.isError, JSON.stringify(response));
+        const value = JSON.parse(response.content[0].text);
+        assert.strictEqual(value.readOnly, true);
+        assert.strictEqual(value.connectedPeerCount, 1);
+        assert.strictEqual(value.windows.length, 1);
+        assert.strictEqual(value.windows[0].window.workspace.kind, 'empty');
+        assert.deepStrictEqual(value.windows[0].window.notebooks, { total: 0, fileBacked: 0, untitled: 0, dirty: 0, visibleEditors: 0, activeEditor: false });
+        assert.strictEqual(value.windows[0].window.textDocuments.activeEditor, false);
+        assert.strictEqual(value.peerWindowCorrespondence.availability, 'not-exposed');
+        assert.strictEqual(value.snapshot.retained, false);
+        assert.ok(!value.blockers.includes('peer_window_correspondence_not_exposed'));
+        assert.ok(value.limitations.some((item) => item.includes('correspondence')));
+        assert.ok(!response.content[0].text.includes(storageRoot));
+        assert.ok((await client.callTool({ name: 'inspect_colab_environment_preflight', arguments: { windowId: 'unexpected' } })).isError);
     });
 
     await check('terminal inventory is window-routed and closure requires explicit strict targets', async () => {

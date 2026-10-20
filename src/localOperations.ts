@@ -22,11 +22,12 @@ import {
     searchCells
 } from './notebookOps';
 import { checkColabRuntime, downloadFile, uploadFile } from './kernelFiles';
-import { getColabEnvironmentPreparation, prepareColabEnvironment } from './colabEnvironment';
+import { getColabEnvironmentPreparation, inspectColabEnvironmentPreflightLocal, prepareColabEnvironment } from './colabEnvironment';
 import { closeColabTerminals, listColabTerminals } from './colabTerminals';
 import { assertNoColabSetup, configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel } from './colabSetup';
 
 export type LocalOperation =
+    | 'inspect_colab_environment_preflight'
     | 'list_colab_terminals'
     | 'close_colab_terminals'
     | 'prepare_colab_environment'
@@ -74,6 +75,8 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
         for (const ref of typeof args.notebookRef === 'string' ? [args.notebookRef] : Array.isArray(args.notebookRefs) ? args.notebookRefs : []) assertNoColabSetup(String(ref));
     }
     switch (operation) {
+        case 'inspect_colab_environment_preflight':
+            return inspectColabEnvironmentPreflightLocal();
         case 'list_colab_terminals':
             return listColabTerminals();
         case 'close_colab_terminals':

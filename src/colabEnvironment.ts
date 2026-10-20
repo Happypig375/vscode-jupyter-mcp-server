@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ChildProcess, execFile, spawn } from 'child_process';
 import * as vscode from 'vscode';
-import { createColabNativeDriver } from './colabNative';
+import { ColabNativeEndpointInspection, createColabNativeDriver, inspectColabNativeEndpoint } from './colabNative';
 
 const SCHEMA = 1;
 const SUPPORTED_VERSION = '1.142.0';
@@ -64,6 +64,45 @@ export interface ParsedCodeStatus {
     windows: Array<{ id: number; pid: number; title: string }>;
 }
 
+export interface ColabEnvironmentPreflightLocal {
+    schemaVersion: 1;
+    observedAt: number;
+    readOnly: true;
+    nativeBinding: {
+        source: 'setting' | 'launch_environment' | 'none' | 'invalid';
+        port: number | null;
+        listenerAvailable: boolean;
+        workbenchPageCount: number | null;
+        exactWindowBinding: 'not-established';
+        correspondenceReason: 'debug-targets-do-not-expose-vscode-peer-window-ids';
+    };
+    window: {
+        localHost: boolean;
+        trusted: boolean;
+        workspace: { kind: 'empty' | 'single-folder' | 'multi-folder' | 'workspace'; folderCount: number };
+        notebooks: { total: number; fileBacked: number; untitled: number; dirty: number; visibleEditors: number; activeEditor: boolean };
+        textDocuments: { total: number; fileBacked: number; untitled: number; dirty: number; blocking: number; visibleEditors: number; activeEditor: boolean };
+        tabs: { total: number; dirty: number; benignWelcomeOnly: boolean };
+        terminals: { total: number };
+        debugging: { active: boolean };
+        quitPolicy: { confirmBeforeClose: 'never' | 'unsupported'; restoreWindows: 'all' | 'folders' | 'one' | 'none' | 'preserve' | 'unresolved' | 'unsupported' };
+    };
+    application: {
+        status: 'verified' | 'unsupported' | 'unavailable' | 'mismatch';
+        version: string;
+        supportedVersion: string;
+        versionSupported: boolean;
+        commit: string | null;
+        mainProcessPid: number | null;
+        mainProcessIdentity: 'verified' | 'mismatch' | 'unavailable';
+        defaultInstall: 'verified' | 'unsupported';
+        startupArguments: 'supported' | 'unsupported' | 'unavailable';
+        actualWindowCount: number | null;
+        failureCode: string | null;
+    };
+    blockers: string[];
+}
+
 interface InstallIdentity {
     executablePath: string;
     userDataDir: string;
@@ -85,6 +124,7 @@ export interface ColabEnvironmentDependenciesForTest {
     env: NodeJS.ProcessEnv;
     vscodeVersion: string;
     probeNative(port: number): Promise<boolean>;
+    inspectNative(port: number): Promise<ColabNativeEndpointInspection>;
     runCodeStatus(executablePath: string): Promise<string>;
     inspectProcess(pid: number): Promise<ProcessIdentity | undefined>;
     reservePort(requestedPort?: number): Promise<number>;
@@ -118,11 +158,17 @@ export async function getColabEnvironmentPreparation(preparationId: string): Pro
     return manager.get(preparationId);
 }
 
+/** Inspect bounded local preparation state without changing editor or runtime state. */
+export async function inspectColabEnvironmentPreflightLocal(): Promise<string> {
+    if (!manager) throw new ColabEnvironmentError('environment_not_initialized', 'Colab environment preparation is not initialized in this VS Code window.');
+    return manager.inspect();
+}
+
 export function createColabEnvironmentForTest(context: ColabEnvironmentContextForTest, dependencies: ColabEnvironmentDependenciesForTest): {
-    initialize(): Promise<void>; prepare(folderUri?: string): Promise<string>; get(id: string): Promise<string>;
+    initialize(): Promise<void>; prepare(folderUri?: string): Promise<string>; get(id: string): Promise<string>; inspect(): Promise<string>;
 } {
     const instance = new ColabEnvironmentManager(context, dependencies);
-    return { initialize: () => instance.initialize(), prepare: folderUri => instance.prepare(folderUri), get: id => instance.get(id) };
+    return { initialize: () => instance.initialize(), prepare: folderUri => instance.prepare(folderUri), get: id => instance.get(id), inspect: () => instance.inspect() };
 }
 
 class ColabEnvironmentManager {
@@ -162,6 +208,176 @@ class ColabEnvironmentManager {
             }
         }
         if (!await this.reconcile(receipt)) await this.prepareWorkspace(receipt);
+    }
+
+    async inspect(): Promise<string> {
+        const observedAt = this.deps.now();
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        const workspaceKind: ColabEnvironmentPreflightLocal['window']['workspace']['kind'] = vscode.workspace.workspaceFile
+            ? 'workspace' : folders.length === 0 ? 'empty' : folders.length === 1 ? 'single-folder' : 'multi-folder';
+        const notebooks = [...vscode.workspace.notebookDocuments];
+        const documents = [...vscode.workspace.textDocuments];
+        const tabs = vscode.window.tabGroups.all.flatMap(group => [...group.tabs]);
+        const confirmBeforeClose = vscode.workspace.getConfiguration('window').get<string>('confirmBeforeClose');
+        const restoreWindows = classifyRestoreWindows(vscode.workspace.getConfiguration('window').get<string>('restoreWindows'));
+        const configured = vscode.workspace.getConfiguration('jupyterMcp').get<number>('nativeDebugPort', 0) ?? 0;
+        const environment = Number(this.deps.env.JUPYTER_MCP_NATIVE_DEBUG_PORT ?? 0);
+        const selectedPort = configured !== 0 ? configured : environment;
+        const nativeSource: ColabEnvironmentPreflightLocal['nativeBinding']['source'] = configured !== 0
+            ? (validPort(configured) ? 'setting' : 'invalid')
+            : environment !== 0 ? (validPort(environment) ? 'launch_environment' : 'invalid') : 'none';
+        const native = validPort(selectedPort)
+            ? await this.deps.inspectNative(selectedPort).catch(() => ({ listenerAvailable: false, workbenchPageCount: null }))
+            : { listenerAvailable: false, workbenchPageCount: null };
+        const application = await this.inspectApplication();
+        const windowState: ColabEnvironmentPreflightLocal['window'] = {
+            localHost: !vscode.env.remoteName,
+            trusted: vscode.workspace.isTrusted,
+            workspace: { kind: workspaceKind, folderCount: folders.length },
+            notebooks: {
+                total: notebooks.length,
+                fileBacked: notebooks.filter(document => document.uri.scheme === 'file' && !document.isUntitled).length,
+                untitled: notebooks.filter(document => document.isUntitled).length,
+                dirty: notebooks.filter(document => document.isDirty).length,
+                visibleEditors: vscode.window.visibleNotebookEditors.length,
+                activeEditor: Boolean(vscode.window.activeNotebookEditor)
+            },
+            textDocuments: {
+                total: documents.length,
+                fileBacked: documents.filter(document => document.uri.scheme === 'file').length,
+                untitled: documents.filter(document => document.isUntitled).length,
+                dirty: documents.filter(document => document.isDirty).length,
+                blocking: documents.filter(document => document.isDirty || document.isUntitled || document.uri.scheme === 'file').length,
+                visibleEditors: vscode.window.visibleTextEditors.length,
+                activeEditor: Boolean(vscode.window.activeTextEditor)
+            },
+            tabs: {
+                total: tabs.length,
+                dirty: tabs.filter(tab => tab.isDirty).length,
+                benignWelcomeOnly: tabs.length === 1 && tabs[0].label === 'Welcome' && tabs[0].input === undefined && !tabs[0].isDirty
+            },
+            terminals: { total: vscode.window.terminals.length },
+            debugging: { active: Boolean(vscode.debug.activeDebugSession) },
+            quitPolicy: { confirmBeforeClose: confirmBeforeClose === 'never' ? 'never' : 'unsupported', restoreWindows }
+        };
+        const blockers: string[] = [];
+        if (!windowState.localHost) blockers.push('remote_host_unsupported');
+        if (!windowState.trusted) blockers.push('workspace_untrusted');
+        if (nativeSource === 'invalid') blockers.push('native_port_invalid');
+        if (!native.listenerAvailable) blockers.push('native_binding_unavailable');
+        if (application.status !== 'verified') blockers.push(application.failureCode ?? 'application_identity_unverified');
+        if (windowState.quitPolicy.confirmBeforeClose !== 'never') blockers.push('close_confirmation_unsupported');
+        if (windowState.debugging.active) blockers.push('debug_session_present');
+        if (windowState.workspace.kind !== 'empty') blockers.push('automatic_restart_workspace_present');
+        if (windowState.notebooks.total || windowState.notebooks.visibleEditors || windowState.notebooks.activeEditor) blockers.push('open_notebook_present');
+        if (windowState.terminals.total) blockers.push('terminal_present');
+        if (windowState.textDocuments.blocking || windowState.textDocuments.visibleEditors || windowState.textDocuments.activeEditor) blockers.push('open_document_present');
+        if (windowState.tabs.total && !windowState.tabs.benignWelcomeOnly) blockers.push('editor_present');
+        const result: ColabEnvironmentPreflightLocal = {
+            schemaVersion: 1,
+            observedAt,
+            readOnly: true,
+            nativeBinding: {
+                source: nativeSource,
+                port: validPort(selectedPort) ? selectedPort : null,
+                listenerAvailable: native.listenerAvailable,
+                workbenchPageCount: native.workbenchPageCount,
+                exactWindowBinding: 'not-established',
+                correspondenceReason: 'debug-targets-do-not-expose-vscode-peer-window-ids'
+            },
+            window: windowState,
+            application,
+            blockers: [...new Set(blockers)]
+        };
+        return JSON.stringify(result);
+    }
+
+    private async inspectApplication(): Promise<ColabEnvironmentPreflightLocal['application']> {
+        const base: ColabEnvironmentPreflightLocal['application'] = {
+            status: 'unavailable',
+            version: this.deps.vscodeVersion,
+            supportedVersion: SUPPORTED_VERSION,
+            versionSupported: this.deps.vscodeVersion === SUPPORTED_VERSION,
+            commit: null,
+            mainProcessPid: null,
+            mainProcessIdentity: 'unavailable',
+            defaultInstall: 'unsupported',
+            startupArguments: 'unavailable',
+            actualWindowCount: null,
+            failureCode: null
+        };
+        let install: InstallIdentity;
+        try {
+            install = validateDefaultWindowsInstall({
+                platform: this.deps.platform,
+                version: this.deps.vscodeVersion,
+                execPath: this.deps.execPath,
+                env: this.deps.env,
+                globalStoragePath: this.root,
+                extensionPath: this.context.extensionPath,
+                extensionId: this.context.extension.id,
+                appHost: vscode.env.appHost,
+                remoteName: vscode.env.remoteName
+            });
+            base.defaultInstall = 'verified';
+        } catch (error) {
+            base.status = 'unsupported';
+            base.failureCode = error instanceof ColabEnvironmentError ? error.code : 'installation_unsupported';
+            return base;
+        }
+        let pid: number;
+        try { pid = parsePid(this.deps.env.VSCODE_PID); }
+        catch (error) {
+            base.failureCode = error instanceof ColabEnvironmentError ? error.code : 'main_process_unverified';
+            return base;
+        }
+        base.mainProcessPid = pid;
+        const before = await this.deps.inspectProcess(pid).catch(() => undefined);
+        if (!before || !samePath(before.executablePath, install.executablePath)) {
+            base.mainProcessIdentity = before ? 'mismatch' : 'unavailable';
+            base.status = before ? 'mismatch' : 'unavailable';
+            base.failureCode = 'main_process_unverified';
+            return base;
+        }
+        let status: ParsedCodeStatus;
+        try {
+            status = parseCodeStatus(await this.deps.runCodeStatus(install.executablePath), pid);
+        } catch (error) {
+            base.failureCode = error instanceof ColabEnvironmentError ? error.code : 'status_unavailable';
+            return base;
+        }
+        base.version = status.version;
+        base.versionSupported = status.version === SUPPORTED_VERSION && status.version === this.deps.vscodeVersion;
+        base.commit = status.commit;
+        base.actualWindowCount = status.windows.length;
+        try { assertSafeInitialArgs(status.processArgs); base.startupArguments = 'supported'; }
+        catch (error) {
+            base.startupArguments = 'unsupported';
+            base.status = 'unsupported';
+            base.failureCode = error instanceof ColabEnvironmentError ? error.code : 'startup_arguments_unsupported';
+        }
+        const after = await this.deps.inspectProcess(pid).catch(() => undefined);
+        if (!after) {
+            base.mainProcessIdentity = 'unavailable';
+            base.status = 'unavailable';
+            base.failureCode ??= 'main_process_unverified';
+            return base;
+        }
+        if (!sameProcess(before, after) || !samePath(after.executablePath, install.executablePath)) {
+            base.mainProcessIdentity = 'mismatch';
+            base.status = 'mismatch';
+            base.failureCode = 'main_process_unverified';
+            return base;
+        }
+        base.mainProcessIdentity = 'verified';
+        if (!base.versionSupported) {
+            base.status = 'unsupported';
+            base.failureCode = 'unsupported_vscode_version';
+        } else if (base.startupArguments === 'supported') {
+            base.status = 'verified';
+            base.failureCode = null;
+        }
+        return base;
     }
 
     async prepare(folderUri?: string): Promise<string> {
@@ -528,6 +744,7 @@ function productionDependencies(): ColabEnvironmentDependenciesForTest {
         env: process.env,
         vscodeVersion: vscode.version,
         probeNative: probeNativePort,
+        inspectNative: inspectNativePort,
         runCodeStatus,
         inspectProcess,
         reservePort,
@@ -542,6 +759,14 @@ function productionDependencies(): ColabEnvironmentDependenciesForTest {
             }, QUIT_DELAY_MS);
         }
     };
+}
+
+async function inspectNativePort(port: number): Promise<ColabNativeEndpointInspection> {
+    if (!validPort(port)) return { listenerAvailable: false, workbenchPageCount: null };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4_000);
+    try { return await inspectColabNativeEndpoint(port, controller.signal); }
+    finally { clearTimeout(timer); }
 }
 
 async function probeNativePort(port: number): Promise<boolean> {
@@ -839,6 +1064,12 @@ function parsePid(value: string | undefined): number {
     const pid = Number(value);
     if (!Number.isSafeInteger(pid) || pid <= 0) throw new ColabEnvironmentError('main_process_unverified', 'VSCODE_PID did not identify the primary VS Code process.');
     return pid;
+}
+function classifyRestoreWindows(value: string | undefined): ColabEnvironmentPreflightLocal['window']['quitPolicy']['restoreWindows'] {
+    if (value === undefined) return 'unresolved';
+    return ['all', 'folders', 'one', 'none', 'preserve'].includes(value)
+        ? value as ColabEnvironmentPreflightLocal['window']['quitPolicy']['restoreWindows']
+        : 'unsupported';
 }
 function validPort(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 65535; }
 function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }

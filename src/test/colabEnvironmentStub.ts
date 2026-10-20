@@ -48,7 +48,7 @@ export function reset(): void {
         trusted: true, remoteName: undefined, folders: undefined, workspaceFile: undefined,
         notebooks: [], documents: [], visibleNotebooks: [], activeNotebook: undefined,
         terminals: [], visibleEditors: [], activeEditor: undefined, tabs: [], calls: [],
-        configuredPort: 0, confirmBeforeClose: 'never', activeDebugSession: undefined,
+        configuredPort: 0, confirmBeforeClose: 'never', restoreWindows: 'all', activeDebugSession: undefined,
         workspaceUpdates: [], workspaceUpdateResult: true, onWorkspaceUpdate: undefined
     });
 }
@@ -70,7 +70,9 @@ export const workspace = {
         return state.workspaceUpdateResult;
     },
     getConfiguration: (section: string) => ({
-        get: (_key: string, fallback: unknown) => section === 'window' ? state.confirmBeforeClose : state.configuredPort || fallback
+        get: (key: string, fallback: unknown) => section === 'window'
+            ? key === 'confirmBeforeClose' ? state.confirmBeforeClose : key === 'restoreWindows' ? state.restoreWindows : fallback
+            : state.configuredPort || fallback
     })
 };
 export const debug = { get activeDebugSession() { return state.activeDebugSession; } };

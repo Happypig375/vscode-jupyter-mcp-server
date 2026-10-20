@@ -389,6 +389,46 @@ async function targets(port: number, signal: AbortSignal): Promise<NativeTarget[
     });
 }
 const transport: ColabNativeTransport = { targets, connect: (url, signal) => CdpSession.connect(url, signal, TIMING.commandMs) };
+
+export interface ColabNativeEndpointInspection {
+    listenerAvailable: boolean;
+    workbenchPageCount: number | null;
+}
+
+/**
+ * Read-only inspection of the configured loopback debugging endpoint.
+ *
+ * This intentionally stops at the bounded target catalog. It never creates a
+ * status-bar marker, opens a WebSocket, evaluates renderer code, focuses a
+ * window, or claims that a target belongs to this extension host.
+ */
+async function inspectColabNativeEndpointWithTransport(port: number, signal: AbortSignal, source: ColabNativeTransport): Promise<ColabNativeEndpointInspection> {
+    try {
+        const listed = await source.targets(port, signal);
+        if (!Array.isArray(listed) || listed.length > MAX_TARGETS) throw new DesktopSetupError('native_debug_unavailable');
+        let workbenchPageCount = 0;
+        for (const target of listed) {
+            if (!target || !boundedString(target.id, 256) || !boundedString(target.type, 64) || !boundedString(target.url, 2048)) {
+                throw new DesktopSetupError('native_debug_unavailable');
+            }
+            if (target.type !== 'page' || !/\/workbench(?:\.html)?(?:[?#]|$)/.test(target.url)) continue;
+            if (typeof target.webSocketDebuggerUrl !== 'string') throw new DesktopSetupError('native_debug_unavailable');
+            validateDebuggerUrl(target.webSocketDebuggerUrl, port);
+            workbenchPageCount++;
+        }
+        return { listenerAvailable: true, workbenchPageCount };
+    } catch {
+        return { listenerAvailable: false, workbenchPageCount: null };
+    }
+}
+
+export function inspectColabNativeEndpoint(port: number, signal: AbortSignal): Promise<ColabNativeEndpointInspection> {
+    return inspectColabNativeEndpointWithTransport(port, signal, transport);
+}
+export function inspectColabNativeEndpointForTest(port: number, testTransport: ColabNativeTransport, signal: AbortSignal): Promise<ColabNativeEndpointInspection> {
+    return inspectColabNativeEndpointWithTransport(port, signal, testTransport);
+}
+
 export function createColabNativeDriver(port = 0): DesktopSetupDriver {
     const resolved = port === 0 ? Number(process.env.JUPYTER_MCP_NATIVE_DEBUG_PORT ?? 0) : port;
     return new NativeDriver(resolved, transport, TIMING);
