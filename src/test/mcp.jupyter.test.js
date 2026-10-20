@@ -28,6 +28,22 @@ let executionMode = 'complete';
 let executionDeferred;
 let activeKernelAvailable = true;
 let kernelApiFailure;
+let kernelLookupDeferred;
+const runtimeKernels = new Map();
+function newRuntimeKernel() {
+    const listeners = new Set();
+    return {
+        label: 'Python 3.12.2', language: 'python', status: 'idle', listeners,
+        onDidChangeStatus(listener) { listeners.add(listener); return { dispose() { listeners.delete(listener); } }; },
+        emit(status) { this.status = status; for (const listener of [...listeners]) listener(status); }
+    };
+}
+function runtimeKernel(uri) {
+    const key = String(uri);
+    if (!runtimeKernels.has(key)) runtimeKernels.set(key, newRuntimeKernel());
+    return runtimeKernels.get(key);
+}
+let crashStatus = 'autorestarting';
 let restartCommandFailure;
 let dropKernelAfterRestart = false;
 let exactSelectionAccepted = true;
@@ -133,7 +149,23 @@ const vscodeShim = {
     },
     extensions: { getExtension: (id) => id === 'google.colab'
         ? (colabInstalled ? { id, isActive: false, activate: async () => { if (colabActivationFails) throw new Error('secret Colab activation detail'); } } : undefined)
-        : ({ id: 'ms-toolsai.jupyter', isActive: true, activate: async () => { if (kernelApiFailure === 'activation') throw new Error('secret activation detail'); return { getKernel: () => { if (kernelApiFailure === 'query') throw new Error('secret query detail'); return activeKernelAvailable ? ({ label: 'Python 3.12.2', language: 'python', status: 'idle' }) : undefined; } }; } }), onDidChange: () => ({ dispose() {} }) },
+        : ({ id: 'ms-toolsai.jupyter', isActive: true, activate: async () => {
+            if (kernelApiFailure === 'activation') throw new Error('secret activation detail');
+            if (kernelApiFailure === 'hang') return new Promise(() => {});
+            if (kernelApiFailure === 'deferred-lookup') {
+                kernelApiFailure = undefined;
+                return { kernels: { getKernel: (uri) => {
+                    const captured = runtimeKernel(uri);
+                    kernelLookupDeferred.started = true;
+                    return kernelLookupDeferred.promise.then(() => captured);
+                } } };
+            }
+            return { getKernel: (uri) => {
+                if (kernelApiFailure === 'query') throw new Error('secret query detail');
+                if (kernelApiFailure === 'query-once') { kernelApiFailure = undefined; throw new Error('one transient lookup failure'); }
+                return activeKernelAvailable ? runtimeKernel(uri) : undefined;
+            } };
+        } }), onDidChange: () => ({ dispose() {} }) },
     commands: {
         registerCommand: () => ({ dispose() {} }),
         executeCommand: async (cmd, uri, cellUris) => {
@@ -175,6 +207,17 @@ const vscodeShim = {
                         cell.executionSummary = { timing: { startTime: Date.now() } };
                         continue;
                     }
+                    if (executionMode === 'crash-no-summary' || executionMode === 'crash-command-pending') {
+                        cell.executionSummary = { executionOrder: 201, timing: { startTime: Date.now() } };
+                        cell.outputs = [{ items: [{ mime: 'application/vnd.code.notebook.error', data: Buffer.from('{"name":"","message":""}') }] }];
+                        const kernel = runtimeKernel(uri.document);
+                        setTimeout(() => {
+                            kernel.emit(crashStatus);
+                            kernel.emit('idle'); // Automatic restart can finish before the next poll.
+                        }, 10);
+                        if (executionMode === 'crash-command-pending') return executionDeferred.promise;
+                        continue;
+                    }
                     const failed = executionMode === 'error' || executionMode === 'empty-error';
                     cell.executionSummary = { success: !failed, executionOrder: 1, timing: { startTime: Date.now() - 50, endTime: Date.now() } };
                     cell.outputs = executionMode === 'empty-error'
@@ -186,6 +229,9 @@ const vscodeShim = {
                         ] }, { items: [
                             { mime: 'application/vnd.code.notebook.stdout', data: Buffer.from('stream-line\n') }
                         ] }];
+                    if (executionMode === 'replace-after-first' && idx === 0) {
+                        runtimeKernels.set(String(uri.document), newRuntimeKernel());
+                    }
                 }
                 if (executionMode === 'deferred-complete') return executionDeferred.promise;
             }
@@ -501,6 +547,164 @@ async function main() {
         assert.strictEqual(receipt.status, 'failed');
         assert.match(receipt.cells[0].output, /without a name or message/);
         assert.doesNotMatch(receipt.cells[0].output, /Error:\s*:/);
+    });
+
+    for (const [status, reasonCode] of [['dead', 'kernel_dead'], ['autorestarting', 'kernel_restarted'], ['restarting', 'kernel_restarted'], ['terminating', 'kernel_terminating']]) {
+        await check(`run_cells stops on ${status} without a completed cell summary`, async () => {
+            crashStatus = status; executionMode = 'crash-no-summary';
+            const before = executionCalls.length;
+            const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], waitMs: 1000 } });
+            executionMode = 'complete';
+            const receipt = JSON.parse(res.content[0].text);
+            assert.strictEqual(receipt.status, 'unavailable');
+            assert.strictEqual(receipt.reasonCode, reasonCode);
+            assert.strictEqual(receipt.kernelStatusAtStop, status, 'a rapid return to idle must not erase lifecycle loss');
+            assert.strictEqual(receipt.cells[1].state, 'not-run');
+            assert.strictEqual(executionCalls.length, before + 1);
+            assert.strictEqual(runtimeKernel('file:///C:/nb.ipynb').listeners.size, 0, 'terminal tracking disposes its status listener');
+        });
+    }
+    await check('kernel death preserves the unsettled command quarantine', async () => {
+        crashStatus = 'dead'; executionMode = 'crash-command-pending';
+        executionDeferred = {};
+        executionDeferred.promise = new Promise((resolve) => { executionDeferred.resolve = resolve; });
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], waitMs: 1000 } });
+        const receipt = JSON.parse(res.content[0].text);
+        assert.strictEqual(receipt.reasonCode, 'kernel_dead');
+        assert.strictEqual(receipt.notebookCommandPending, true);
+        const blocked = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 0 } });
+        assert.ok(blocked.isError);
+        assert.match(blocked.content[0].text, /previous notebook execution command is still pending/);
+        executionDeferred.resolve(); executionMode = 'complete';
+        await new Promise((resolve) => setImmediate(resolve));
+        const settled = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId: receipt.executionId } });
+        assert.strictEqual(JSON.parse(settled.content[0].text).notebookCommandPending, false);
+    });
+    for (const loss of ['missing', 'replaced', 'dead-without-event']) {
+        await check(`kernel polling detects ${loss} while the cell summary is incomplete`, async () => {
+            executionMode = 'observed-hang';
+            const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], waitMs: 20 } });
+            const executionId = JSON.parse(res.content[0].text).executionId;
+            const original = runtimeKernel('file:///C:/nb.ipynb');
+            if (loss === 'missing') activeKernelAvailable = false;
+            if (loss === 'replaced') runtimeKernels.set('file:///C:/nb.ipynb', newRuntimeKernel());
+            if (loss === 'dead-without-event') original.status = 'dead';
+            const done = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId, waitMs: 2000 } });
+            activeKernelAvailable = true; original.status = 'idle'; executionMode = 'complete';
+            const receipt = JSON.parse(done.content[0].text);
+            assert.strictEqual(receipt.status, 'unavailable');
+            assert.strictEqual(receipt.reasonCode, { missing: 'kernel_unavailable', replaced: 'kernel_changed', 'dead-without-event': 'kernel_dead' }[loss]);
+            assert.strictEqual(receipt.cells[1].state, 'not-run');
+            assert.strictEqual(original.listeners.size, 0);
+        });
+    }
+    await check('busy/idle transitions and fresh error-shaped output alone do not end a live execution', async () => {
+        executionMode = 'observed-hang';
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 20 } });
+        const executionId = JSON.parse(res.content[0].text).executionId;
+        const kernel = runtimeKernel('file:///C:/nb.ipynb'); kernel.emit('busy'); kernel.emit('idle');
+        openNotebooks[0]._cells[0].outputs = [{ items: [{ mime: 'application/vnd.code.notebook.error', data: Buffer.from('{"message":"displayed, not completed"}') }] }];
+        const waiting = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId, waitMs: 50 } });
+        assert.strictEqual(JSON.parse(waiting.content[0].text).status, 'running');
+        assert.strictEqual(JSON.parse(waiting.content[0].text).reasonCode, undefined);
+        openNotebooks[0]._cells[0].executionSummary = { success: true, executionOrder: 202, timing: { startTime: Date.now() - 1, endTime: Date.now() } };
+        const done = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId, waitMs: 500 } });
+        executionMode = 'complete';
+        assert.strictEqual(JSON.parse(done.content[0].text).status, 'completed');
+        assert.strictEqual(kernel.listeners.size, 0);
+    });
+    await check('an unresponsive kernel lookup is bounded and does not diagnose a crash', async () => {
+        kernelApiFailure = 'hang';
+        const before = executionCalls.length;
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 3000 } });
+        kernelApiFailure = undefined;
+        const receipt = JSON.parse(res.content[0].text);
+        assert.strictEqual(receipt.status, 'unavailable');
+        assert.strictEqual(receipt.reasonCode, 'kernel_lookup_timeout');
+        assert.strictEqual(receipt.cells[0].state, 'not-run');
+        assert.strictEqual(executionCalls.length, before);
+    });
+    await check('transient unknown after a ready kernel does not end a healthy execution', async () => {
+        executionMode = 'observed-hang';
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 20 } });
+        const kernel = runtimeKernel('file:///C:/nb.ipynb'); kernel.emit('unknown'); kernel.emit('idle');
+        const executionId = JSON.parse(res.content[0].text).executionId;
+        const waiting = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId, waitMs: 50 } });
+        assert.strictEqual(JSON.parse(waiting.content[0].text).status, 'running');
+        openNotebooks[0]._cells[0].executionSummary = { success: true, executionOrder: 205, timing: { startTime: Date.now() - 1, endTime: Date.now() } };
+        const done = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId, waitMs: 500 } });
+        assert.strictEqual(JSON.parse(done.content[0].text).status, 'completed');
+        executionMode = 'complete';
+        assert.strictEqual(kernel.listeners.size, 0);
+    });
+    await check('persistent unknown is bounded observation loss without a crash claim', async () => {
+        executionMode = 'observed-hang';
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], waitMs: 20 } });
+        const kernel = runtimeKernel('file:///C:/nb.ipynb'); kernel.emit('unknown');
+        const done = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId: JSON.parse(res.content[0].text).executionId, waitMs: 4000 } });
+        kernel.emit('idle'); executionMode = 'complete';
+        assert.strictEqual(JSON.parse(done.content[0].text).reasonCode, 'kernel_unavailable');
+        assert.strictEqual(JSON.parse(done.content[0].text).cells[1].state, 'not-run');
+        assert.strictEqual(kernel.listeners.size, 0);
+    });
+    await check('one transient lookup failure during a healthy long cell does not end tracking', async () => {
+        executionMode = 'observed-hang';
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 20 } });
+        kernelApiFailure = 'query-once';
+        const executionId = JSON.parse(res.content[0].text).executionId;
+        const waiting = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId, waitMs: 1500 } });
+        assert.strictEqual(kernelApiFailure, undefined, 'the periodic check must have encountered the injected failure');
+        assert.strictEqual(JSON.parse(waiting.content[0].text).status, 'running');
+        openNotebooks[0]._cells[0].executionSummary = { success: true, executionOrder: 204, timing: { startTime: Date.now() - 1, endTime: Date.now() } };
+        const done = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId, waitMs: 500 } });
+        executionMode = 'complete';
+        assert.strictEqual(JSON.parse(done.content[0].text).status, 'completed');
+    });
+    await check('initial starting state may become busy without being treated as a restart', async () => {
+        const kernel = runtimeKernel('file:///C:/nb.ipynb'); kernel.status = 'starting';
+        executionMode = 'observed-hang';
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0], waitMs: 20 } });
+        kernel.emit('busy');
+        openNotebooks[0]._cells[0].executionSummary = { success: true, executionOrder: 203, timing: { startTime: Date.now() - 1, endTime: Date.now() } };
+        const done = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId: JSON.parse(res.content[0].text).executionId, waitMs: 500 } });
+        kernel.emit('idle'); executionMode = 'complete';
+        assert.strictEqual(JSON.parse(done.content[0].text).status, 'completed');
+        assert.strictEqual(kernel.listeners.size, 0);
+    });
+    await check('identity is rechecked between fast cells before the next dispatch', async () => {
+        executionMode = 'replace-after-first';
+        const before = executionCalls.length;
+        const original = runtimeKernel('file:///C:/nb.ipynb');
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], waitMs: 1000 } });
+        executionMode = 'complete';
+        const receipt = JSON.parse(res.content[0].text);
+        assert.strictEqual(receipt.status, 'unavailable');
+        assert.strictEqual(receipt.reasonCode, 'kernel_changed');
+        assert.strictEqual(receipt.cells[0].state, 'completed');
+        assert.strictEqual(receipt.cells[1].state, 'not-run');
+        assert.strictEqual(executionCalls.length, before + 1);
+        assert.strictEqual(original.listeners.size, 0);
+    });
+    await check('a periodic lookup sampled before completion cannot authorize the next cell', async () => {
+        executionMode = 'observed-hang';
+        const before = executionCalls.length;
+        const res = await client.callTool({ name: 'run_cells', arguments: { notebookRef: 'file:///C:/nb.ipynb', cellIds: [0, 2], waitMs: 20 } });
+        kernelLookupDeferred = { started: false };
+        kernelLookupDeferred.promise = new Promise((resolve) => { kernelLookupDeferred.resolve = resolve; });
+        kernelApiFailure = 'deferred-lookup';
+        const deadline = Date.now() + 2000;
+        while (!kernelLookupDeferred.started && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.ok(kernelLookupDeferred.started, 'periodic lookup must be in flight');
+        openNotebooks[0]._cells[0].executionSummary = { success: true, executionOrder: 206, timing: { startTime: Date.now() - 1, endTime: Date.now() } };
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        runtimeKernels.set('file:///C:/nb.ipynb', newRuntimeKernel());
+        executionMode = 'complete';
+        kernelLookupDeferred.resolve();
+        const done = await client.callTool({ name: 'get_execution', arguments: { notebookRef: 'file:///C:/nb.ipynb', executionId: JSON.parse(res.content[0].text).executionId, waitMs: 1000 } });
+        const receipt = JSON.parse(done.content[0].text);
+        assert.strictEqual(receipt.reasonCode, 'kernel_changed');
+        assert.strictEqual(receipt.cells[1].state, 'not-run');
+        assert.strictEqual(executionCalls.length, before + 1);
     });
 
     await check('run_cells reports immediate command rejection and consumes detached rejection', async () => {

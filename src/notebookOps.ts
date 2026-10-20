@@ -292,7 +292,7 @@ export interface GetExecutionOptions extends OutputOptions {
 }
 
 type TrackedCell = { requestedIndex: number; currentIndex?: number; id: string; sourceHash: string; state: string; reason?: string; executionOrder?: number; success?: boolean; outputs?: Partial<Record<OutputMode, string>> };
-type TrackedRun = { executionId: string; notebook: string; generation: number; cells: TrackedCell[]; state: string; reason?: string; startedAt: number; finishedAt?: number; outputChars: Record<OutputMode, number>; promise: Promise<void> };
+type TrackedRun = { executionId: string; notebook: string; generation: number; cells: TrackedCell[]; state: string; reason?: string; reasonCode?: string; kernelStatusAtStop?: string; startedAt: number; finishedAt?: number; outputChars: Record<OutputMode, number>; promise: Promise<void> };
 const executionRuns = new Map<string, TrackedRun[]>();
 const executionGenerations = new Map<string, number>();
 // Observation can end before VS Code/Jupyter settles the dispatched command.
@@ -509,7 +509,7 @@ export async function saveNotebooks(filePaths: string[]): Promise<string> {
     return `Saved: ${saved.join(', ') || '(none)'}${skipped.length ? `\nSkipped: ${skipped.join(', ')}` : ''}`;
 }
 
-type ActiveKernel = { label?: string; language?: string; status?: string };
+type ActiveKernel = { label?: string; language?: string; status?: string; onDidChangeStatus?: (listener: (status: string) => void) => { dispose(): void } };
 type JupyterApi = {
     /** Compatibility with older Jupyter extension exports. */
     getKernel?: (u: vscode.Uri) => ActiveKernel | undefined;
@@ -540,6 +540,110 @@ async function observeActiveKernel(nb: vscode.NotebookDocument): Promise<ActiveK
     } catch {
         return { state: 'unavailable', reason: 'Jupyter active-kernel lookup failed; runtime state could not be observed.' };
     }
+}
+
+type ExecutionRuntimeFailure = { reasonCode: string; reason: string; kernelStatusAtStop?: string };
+type ExecutionKernelWatch = { readonly failure: ExecutionRuntimeFailure | undefined; refresh(): Promise<void>; dispose(): void };
+
+/** Observe lifecycle without executing a heartbeat, interrupting, or starting a kernel. */
+async function watchExecutionKernel(nb: vscode.NotebookDocument): Promise<ExecutionKernelWatch> {
+    let kernel: ActiveKernel | undefined;
+    let subscription: { dispose(): void } | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let pendingCheck: Promise<void> | undefined;
+    let disposed = false;
+    let wasReady = false;
+    let currentObservationUsable = false;
+    let observationMisses = 0;
+    let failure: ExecutionRuntimeFailure | undefined;
+    const stop = (reasonCode: string, reason: string, kernelStatusAtStop?: string) => {
+        if (!disposed && !failure) failure = { reasonCode, reason, ...(kernelStatusAtStop ? { kernelStatusAtStop } : {}) };
+    };
+    const observationMiss = (reasonCode: string, reason: string, kernelStatusAtStop?: string) => {
+        currentObservationUsable = false;
+        if (!kernel || ++observationMisses >= 3) stop(reasonCode, reason, kernelStatusAtStop);
+    };
+    const statusChanged = (value?: string) => {
+        if (value === 'idle' || value === 'busy') { wasReady = true; return; }
+        if (value === 'dead') stop('kernel_dead', 'The observed kernel died; later cells were not submitted.', value);
+        else if (value === 'restarting' || value === 'autorestarting') stop('kernel_restarted', 'The observed kernel restarted; the old execution cannot continue.', value);
+        else if (value === 'terminating') stop('kernel_terminating', 'The observed kernel is terminating; later cells were not submitted.', value);
+        else if (wasReady && value === 'starting') stop('kernel_unavailable', 'The observed kernel lost its ready state; execution completion is unknown.', value);
+        else if (wasReady && value === 'unknown') currentObservationUsable = false;
+    };
+    const checkOnce = async () => {
+        let lookupTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const observation = await Promise.race([
+                observeActiveKernel(nb),
+                new Promise<undefined>((resolve) => { lookupTimer = setTimeout(() => resolve(undefined), 2_000); })
+            ]);
+            if (disposed || failure) return;
+            if (!observation) {
+                observationMiss('kernel_lookup_timeout', 'Kernel observation timed out; this does not establish a kernel crash.');
+            } else if (observation.state === 'unavailable') {
+                observationMiss('kernel_observation_unavailable', 'Kernel state could not be observed; execution completion is unknown.');
+            } else if (observation.state === 'none') {
+                // The first user cell can start an already-selected kernel.
+                // Once a kernel has been observed, disappearing is a lifecycle loss.
+                if (kernel) stop('kernel_unavailable', 'The previously observed kernel is no longer available.');
+                else currentObservationUsable = true;
+            } else if (kernel && observation.kernel !== kernel) {
+                stop('kernel_changed', 'The notebook now exposes a different kernel; the old execution cannot continue.');
+            } else {
+                if (!kernel) {
+                    kernel = observation.kernel;
+                    try { subscription = kernel.onDidChangeStatus?.(statusChanged); }
+                    catch {
+                        stop('kernel_observation_unavailable', 'Kernel lifecycle events could not be observed.');
+                        return;
+                    }
+                }
+                statusChanged(kernel.status);
+                if (wasReady && kernel.status === 'unknown') {
+                    observationMiss('kernel_unavailable', 'Kernel state remained unknown across repeated observations; execution completion is unknown.', 'unknown');
+                } else {
+                    observationMisses = 0;
+                    currentObservationUsable = true;
+                }
+            }
+        } catch {
+            observationMiss('kernel_observation_unavailable', 'Kernel state could not be observed; execution completion is unknown.');
+        } finally {
+            if (lookupTimer !== undefined) clearTimeout(lookupTimer);
+        }
+    };
+    const check = (): Promise<void> => {
+        if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
+        if (disposed || failure) return Promise.resolve();
+        if (pendingCheck) return pendingCheck;
+        const pending = checkOnce();
+        pendingCheck = pending;
+        void pending.then(() => {
+            if (pendingCheck === pending) pendingCheck = undefined;
+            if (!disposed && !failure) timer = setTimeout(() => { void check(); }, 1_000);
+        });
+        return pending;
+    };
+    await check();
+    return {
+        get failure() { return failure; },
+        async refresh() {
+            // A periodic lookup may have sampled the old kernel before the last
+            // cell finished. Settle it, then require a new lookup for dispatch.
+            if (pendingCheck) await pendingCheck;
+            do {
+                await check();
+                if (disposed || failure || currentObservationUsable) return;
+                await new Promise((resolve) => setTimeout(resolve, 500));
+            } while (!disposed && !failure);
+        },
+        dispose() {
+            disposed = true;
+            if (timer !== undefined) clearTimeout(timer);
+            subscription?.dispose();
+        }
+    };
 }
 
 function providerCommandFailure(error: unknown): string {
@@ -1023,7 +1127,7 @@ function isFreshExecution(cell: vscode.NotebookCell, baseline: { order?: number;
 }
 
 /** Wait until a cell completes. A timeout is a non-error because the kernel may still be running. */
-async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, expectedId: string, expectedSourceHash: string, generation: number, baseline: { order?: number; startTime?: number; endTime?: number; signature: string; hadSummary: boolean }, requestedAt: number, control: { cancelled: boolean }, onObserved: () => void): Promise<{ cell?: vscode.NotebookCell; observed: boolean }> {
+async function waitForCellExecution(notebook: vscode.NotebookDocument, index: number, expectedId: string, expectedSourceHash: string, generation: number, baseline: { order?: number; startTime?: number; endTime?: number; signature: string; hadSummary: boolean }, requestedAt: number, control: { cancelled: boolean }, onObserved: () => void, kernelWatch: ExecutionKernelWatch): Promise<{ cell?: vscode.NotebookCell; observed: boolean; runtimeFailure?: ExecutionRuntimeFailure }> {
     let observed = false;
     // The request wait budget must never cancel an execution. Continue observing
     // until the owning notebook closes or a fresh result is visible.
@@ -1034,6 +1138,7 @@ async function waitForCellExecution(notebook: vscode.NotebookDocument, index: nu
         let cell: vscode.NotebookCell;
         try { cell = notebook.cellAt(index); } catch { return { observed, }; }
         if (cellIdentifier(cell, index) !== expectedId || textHash(cell.document.getText()) !== expectedSourceHash) return { observed: false };
+        if (kernelWatch.failure) return { observed, runtimeFailure: kernelWatch.failure, ...(outputSignature(cell) !== baseline.signature ? { cell } : {}) };
         if (isFreshExecution(cell, baseline, requestedAt)) {
             return { cell, observed: true };
         }
@@ -1140,7 +1245,8 @@ function executionReceipt(run: TrackedRun, options: RunCellsOptions | GetExecuti
     });
     return JSON.stringify({ executionId: run.executionId, notebookRef: run.notebook, status: run.state,
         notebookCommandPending: hasPendingNotebookExecutionCommand(run.notebook),
-        cells, ...(run.reason ? { reason: run.reason } : {}), ...(waitTimedOut ? { waitTimedOut: true } : {}) });
+        cells, ...(run.reason ? { reason: run.reason } : {}), ...(run.reasonCode ? { reasonCode: run.reasonCode } : {}),
+        ...(run.kernelStatusAtStop ? { kernelStatusAtStop: run.kernelStatusAtStop } : {}), ...(waitTimedOut ? { waitTimedOut: true } : {}) });
 }
 async function waitForExecutionReceipt(run: TrackedRun, waitMs: number, options: RunCellsOptions | GetExecutionOptions): Promise<string> {
     if (run.state === 'completed' || run.state === 'failed' || run.state === 'unavailable') return executionReceipt(run, options);
@@ -1165,8 +1271,23 @@ async function waitForExecutionReceipt(run: TrackedRun, waitMs: number, options:
 async function executeTrackedRun(nb: vscode.NotebookDocument, run: TrackedRun, options: RunCellsOptions): Promise<void> {
     await saveDirtyNotebook(run.notebook);
     await revealNotebookForExecution(nb);
+    const kernelWatch = await watchExecutionKernel(nb);
+    try {
+        await executeTrackedCells(nb, run, options, kernelWatch);
+    } finally {
+        kernelWatch.dispose();
+    }
+}
+
+async function executeTrackedCells(nb: vscode.NotebookDocument, run: TrackedRun, options: RunCellsOptions, kernelWatch: ExecutionKernelWatch): Promise<void> {
     for (const tracked of run.cells) {
+        // A replacement can occur between two fast cell completions without an
+        // event on the old kernel. Recheck before each synchronous dispatch.
+        await kernelWatch.refresh();
         if (executionGeneration(run.notebook) !== run.generation) { tracked.state = 'unavailable'; tracked.reason = 'Kernel lifecycle changed; execution was invalidated.'; run.state = 'unavailable'; return; }
+        if (kernelWatch.failure) {
+            Object.assign(run, kernelWatch.failure); run.state = 'unavailable'; return;
+        }
         const current = findNotebook(run.notebook);
         if (!current || current !== nb || tracked.requestedIndex >= current.cellCount) { tracked.state = 'unavailable'; tracked.reason = 'Notebook closed or cell disappeared.'; run.state = 'unavailable'; return; }
         const cell = current.cellAt(tracked.requestedIndex);
@@ -1176,10 +1297,10 @@ async function executeTrackedRun(nb: vscode.NotebookDocument, run: TrackedRun, o
         const dispatch = dispatchTrackedCell(run.notebook, () => vscode.commands.executeCommand('notebook.cell.execute', { document: nb.uri, ranges: [{ start: tracked.requestedIndex, end: tracked.requestedIndex + 1 }] }));
         const dispatchFailure = dispatch.then(() => new Promise<never>(() => undefined), (error: unknown) => Promise.reject(error));
         const observerControl = { cancelled: false };
-        let observed: { cell?: vscode.NotebookCell; observed: boolean };
+        let observed: { cell?: vscode.NotebookCell; observed: boolean; runtimeFailure?: ExecutionRuntimeFailure };
         try {
             observed = await Promise.race([
-                waitForCellExecution(nb, tracked.requestedIndex, tracked.id, tracked.sourceHash, run.generation, baseline, requestedAt, observerControl, () => { run.state = 'running'; }),
+                waitForCellExecution(nb, tracked.requestedIndex, tracked.id, tracked.sourceHash, run.generation, baseline, requestedAt, observerControl, () => { run.state = 'running'; }, kernelWatch),
                 dispatchFailure
             ]);
         } catch (error) {
@@ -1187,15 +1308,16 @@ async function executeTrackedRun(nb: vscode.NotebookDocument, run: TrackedRun, o
         } finally {
             observerControl.cancelled = true;
         }
+        if (observed.runtimeFailure) {
+            Object.assign(run, observed.runtimeFailure); run.state = 'unavailable';
+            tracked.state = 'unavailable'; tracked.reason = observed.runtimeFailure.reason;
+            if (observed.cell) captureTrackedOutputs(observed.cell, tracked, run, options);
+            if (!nb.isUntitled) await forceSaveNotebook(nb);
+            return;
+        }
         if (!observed.cell) { tracked.state = 'unavailable'; tracked.reason = observed.observed ? 'Execution completion could not be observed.' : 'Execution was not observed.'; run.state = 'unavailable'; return; }
         const result = observed.cell; tracked.executionOrder = result.executionSummary?.executionOrder; tracked.success = result.executionSummary?.success === true; tracked.state = tracked.success ? 'completed' : 'failed';
-        tracked.outputs = {};
-        for (const mode of ['summary', 'text', 'full'] as const) {
-            const remaining = Math.max(0, MAX_TOTAL_OUTPUT_CHARS - run.outputChars[mode]);
-            const output = formatCellOutputs(result, { mode, maxChars: options.maxChars }).slice(0, Math.min(MAX_OUTPUT_CHARS, remaining));
-            tracked.outputs[mode] = output;
-            run.outputChars[mode] += output.length;
-        }
+        captureTrackedOutputs(result, tracked, run, options);
         if (!tracked.success) {
             run.state = 'failed'; run.reason = `Cell ${tracked.requestedIndex} reported failure.`;
             if (!nb.isUntitled) await forceSaveNotebook(nb);
@@ -1204,6 +1326,16 @@ async function executeTrackedRun(nb: vscode.NotebookDocument, run: TrackedRun, o
     }
     if (!nb.isUntitled) await forceSaveNotebook(nb);
     run.state = 'completed'; run.finishedAt = Date.now();
+}
+
+function captureTrackedOutputs(cell: vscode.NotebookCell, tracked: TrackedCell, run: TrackedRun, options: RunCellsOptions): void {
+    tracked.outputs = {};
+    for (const mode of ['summary', 'text', 'full'] as const) {
+        const remaining = Math.max(0, MAX_TOTAL_OUTPUT_CHARS - run.outputChars[mode]);
+        const output = formatCellOutputs(cell, { mode, maxChars: options.maxChars }).slice(0, Math.min(MAX_OUTPUT_CHARS, remaining));
+        tracked.outputs[mode] = output;
+        run.outputChars[mode] += output.length;
+    }
 }
 
 /** Read a tracked execution without dispatching or requiring Jupyter availability. */
