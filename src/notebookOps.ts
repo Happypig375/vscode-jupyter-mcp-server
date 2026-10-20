@@ -295,6 +295,9 @@ type TrackedCell = { requestedIndex: number; currentIndex?: number; id: string; 
 type TrackedRun = { executionId: string; notebook: string; generation: number; cells: TrackedCell[]; state: string; reason?: string; startedAt: number; finishedAt?: number; outputChars: Record<OutputMode, number>; promise: Promise<void> };
 const executionRuns = new Map<string, TrackedRun[]>();
 const executionGenerations = new Map<string, number>();
+// Observation can end before VS Code/Jupyter settles the dispatched command.
+// Keep this quarantine independent of execution generation and history retention.
+const pendingExecutionCommands = new Map<string, Set<Promise<unknown>>>();
 const MAX_EXECUTIONS = 8;
 const MAX_OUTPUT_CHARS = 12000;
 const MAX_TOTAL_OUTPUT_CHARS = 48_000;
@@ -320,6 +323,22 @@ function pruneExecutionRuns(): void {
 }
 function executionGeneration(uri: string): number { return executionGenerations.get(uri) ?? 0; }
 function invalidateExecutionGeneration(uri: string): void { executionGenerations.set(uri, executionGeneration(uri) + 1); }
+export function hasPendingNotebookExecutionCommand(notebookUri: string): boolean {
+    return !!pendingExecutionCommands.get(notebookUri)?.size;
+}
+function dispatchTrackedCell(notebookUri: string, work: () => Thenable<unknown>): Promise<unknown> {
+    const pending = pendingExecutionCommands.get(notebookUri) ?? new Set<Promise<unknown>>();
+    // Preserve synchronous command dispatch; the executor also turns a synchronous
+    // provider throw into a rejection that the same settlement handler consumes.
+    const dispatch = new Promise<unknown>((resolve) => resolve(work()));
+    pending.add(dispatch); pendingExecutionCommands.set(notebookUri, pending);
+    const settled = () => {
+        pending.delete(dispatch);
+        if (!pending.size && pendingExecutionCommands.get(notebookUri) === pending) pendingExecutionCommands.delete(notebookUri);
+    };
+    void dispatch.then(settled, settled);
+    return dispatch;
+}
 
 /** Native summary: cells, types, languages, line counts, execution state, output mime types. */
 export async function getNotebookSummary(filePath: string): Promise<string> {
@@ -1068,10 +1087,14 @@ export async function runNotebookCells(filePath: string, cellIds: Array<string |
     }
 
     const key = nb.uri.toString();
+    if (hasPendingNotebookExecutionCommand(key)) throw new Error('A previous notebook execution command is still pending in VS Code/Jupyter. Wait for command settlement before another run.');
     pruneExecutionRuns(); const history = executionRuns.get(key) ?? [];
     const active = history.find((r) => !TERMINAL_STATES.has(r.state));
     if (active) throw new Error(`Notebook already has an active execution: ${active.executionId}`);
-    const activeCount = [...executionRuns.values()].flat().filter((r) => !TERMINAL_STATES.has(r.state)).length;
+    const activeCount = new Set([
+        ...pendingExecutionCommands.keys(),
+        ...[...executionRuns.entries()].filter(([, runs]) => runs.some((r) => !TERMINAL_STATES.has(r.state))).map(([uri]) => uri)
+    ]).size;
     if (activeCount >= MAX_ACTIVE_EXECUTIONS) throw new Error(`At most ${MAX_ACTIVE_EXECUTIONS} notebook executions may be active in this VS Code window`);
     if (!executionRuns.has(key) && executionRuns.size >= MAX_EXECUTION_NOTEBOOKS) {
         const evictable = [...executionRuns.entries()]
@@ -1115,7 +1138,9 @@ function executionReceipt(run: TrackedRun, options: RunCellsOptions | GetExecuti
         remainingOutputChars -= output?.length ?? 0;
         return { cellId: c.id, requestedIndex: c.requestedIndex, ...(c.currentIndex !== undefined ? { currentIndex: c.currentIndex } : {}), state: c.state, ...(c.reason ? { reason: c.reason } : {}), ...(c.executionOrder !== undefined ? { executionOrder: c.executionOrder } : {}), ...(output ? { output } : {}) };
     });
-    return JSON.stringify({ executionId: run.executionId, notebookRef: run.notebook, status: run.state, cells, ...(run.reason ? { reason: run.reason } : {}), ...(waitTimedOut ? { waitTimedOut: true } : {}) });
+    return JSON.stringify({ executionId: run.executionId, notebookRef: run.notebook, status: run.state,
+        notebookCommandPending: hasPendingNotebookExecutionCommand(run.notebook),
+        cells, ...(run.reason ? { reason: run.reason } : {}), ...(waitTimedOut ? { waitTimedOut: true } : {}) });
 }
 async function waitForExecutionReceipt(run: TrackedRun, waitMs: number, options: RunCellsOptions | GetExecutionOptions): Promise<string> {
     if (run.state === 'completed' || run.state === 'failed' || run.state === 'unavailable') return executionReceipt(run, options);
@@ -1148,7 +1173,7 @@ async function executeTrackedRun(nb: vscode.NotebookDocument, run: TrackedRun, o
         if (cellIdentifier(cell, tracked.requestedIndex) !== tracked.id || textHash(cell.document.getText()) !== tracked.sourceHash) { tracked.state = 'unavailable'; tracked.reason = 'Cell changed or moved; execution stopped safely.'; run.state = 'unavailable'; return; }
         tracked.currentIndex = tracked.requestedIndex; tracked.state = 'dispatched';
         const baseline = executionBaseline(cell); const requestedAt = Date.now();
-        const dispatch = Promise.resolve(vscode.commands.executeCommand('notebook.cell.execute', { document: nb.uri, ranges: [{ start: tracked.requestedIndex, end: tracked.requestedIndex + 1 }] }));
+        const dispatch = dispatchTrackedCell(run.notebook, () => vscode.commands.executeCommand('notebook.cell.execute', { document: nb.uri, ranges: [{ start: tracked.requestedIndex, end: tracked.requestedIndex + 1 }] }));
         const dispatchFailure = dispatch.then(() => new Promise<never>(() => undefined), (error: unknown) => Promise.reject(error));
         const observerControl = { cancelled: false };
         let observed: { cell?: vscode.NotebookCell; observed: boolean };

@@ -6,17 +6,19 @@ import * as vscode from 'vscode';
 import { DesktopSetupChoice, DesktopSetupDriver, DesktopSetupError } from './colabDesktop';
 import { createColabNativeDriver } from './colabNative';
 import { checkColabRuntime, getColabFileRoots } from './kernelFiles';
-import { findNotebook, getExecution } from './notebookOps';
+import { findNotebook, getExecution, hasPendingNotebookExecutionCommand } from './notebookOps';
 
 const SETUP_TIMEOUT_MS = 300_000;
 const MAX_HISTORY = 16;
 type Stage = 'preflight' | 'binding_window' | 'selecting_provider' | 'creating_cpu_server' | 'naming_server' | 'awaiting_kernel_selection' | 'selecting_python' | 'starting_kernel' | 'mounting_filesystem' | 'verifying_runtime' | 'finished';
+type ProviderStep = 'opening_kernel_picker' | 'choosing_colab_source' | 'awaiting_server_picker' | 'choosing_colab_handoff' | 'choosing_existing_server' | 'choosing_new_server';
 type State = 'running' | 'ready' | 'failed' | 'cancelled';
 type SetupOperation = 'configure_kernel' | 'mount_colab_server';
 interface SetupKernel { language?: string; status?: string; executeCode?: unknown; }
 interface Setup {
     id: string; notebook: string; operation: SetupOperation; serverAlias?: string; state: State; stage: Stage; startedAt: string;
     endedAt?: string; reason?: string; code?: string; verification?: unknown; failedStage?: Stage;
+    providerStep?: ProviderStep; failedProviderStep?: ProviderStep;
     startupCellRetained?: boolean; serverMayRemain?: boolean; cleanupPending?: boolean;
     desktopOperation?: string; desktopError?: string;
     driver?: DesktopSetupDriver; kernelHeader?: string; kernelChoices?: Map<string, DesktopSetupChoice>;
@@ -65,7 +67,9 @@ function receipt(job: Setup): string {
     return JSON.stringify({ setupId: job.id, notebook: job.notebook, operation: job.operation, serverAlias: job.serverAlias,
         runtime: 'colab', status: job.endedAt ? job.state : 'running', stage: job.stage,
         ready: !!job.endedAt && job.state === 'ready', startedAt: job.startedAt, endedAt: job.endedAt,
-        code: job.code, reason: job.reason, failedStage: job.failedStage, desktopOperation: job.desktopOperation,
+        code: job.code, reason: job.reason, failedStage: job.failedStage,
+        providerStep: job.stage === 'selecting_provider' ? job.providerStep : undefined,
+        failedProviderStep: job.failedProviderStep, desktopOperation: job.desktopOperation,
         desktopError: job.desktopError, verification: job.verification,
         startupCellRetained: job.startupCellRetained ?? false, serverMayRemain: job.serverMayRemain ?? false,
         cleanupPending: job.cleanupPending ?? false, actionRequired }, null, 2);
@@ -310,6 +314,9 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         if (extension.packageJSON?.version !== '0.9.7') fail('colab_version_unsupported', 'Automatic picker setup currently supports Google Colab 0.9.7. Other versions need an adapter check.');
         originalNotebook = findNotebook(job.notebook);
         if (!originalNotebook) fail('notebook_changed', 'The target notebook is no longer open.');
+        if (hasPendingNotebookExecutionCommand(originalNotebook.uri.toString())) {
+            fail('execution_command_pending', 'A notebook execution command is still pending in VS Code/Jupyter. Wait for command settlement before Colab setup.');
+        }
         // Never interleave setup with the existing tracked scientific runner.
         try {
             const run = JSON.parse(await getExecution(job.notebook, {}));
@@ -418,7 +425,7 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         marker = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1_000_000);
         marker.text = markerText; marker.show();
         job.stage = 'binding_window'; await driver.bind(markerText, signal); current();
-        job.stage = 'selecting_provider';
+        job.stage = 'selecting_provider'; job.providerStep = 'opening_kernel_picker';
         const selection = command('notebook.selectKernel', { notebookEditor: editor });
         // A rejected/false command means VS Code has already closed this picker. Race
         // every provider step against that outcome, while deliberately ignoring an
@@ -453,19 +460,26 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         // workspace/extension-host refresh, without the suggestions screen.
         const initialHeaders = ['Select Kernel', 'Select Another Kernel', ...notebookLabels.flatMap(label => [`Select kernel for '${label}'`, `Change kernel for '${label}'`])];
         const first = await picker((stepSignal) => driver!.choose(initialHeaders, ['Select Another Kernel...', 'Colab'], stepSignal));
-        if (first !== 'Colab') await picker((stepSignal) => driver!.choose(['Select Kernel', 'Select Another Kernel'], ['Colab'], stepSignal));
+        if (first !== 'Colab') {
+            job.providerStep = 'choosing_colab_source';
+            await picker((stepSignal) => driver!.choose(['Select Kernel', 'Select Another Kernel'], ['Colab'], stepSignal));
+        }
         // After a workspace refresh VS Code can reopen its source picker once
         // before handing control to Colab. Require an empty new prompt, then
         // permit only one additional exact Colab selection, never a retry loop.
+        job.providerStep = 'awaiting_server_picker';
         const providerPrompt = await picker((stepSignal) => driver!.waitForInput(['Select a Jupyter Server', 'Select Kernel', 'Select Another Kernel'], stepSignal));
         if (providerPrompt !== 'Select a Jupyter Server') {
+            job.providerStep = 'choosing_colab_handoff';
             await picker((stepSignal) => driver!.choose([providerPrompt], ['Colab'], stepSignal));
         }
         let alias: string;
         if (requestedAlias) {
             alias = requestedAlias;
+            job.providerStep = 'choosing_existing_server';
             await picker((stepSignal) => driver!.choose(['Select a Jupyter Server'], [alias], stepSignal)); current();
         } else {
+            job.providerStep = 'choosing_new_server';
             await picker((stepSignal) => driver!.choose(['Select a Jupyter Server'], ['New Colab Server'], stepSignal)); current();
             job.stage = 'creating_cpu_server';
             await picker((stepSignal) => driver!.choose(['Select a variant'], ['CPU'], stepSignal));
@@ -566,6 +580,7 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
         job.verification = verification; job.state = 'ready'; job.serverMayRemain = false;
     } catch (error) {
         job.failedStage = job.stage;
+        if (job.stage === 'selecting_provider') job.failedProviderStep = job.providerStep;
         if (error instanceof DesktopSetupError) { job.desktopOperation = error.operation; job.desktopError = error.providerCode; }
         job.state = signal.aborted ? 'cancelled' : 'failed';
         if (error instanceof SetupFailure || error instanceof DesktopSetupError) { job.code = error.code; job.reason = error.message; }

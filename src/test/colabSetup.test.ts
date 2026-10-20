@@ -4,6 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel, assertNoColabSetup, acquireDesktopLease, SetupDeps } from '../colabSetup';
 import { createColabNativeDriverForTest } from '../colabNative';
+import { DesktopSetupError } from '../colabDesktop';
+import { runNotebookCells, getExecution, interruptKernels, hasPendingNotebookExecutionCommand } from '../notebookOps';
 import { state, reset, uri } from './colabSetupStub';
 
 const ref = 'file:///test.ipynb';
@@ -11,6 +13,7 @@ function fixture(options: {
     optional?: boolean; checkFails?: boolean; checkFalse?: boolean; failChoice?: boolean; close?: boolean;
     omitListing?: boolean; listFails?: boolean; listDelay?: boolean; selectDelay?: boolean; providerDelay?: boolean;
     productionBind?: boolean; missingServerAlias?: boolean; directSourcePicker?: boolean; providerHandoff?: string;
+    failAt?: 'initial' | 'source' | 'server_prompt' | 'handoff' | 'existing_alias' | 'new_server';
     listings?: Array<Array<{ choiceId: string; label: string }>>;
 } = {}) {
     reset();
@@ -33,6 +36,11 @@ function fixture(options: {
         },
         choose: async (_headers: readonly string[], labels: readonly string[], signal: AbortSignal) => {
             headerSelections.push([..._headers]);
+            if ((options.failAt === 'initial' && headerSelections.length === 1) ||
+                (options.failAt === 'source' && labels[0] === 'Colab' && headerSelections.length === 2) ||
+                (options.failAt === 'handoff' && labels[0] === 'Colab' && headerSelections.length === 3) ||
+                (options.failAt === 'existing_alias' && _headers[0] === 'Select a Jupyter Server' && /^m[a-f0-9]{8}$/.test(labels[0])) ||
+                (options.failAt === 'new_server' && labels[0] === 'New Colab Server')) throw new DesktopSetupError('picker_timeout');
             if (options.directSourcePicker && headerSelections.length === 1) {
                 assert.ok(_headers.includes('Select Another Kernel'));
                 assert.ok(labels.includes('Colab')); events.push('Colab'); return 'Colab';
@@ -53,6 +61,7 @@ function fixture(options: {
             return labels[0] === 'Select Another Kernel...' ? 'Select Another Kernel...' : labels[0];
         },
         waitForInput: async (headers: readonly string[]) => {
+            if (options.failAt === 'server_prompt' && headers.includes('Select a Jupyter Server')) throw new DesktopSetupError('picker_timeout');
             const result = headers.includes('Select a Jupyter Server') ? (options.providerHandoff ?? 'Select a Jupyter Server') : inputs.shift()!;
             assert.ok(headers.includes(result)); return result;
         },
@@ -100,6 +109,57 @@ async function result(f: ReturnType<typeof fixture>, serverAlias?: string): Prom
 async function main() {
     let count = 0;
     const test = async (name: string, work: () => Promise<void>) => { await work(); count++; console.log('PASS ' + name); };
+    for (const settlement of ['resolve', 'reject_after_history_expiry'] as const) {
+        await test('interrupt keeps unsettled notebook command quarantined until ' + settlement, async () => {
+            const f = fixture(); state.notebook.isUntitled = true; state.userExecutionMode = 'unsettled';
+            const running = JSON.parse(await runNotebookCells(ref, [0, 1], { waitMs: 0 }));
+            const deadline = Date.now() + 2000;
+            while (!state.finishUserCommand && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1));
+            assert.strictEqual(typeof state.finishUserCommand, 'function');
+            assert.strictEqual(hasPendingNotebookExecutionCommand(ref), true);
+            await interruptKernels([ref]);
+            const interrupted = JSON.parse(await getExecution(ref, { executionId: running.executionId, waitMs: 1000 }));
+            assert.strictEqual(interrupted.status, 'unavailable');
+            assert.strictEqual(interrupted.notebookCommandPending, true);
+            assert.strictEqual(interrupted.cells[1].state, 'not-run');
+            if (settlement === 'reject_after_history_expiry') {
+                const originalNow = Date.now, expired = originalNow() + 3600001;
+                try {
+                    Date.now = () => expired;
+                    await assert.rejects(getExecution(ref, { executionId: running.executionId }), /Unknown executionId/);
+                } finally { Date.now = originalNow; }
+            }
+            const blocked = await result(f, 'm7ae91d89');
+            assert.strictEqual(blocked.code, 'execution_command_pending');
+            assert.strictEqual(blocked.failedStage, 'preflight');
+            assert.deepStrictEqual(f.events, []);
+            assert.ok(!state.calls.some((call: any) => call[0] === 'notebook.selectKernel'));
+            await assert.rejects(runNotebookCells(ref, [0], { waitMs: 0 }), /execution command is still pending/);
+            state.finishUserCommand(settlement === 'resolve' ? undefined : new Error('private command detail'));
+            await new Promise((resolve) => setImmediate(resolve));
+            assert.strictEqual(hasPendingNotebookExecutionCommand(ref), false);
+            const recovered = await result(f, 'm7ae91d89');
+            assert.strictEqual(recovered.ready, true);
+            assert.ok(!JSON.stringify(recovered).includes('private command detail'));
+            assert.strictEqual(state.calls.filter((call: any) => call[0] === 'notebook.cell.execute').length, 2, 'only the first user-cell dispatch and owned setup cell; no later user cell');
+        });
+    }
+    for (const [failAt, failedProviderStep] of [
+        ['initial', 'opening_kernel_picker'], ['source', 'choosing_colab_source'],
+        ['server_prompt', 'awaiting_server_picker'], ['handoff', 'choosing_colab_handoff'],
+        ['existing_alias', 'choosing_existing_server'], ['new_server', 'choosing_new_server']
+    ] as const) {
+        await test('provider timeout identifies ' + failedProviderStep, async () => {
+            const f = fixture({ failAt, providerHandoff: failAt === 'handoff' ? 'Select Another Kernel' : undefined });
+            const r = await result(f, failAt === 'new_server' ? undefined : 'm7ae91d89');
+            assert.strictEqual(r.code, 'picker_timeout');
+            assert.strictEqual(r.failedStage, 'selecting_provider');
+            assert.strictEqual(r.failedProviderStep, failedProviderStep);
+            assert.strictEqual(r.providerStep, undefined, 'finished receipt uses failedProviderStep');
+            assert.strictEqual(r.startupCellRetained, false);
+            assert.ok(!state.calls.some((call: any) => call[0] === 'notebook.cell.execute'));
+        });
+    }
     await test('all CPU selections, exact temporary startup, mounting and verification run inside setup', async () => {
         const f = fixture(); const before = state.notebook.getCells().map((c: any) => c.document.getText()); const r = await result(f);
         assert.strictEqual(r.ready, true); assert.strictEqual(f.checked, 1); assert.strictEqual(f.released, 1);
