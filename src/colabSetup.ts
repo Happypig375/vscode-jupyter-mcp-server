@@ -455,7 +455,15 @@ async function performSetup(job: Setup, deps: SetupDeps): Promise<void> {
             ? `${notebookFolder.name} • ` : '';
         // The public API returns slash-separated relative paths; the Windows
         // workbench's file label uses backslashes. Both are exact target labels.
-        const notebookLabels = [...new Set([relativeLabel, relativeLabel.split('/').join(path.sep)].map(label => folderPrefix + label))];
+        const notebookLabels = [...new Set([relativeLabel, relativeLabel.split('/').join(path.sep)].map(label => {
+            // Outside a workspace, asRelativePath returns URI.fsPath with a
+            // lowercase drive. The Windows workbench label uppercases only
+            // that drive letter. Keep the entire remaining target path exact.
+            if (process.platform === 'win32' && !notebookFolder && editor.notebook.uri.scheme === 'file' && /^[a-zA-Z]:[\\/]/.test(label)) {
+                label = label[0].toUpperCase() + label.slice(1);
+            }
+            return folderPrefix + label;
+        }))];
         // A remembered controller can open the source picker directly after a
         // workspace/extension-host refresh, without the suggestions screen.
         const initialHeaders = ['Select Kernel', 'Select Another Kernel', ...notebookLabels.flatMap(label => [`Select kernel for '${label}'`, `Change kernel for '${label}'`])];

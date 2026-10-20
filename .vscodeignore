@@ -13,5 +13,6 @@ tsconfig.json
 coverage
 .github
 AGENTS.md
+TRANSFER_DIAGNOSIS.md
 *.map
 dist/*.map

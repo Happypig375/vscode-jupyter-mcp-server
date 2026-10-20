@@ -2,6 +2,8 @@
 
 ## 0.5.0
 
+- Match the Windows workbench's uppercase drive letter for notebooks outside the workspace. Keep the rest of the full path exact so another notebook's picker cannot be selected.
+
 - Prepare a single-folder window as an untitled Workspace through the public folder API before creating a runtime. Preserve its root URI, retain a durable conversion receipt across the one planned extension-host refresh, and verify exact root/name/configuration plus fresh native binding before readiness. Polling never dispatches conversion; restored work blocks it. Later Colab folder mounting can then stay in the same extension host.
 
 - Bring only the exact bound VS Code page forward through Chromium before input actions, then verify window and input focus. Read-only binding/listing do not move focus; lost focus prevents input.

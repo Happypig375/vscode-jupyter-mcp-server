@@ -288,6 +288,25 @@ test('source picker after controller suggestions accepts the installed Select An
     assert.equal(await driver.choose(['Select Kernel', 'Select Another Kernel'], ['Colab'], SIGNAL), 'Colab');
     assert.deepEqual(fixture.writes, ['Colab']); assert.equal(fixture.submits, 1);
 });
+test('absolute notebook picker remains bound to the exact drive and directory', async () => {
+    const expected = "Select kernel for 'C:\\Users\\Researcher\\outside\\target.ipynb'";
+    const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);
+    fixture.title = ''; fixture.placeholder = expected; fixture.ariaLabel = expected;
+    fixture.rows = [{ label: 'Select Another Kernel...', description: '', detail: '', disabled: false }];
+    assert.equal(await driver.choose([expected], ['Select Another Kernel...', 'Colab'], SIGNAL), 'Select Another Kernel...');
+    for (const wrong of [
+        "Select kernel for 'D:\\Users\\Researcher\\outside\\target.ipynb'",
+        "Select kernel for 'C:\\Users\\Researcher\\another\\target.ipynb'",
+        "Select kernel for 'C:\\Users\\researcher\\outside\\target.ipynb'",
+    ]) {
+        const other = setup(); await other.driver.bind(MARKER, SIGNAL);
+        other.fixture.title = ''; other.fixture.placeholder = wrong; other.fixture.ariaLabel = wrong;
+        other.fixture.rows = fixture.rows;
+        await rejects(other.driver.choose([expected], ['Select Another Kernel...', 'Colab'], SIGNAL), 'picker_timeout');
+        assert.deepEqual(other.fixture.writes, []); assert.equal(other.fixture.submits, 0);
+    }
+});
+
 test('multi-folder initial picker refuses a different folder with the same relative notebook path', async () => {
     const header = "Change kernel for 'research • nested\\target.ipynb'";
     const { fixture, driver } = setup(); await driver.bind(MARKER, SIGNAL);

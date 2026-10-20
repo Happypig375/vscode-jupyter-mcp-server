@@ -181,6 +181,23 @@ async function main() {
         assert.deepStrictEqual(f.headerSelections[1], ['Select Kernel', 'Select Another Kernel']);
         assert.ok(!f.events.includes('Python'), 'a suggested local controller is never selected');
     });
+    await test('outside-workspace file picker uses the Windows display drive without changing the remaining path', async () => {
+        for (const absoluteLabel of ['c:\\Users\\Researcher\\outside\\target.ipynb', 'd:/outside/MixedCase/target.ipynb']) {
+            const f = fixture(); state.relativeNotebookLabel = absoluteLabel; state.notebookOutsideWorkspace = true;
+            state.folders.push({ name: 'unrelated-root', uri: uri('colab://matching/content') });
+            assert.strictEqual((await result(f, 'm7ae91d89')).ready, true);
+            const displayLabels = [...new Set([absoluteLabel, absoluteLabel.split('/').join(path.sep)]
+                .map(label => process.platform === 'win32' ? label[0].toUpperCase() + label.slice(1) : label))];
+            assert.deepStrictEqual(f.headerSelections[0], ['Select Kernel', 'Select Another Kernel',
+                ...displayLabels.flatMap(label => [`Select kernel for '${label}'`, `Change kernel for '${label}'`])]);
+            if (process.platform === 'win32' && absoluteLabel.startsWith('c:')) {
+                assert.ok(f.headerSelections[0].includes("Select kernel for 'C:\\Users\\Researcher\\outside\\target.ipynb'"));
+                assert.ok(!f.headerSelections[0].includes("Select kernel for 'c:\\Users\\Researcher\\outside\\target.ipynb'"));
+            }
+            assert.ok(f.headerSelections[0].every(label => !label.includes('unrelated-root')));
+            assert.ok(f.headerSelections[0].some(label => label.includes(absoluteLabel.slice(2).split('/').join(path.sep))));
+        }
+    });
     await test('requested existing alias skips server creation and continues explicit kernel selection', async () => {
         const alias = 'm7ae91d89'; const f = fixture(); state.active = { status: 'idle' };
         state.folders.push({ name: 'stale', uri: uri('colab://stale/content') });

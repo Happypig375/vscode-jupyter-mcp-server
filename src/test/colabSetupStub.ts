@@ -9,7 +9,7 @@ function cell(value: string, index: number, identity: string): any {
 }
 export function reset(): void {
     Object.assign(state, { remoteName: undefined, trusted: true, version: '0.9.7', installed: true, activationFailure: false, colabIsActive: false, activationCalls: 0, editorMismatch: false,
-        active: undefined, calls: [], markers: [], relativeNotebookLabel: 'test.ipynb', startupMode: 'success', userExecutionMode: undefined, finishUserCommand: undefined, mountMode: 'single', mountCommandHang: false, selection: true, editFailure: false, cleanupFailure: false, cleanupHang: false });
+        active: undefined, calls: [], markers: [], relativeNotebookLabel: 'test.ipynb', notebookOutsideWorkspace: false, startupMode: 'success', userExecutionMode: undefined, finishUserCommand: undefined, mountMode: 'single', mountCommandHang: false, selection: true, editFailure: false, cleanupFailure: false, cleanupHang: false });
     const cells = [cell('never_execute_user_code()', 0, 'vscode-notebook-cell:///one'), cell('second_user_cell()', 1, 'vscode-notebook-cell:///two')];
     state.notebook = { notebookType: 'jupyter-notebook', uri: uri('file:///test.ipynb'), isClosed: false, metadata: {},
         get cellCount() { return cells.length; }, getCells: () => cells, cellAt: (i: number) => cells[i] };
@@ -39,7 +39,7 @@ export const workspace = {
         if (target !== state.notebook.uri || includeWorkspace !== false) throw new Error('Wrong notebook label target or prefix mode');
         return state.relativeNotebookLabel;
     },
-    getWorkspaceFolder: (target: any) => { if (target !== state.notebook.uri) throw new Error('Wrong notebook folder target'); return state.folders.find((folder: any) => folder.uri.scheme === 'file'); },
+    getWorkspaceFolder: (target: any) => { if (target !== state.notebook.uri) throw new Error('Wrong notebook folder target'); return state.notebookOutsideWorkspace ? undefined : state.folders.find((folder: any) => folder.uri.scheme === 'file'); },
     getConfiguration: () => ({ get: (_key: string, fallback: any) => fallback }),
     applyEdit: async (edit: WorkspaceEdit) => {
         if (state.editFailure) return false;
