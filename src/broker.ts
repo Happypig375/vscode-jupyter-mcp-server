@@ -8,6 +8,8 @@ const BROKER_PROTOCOL = 'jupyter-mcp-window-broker-v1';
 const MAX_CONTROL_BODY = 5 * 1024 * 1024;
 const PREFLIGHT_TIMEOUT_MS = 30_000;
 const MAX_WINDOW_LABEL_CODE_POINTS = 256;
+const WINDOW_IDENTITY_VERSION = '1.142.0';
+const WINDOW_IDENTITY_COMMIT = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
 
 export type BrokerRole = 'broker' | 'peer' | 'blocked' | 'stopped';
 
@@ -49,6 +51,7 @@ function record(value: unknown): Record<string, any> | undefined {
     return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : undefined;
 }
 function count(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000; }
+function positiveSafeInteger(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0; }
 function oneOf<T extends string>(value: unknown, values: readonly T[]): value is T { return typeof value === 'string' && values.includes(value as T); }
 function blocker(value: unknown): value is string { return typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value); }
 function version(value: unknown): value is string { return typeof value === 'string' && /^(?:0|[1-9]\d{0,3})\.(?:0|[1-9]\d{0,3})\.(?:0|[1-9]\d{0,3})$/.test(value); }
@@ -62,15 +65,27 @@ function boundedWindowLabel(value: string): string {
 function parseLocalPreflight(text: string): ColabEnvironmentPreflightLocal {
     if (Buffer.byteLength(text) > 64 * 1024) throw new Error('Peer preflight response exceeded the size bound.');
     const value = record(JSON.parse(text));
-    const native = record(value?.nativeBinding), window = record(value?.window), workspace = record(window?.workspace);
+    const native = record(value?.nativeBinding), identity = record(value?.windowIdentity), window = record(value?.window), workspace = record(window?.workspace);
     const notebooks = record(window?.notebooks), documents = record(window?.textDocuments), tabs = record(window?.tabs);
     const terminals = record(window?.terminals), debugging = record(window?.debugging), quit = record(window?.quitPolicy);
     const application = record(value?.application);
+    const nativeWindows = Array.isArray(application?.nativeWindows) ? application.nativeWindows.map(record) : undefined;
     if (!value || value.schemaVersion !== 1 || !Number.isSafeInteger(value.observedAt) || value.observedAt < 0 || value.readOnly !== true ||
         !native || !oneOf(native.source, ['setting', 'launch_environment', 'none', 'invalid'] as const) ||
         !(native.port === null || (Number.isInteger(native.port) && native.port > 0 && native.port <= 65535)) ||
         typeof native.listenerAvailable !== 'boolean' || !(native.workbenchPageCount === null || count(native.workbenchPageCount)) ||
         native.exactWindowBinding !== 'not-established' || native.correspondenceReason !== 'debug-targets-do-not-expose-vscode-peer-window-ids' ||
+        !identity || identity.source !== 'extension_log_uri' ||
+        !oneOf(identity.status, ['verified', 'unsupported', 'unavailable', 'mismatch'] as const) ||
+        !version(identity.sourceVersion) || !/^[0-9a-f]{40}$/.test(identity.sourceCommit) ||
+        !(identity.nativeWindowId === null || positiveSafeInteger(identity.nativeWindowId)) ||
+        !(identity.rendererProcessPid === null || positiveSafeInteger(identity.rendererProcessPid)) ||
+        !Array.isArray(identity.observedNativeWindowIds) || identity.observedNativeWindowIds.length > 64 ||
+        identity.observedNativeWindowIds.some((item: unknown) => !positiveSafeInteger(item)) ||
+        !(identity.failureCode === null || blocker(identity.failureCode)) ||
+        (identity.status === 'verified'
+            ? identity.nativeWindowId === null || identity.rendererProcessPid === null || identity.failureCode !== null
+            : identity.nativeWindowId !== null || identity.rendererProcessPid !== null || identity.failureCode === null) ||
         !window || typeof window.localHost !== 'boolean' || typeof window.trusted !== 'boolean' ||
         !workspace || !oneOf(workspace.kind, ['empty', 'single-folder', 'multi-folder', 'workspace'] as const) || !count(workspace.folderCount) ||
         !notebooks || !['total', 'fileBacked', 'untitled', 'dirty', 'visibleEditors'].every(key => count(notebooks[key])) || typeof notebooks.activeEditor !== 'boolean' ||
@@ -87,6 +102,7 @@ function parseLocalPreflight(text: string): ColabEnvironmentPreflightLocal {
         !oneOf(application.defaultInstall, ['verified', 'unsupported'] as const) ||
         !oneOf(application.startupArguments, ['supported', 'unsupported', 'unavailable'] as const) ||
         !(application.actualWindowCount === null || count(application.actualWindowCount)) ||
+        !nativeWindows || nativeWindows.length > 64 || nativeWindows.some(item => !item || !positiveSafeInteger(item.id) || !positiveSafeInteger(item.rendererProcessPid)) ||
         !(application.failureCode === null || blocker(application.failureCode)) ||
         !Array.isArray(value.blockers) || value.blockers.length > 32 || value.blockers.some((item: unknown) => !blocker(item))) {
         throw new Error('Peer returned an invalid preflight response.');
@@ -98,6 +114,12 @@ function parseLocalPreflight(text: string): ColabEnvironmentPreflightLocal {
             source: native.source, port: native.port, listenerAvailable: native.listenerAvailable,
             workbenchPageCount: native.workbenchPageCount, exactWindowBinding: 'not-established',
             correspondenceReason: 'debug-targets-do-not-expose-vscode-peer-window-ids'
+        },
+        windowIdentity: {
+            source: 'extension_log_uri', status: identity.status, sourceVersion: identity.sourceVersion,
+            sourceCommit: identity.sourceCommit, nativeWindowId: identity.nativeWindowId,
+            rendererProcessPid: identity.rendererProcessPid,
+            observedNativeWindowIds: [...identity.observedNativeWindowIds], failureCode: identity.failureCode
         },
         window: {
             localHost: window.localHost, trusted: window.trusted,
@@ -113,6 +135,7 @@ function parseLocalPreflight(text: string): ColabEnvironmentPreflightLocal {
             versionSupported: application.versionSupported, commit: application.commit, mainProcessPid: application.mainProcessPid,
             mainProcessIdentity: application.mainProcessIdentity, defaultInstall: application.defaultInstall,
             startupArguments: application.startupArguments, actualWindowCount: application.actualWindowCount,
+            nativeWindows: nativeWindows.map(item => ({ id: item!.id, rendererProcessPid: item!.rendererProcessPid })),
             failureCode: application.failureCode
         },
         blockers: [...value.blockers]
@@ -129,12 +152,15 @@ export function aggregateColabEnvironmentPreflight(
         catch { return { windowId: input.windowId, observation: undefined }; }
     });
     const invalidPeerIdCount = parsed.filter(item => item.windowId === undefined).length;
+    const validPeerIds = parsed.flatMap(item => item.windowId === undefined ? [] : [item.windowId]);
+    const duplicatePeerIdCount = validPeerIds.length - new Set(validPeerIds).size;
     const available = parsed.filter((item): item is { windowId: string; observation: ColabEnvironmentPreflightLocal } => Boolean(item.windowId && item.observation));
     const unavailablePeerIds = parsed.filter((item): item is { windowId: string; observation: undefined } => Boolean(item.windowId && !item.observation)).map(item => item.windowId).sort();
     const windows = available.map(item => ({
         windowId: item.windowId,
         observedAt: item.observation.observedAt,
         nativeBinding: item.observation.nativeBinding,
+        windowIdentity: item.observation.windowIdentity,
         window: item.observation.window,
         blockers: item.observation.blockers
     })).sort((left, right) => left.windowId.localeCompare(right.windowId));
@@ -157,6 +183,7 @@ export function aggregateColabEnvironmentPreflight(
         defaultInstall: 'unsupported' as const,
         startupArguments: 'unavailable' as const,
         actualWindowCount: null,
+        nativeWindows: [] as Array<{ id: number; rendererProcessPid: number }>,
         failureCode: applicationValues.length ? 'application_corroboration_inconsistent' : 'application_corroboration_unavailable'
     };
     const actualWindowCount = application.actualWindowCount;
@@ -183,18 +210,60 @@ export function aggregateColabEnvironmentPreflight(
     } : {
         status: 'blocked', tool: null, candidateWindowIds: [] as string[], reasonCode: 'current_mcp_cannot_resolve_preflight_blockers'
     };
+    const sortedNativeRows = [...application.nativeWindows].sort((left, right) => left.id - right.id || left.rendererProcessPid - right.rendererProcessPid);
+    const nativeWindowIds = sortedNativeRows.map(row => row.id);
+    const nativeRendererPids = sortedNativeRows.map(row => row.rendererProcessPid);
+    const peerMappings = windows.flatMap(item => item.windowIdentity.status === 'verified' &&
+        item.windowIdentity.nativeWindowId !== null && item.windowIdentity.rendererProcessPid !== null
+        ? [{ windowId: item.windowId, nativeWindowId: item.windowIdentity.nativeWindowId, rendererProcessPid: item.windowIdentity.rendererProcessPid }]
+        : []);
+    let correspondenceReasonCode: string | null = null;
+    if (invalidPeerIdCount || unavailablePeerIds.length || available.length !== connectedPeerCount) {
+        correspondenceReasonCode = 'peer_window_identity_incomplete';
+    } else if (duplicatePeerIdCount) {
+        correspondenceReasonCode = 'peer_window_identity_duplicate_registration';
+    } else if (!applicationConsistent || application.mainProcessPid === null || application.mainProcessIdentity !== 'verified' ||
+        application.commit !== WINDOW_IDENTITY_COMMIT || application.version !== WINDOW_IDENTITY_VERSION ||
+        application.supportedVersion !== WINDOW_IDENTITY_VERSION || application.versionSupported !== true ||
+        application.defaultInstall !== 'verified') {
+        correspondenceReasonCode = 'peer_window_identity_application_unverified';
+    } else if (windows.some(item => !item.window.localHost)) {
+        correspondenceReasonCode = 'peer_window_identity_local_host_required';
+    } else if (windows.some(item => item.windowIdentity.sourceVersion !== WINDOW_IDENTITY_VERSION ||
+        item.windowIdentity.sourceCommit !== WINDOW_IDENTITY_COMMIT || item.windowIdentity.status === 'unsupported')) {
+        correspondenceReasonCode = 'peer_window_identity_source_unsupported';
+    } else if (windows.some(item => item.windowIdentity.status !== 'verified')) {
+        correspondenceReasonCode = 'peer_window_identity_unavailable';
+    } else if (nativeWindowIds.length !== application.actualWindowCount ||
+        new Set(nativeWindowIds).size !== nativeWindowIds.length || new Set(nativeRendererPids).size !== nativeRendererPids.length) {
+        correspondenceReasonCode = 'peer_window_identity_native_rows_invalid';
+    } else if (windows.some(item => JSON.stringify(item.windowIdentity.observedNativeWindowIds) !== JSON.stringify(nativeWindowIds))) {
+        correspondenceReasonCode = 'peer_window_identity_native_rows_inconsistent';
+    } else if (peerMappings.length !== connectedPeerCount ||
+        new Set(peerMappings.map(item => item.nativeWindowId)).size !== peerMappings.length ||
+        JSON.stringify(peerMappings.map(item => item.nativeWindowId).sort((left, right) => left - right)) !== JSON.stringify(nativeWindowIds) ||
+        peerMappings.some(mapping => !sortedNativeRows.some(row => row.id === mapping.nativeWindowId && row.rendererProcessPid === mapping.rendererProcessPid))) {
+        correspondenceReasonCode = 'peer_window_identity_set_mismatch';
+    }
+    const correspondenceVerified = correspondenceReasonCode === null;
     return JSON.stringify({
         schemaVersion: 1, status: 'colab_environment_preflight', readOnly: true, observedAt,
         connectedPeerCount, respondingPeerCount: available.length, unavailablePeerIds, invalidPeerIdCount, application,
         appWindowCountMatchesConnectedPeerCount: actualWindowCount === null ? null : actualWindowCount === connectedPeerCount,
         peerWindowCorrespondence: {
-            availability: 'not-exposed', countEqualityDoesNotEstablishMapping: true,
-            reason: 'VS Code status window rows do not expose the broker peer UUID or another public exact correspondence field.'
+            availability: correspondenceVerified ? 'verified' : 'unavailable',
+            source: 'extension_log_uri', sourceVersion: WINDOW_IDENTITY_VERSION, sourceCommit: WINDOW_IDENTITY_COMMIT,
+            evidenceOnly: true, countEqualityDoesNotEstablishMapping: true,
+            reasonCode: correspondenceReasonCode,
+            duplicatePeerIdCount,
+            observedNativeWindowIds: correspondenceVerified ? nativeWindowIds : [],
+            mappings: correspondenceVerified ? peerMappings.sort((left, right) => left.windowId.localeCompare(right.windowId)) : []
         },
         windows, blockers: [...blockers].sort(), supportedNextOperation,
         snapshot: { retained: false, reason: 'No restart mode consumes a snapshot in this release; every call is point-in-time evidence only.' },
         limitations: [
-            'Peer-to-app-window correspondence is not exposed; equal counts do not establish a mapping.',
+            'The version-pinned ExtensionContext.logUri correspondence is read-only evidence, not restart permission; equal counts alone do not establish a mapping.',
+            'Window identity requires every peer and the exact unique native window-ID set to be revalidated from the same verified main process and reviewed VS Code commit.',
             'The loopback target catalog does not establish which workbench page belongs to a broker peer; prepare_colab_environment performs its own exact marker binding.',
             'The recommendation gate requires one complete corroborated peer and app window. An already-running native listener may still be usable only if prepare_colab_environment independently passes its marker-bound revalidation.',
             'Startup-argument corroboration reuses the automatic-restart allowlist. A previously bootstrapped debug-port/workspace launch can therefore suppress a recommendation even when the native catalog is reachable; inspection does not prove native readiness failed.',

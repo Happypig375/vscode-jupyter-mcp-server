@@ -9,6 +9,9 @@ import { ColabNativeEndpointInspection, createColabNativeDriver, inspectColabNat
 
 const SCHEMA = 1;
 const SUPPORTED_VERSION = '1.142.0';
+const SUPPORTED_COMMIT = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
+const SUPPORTED_EXTENSION_ID = 'Happypig375.vscode-jupyter-mcp-server';
+const MAX_NATIVE_WINDOWS = 64;
 const PREPARATION_MS = 120_000;
 const HELPER_ACK_MS = 5_000;
 const QUIT_DELAY_MS = 1_000;
@@ -76,6 +79,16 @@ export interface ColabEnvironmentPreflightLocal {
         exactWindowBinding: 'not-established';
         correspondenceReason: 'debug-targets-do-not-expose-vscode-peer-window-ids';
     };
+    windowIdentity: {
+        source: 'extension_log_uri';
+        status: 'verified' | 'unsupported' | 'unavailable' | 'mismatch';
+        sourceVersion: string;
+        sourceCommit: string;
+        nativeWindowId: number | null;
+        rendererProcessPid: number | null;
+        observedNativeWindowIds: number[];
+        failureCode: string | null;
+    };
     window: {
         localHost: boolean;
         trusted: boolean;
@@ -98,6 +111,7 @@ export interface ColabEnvironmentPreflightLocal {
         defaultInstall: 'verified' | 'unsupported';
         startupArguments: 'supported' | 'unsupported' | 'unavailable';
         actualWindowCount: number | null;
+        nativeWindows: Array<{ id: number; rendererProcessPid: number }>;
         failureCode: string | null;
     };
     blockers: string[];
@@ -111,6 +125,7 @@ interface InstallIdentity {
 
 export interface ColabEnvironmentContextForTest {
     globalStorageUri: vscode.Uri;
+    logUri: vscode.Uri;
     extensionPath: string;
     extension: { id: string };
     subscriptions: Array<{ dispose(): unknown }>;
@@ -230,6 +245,7 @@ class ColabEnvironmentManager {
             ? await this.deps.inspectNative(selectedPort).catch(() => ({ listenerAvailable: false, workbenchPageCount: null }))
             : { listenerAvailable: false, workbenchPageCount: null };
         const application = await this.inspectApplication();
+        const windowIdentity = inspectWindowIdentity(this.context, this.deps, application);
         const windowState: ColabEnvironmentPreflightLocal['window'] = {
             localHost: !vscode.env.remoteName,
             trusted: vscode.workspace.isTrusted,
@@ -285,6 +301,7 @@ class ColabEnvironmentManager {
                 exactWindowBinding: 'not-established',
                 correspondenceReason: 'debug-targets-do-not-expose-vscode-peer-window-ids'
             },
+            windowIdentity,
             window: windowState,
             application,
             blockers: [...new Set(blockers)]
@@ -304,6 +321,7 @@ class ColabEnvironmentManager {
             defaultInstall: 'unsupported',
             startupArguments: 'unavailable',
             actualWindowCount: null,
+            nativeWindows: [],
             failureCode: null
         };
         let install: InstallIdentity;
@@ -350,6 +368,12 @@ class ColabEnvironmentManager {
         base.versionSupported = status.version === SUPPORTED_VERSION && status.version === this.deps.vscodeVersion;
         base.commit = status.commit;
         base.actualWindowCount = status.windows.length;
+        if (status.windows.length <= MAX_NATIVE_WINDOWS && status.windows.every(window =>
+            Number.isSafeInteger(window.id) && window.id > 0 &&
+            Number.isSafeInteger(window.pid) && window.pid > 0)) {
+            base.nativeWindows = status.windows.map(window => ({ id: window.id, rendererProcessPid: window.pid }))
+                .sort((left, right) => left.id - right.id || left.rendererProcessPid - right.rendererProcessPid);
+        }
         try { assertSafeInitialArgs(status.processArgs); base.startupArguments = 'supported'; }
         catch (error) {
             base.startupArguments = 'unsupported';
@@ -847,6 +871,105 @@ function resolveLocalGlobalStoragePath(
         throw new ColabEnvironmentError('local_storage_required', 'The VS Code user-data URI does not map to this extension in the default local profile.');
     }
     return path.win32.resolve(storagePath);
+}
+
+function inspectWindowIdentity(
+    context: Pick<ColabEnvironmentContextForTest, 'logUri' | 'extension'>,
+    dependencies: Pick<ColabEnvironmentDependenciesForTest, 'platform' | 'env' | 'vscodeVersion'>,
+    application: ColabEnvironmentPreflightLocal['application']
+): ColabEnvironmentPreflightLocal['windowIdentity'] {
+    const base: ColabEnvironmentPreflightLocal['windowIdentity'] = {
+        source: 'extension_log_uri',
+        status: 'unavailable',
+        sourceVersion: SUPPORTED_VERSION,
+        sourceCommit: SUPPORTED_COMMIT,
+        nativeWindowId: null,
+        rendererProcessPid: null,
+        observedNativeWindowIds: [],
+        failureCode: 'window_identity_unavailable'
+    };
+    if (dependencies.vscodeVersion !== SUPPORTED_VERSION || application.version !== SUPPORTED_VERSION) {
+        return { ...base, status: 'unsupported', failureCode: 'window_identity_version_unsupported' };
+    }
+    if (application.commit !== SUPPORTED_COMMIT) {
+        return { ...base, status: 'unsupported', failureCode: 'window_identity_commit_unsupported' };
+    }
+    if (application.defaultInstall !== 'verified' || application.mainProcessIdentity !== 'verified' || dependencies.platform !== 'win32') {
+        return { ...base, failureCode: 'window_identity_application_unverified' };
+    }
+    if (context.extension.id.toLowerCase() !== SUPPORTED_EXTENSION_ID.toLowerCase()) {
+        return { ...base, status: 'unsupported', failureCode: 'window_identity_extension_unsupported' };
+    }
+    const rows = application.nativeWindows;
+    const ids = rows.map(row => row.id);
+    const rendererPids = rows.map(row => row.rendererProcessPid);
+    if (application.actualWindowCount === null || rows.length !== application.actualWindowCount || rows.length > MAX_NATIVE_WINDOWS ||
+        rows.some(row => !Number.isSafeInteger(row.id) || row.id <= 0 || !Number.isSafeInteger(row.rendererProcessPid) || row.rendererProcessPid <= 0) ||
+        new Set(ids).size !== ids.length || new Set(rendererPids).size !== rendererPids.length) {
+        return { ...base, status: 'mismatch', failureCode: 'window_identity_native_rows_invalid' };
+    }
+    base.observedNativeWindowIds = [...ids].sort((left, right) => left - right);
+    let nativeWindowId: number;
+    try {
+        nativeWindowId = nativeWindowIdFromLogUri(context, dependencies);
+    } catch (error) {
+        return {
+            ...base,
+            observedNativeWindowIds: base.observedNativeWindowIds,
+            failureCode: error instanceof ColabEnvironmentError ? error.code : 'window_identity_log_uri_invalid'
+        };
+    }
+    const matches = rows.filter(row => row.id === nativeWindowId);
+    if (matches.length !== 1) {
+        return {
+            ...base,
+            status: 'mismatch',
+            observedNativeWindowIds: base.observedNativeWindowIds,
+            failureCode: 'window_identity_status_row_mismatch'
+        };
+    }
+    return {
+        ...base,
+        status: 'verified',
+        nativeWindowId,
+        rendererProcessPid: matches[0].rendererProcessPid,
+        observedNativeWindowIds: base.observedNativeWindowIds,
+        failureCode: null
+    };
+}
+
+function nativeWindowIdFromLogUri(
+    context: Pick<ColabEnvironmentContextForTest, 'logUri' | 'extension'>,
+    dependencies: Pick<ColabEnvironmentDependenciesForTest, 'platform' | 'env'>
+): number {
+    const uri = context.logUri;
+    const appData = dependencies.env.APPDATA;
+    if (dependencies.platform !== 'win32' || !appData || !path.win32.isAbsolute(appData) ||
+        uri.scheme !== 'file' || uri.authority || uri.query || uri.fragment ||
+        !path.win32.isAbsolute(uri.fsPath) || uri.fsPath.startsWith('\\\\')) {
+        throw new ColabEnvironmentError('window_identity_log_uri_invalid', 'The extension log URI is not an unambiguous local default-profile file URI.');
+    }
+    const uriSegments = uri.path.replace(/\\/g, '/').split('/');
+    if (uriSegments.some(segment => segment === '.' || segment === '..')) {
+        throw new ColabEnvironmentError('window_identity_log_uri_invalid', 'The extension log URI contains a relative path segment.');
+    }
+    const logsRoot = path.win32.resolve(appData, 'Code', 'logs');
+    const logPath = path.win32.resolve(uri.fsPath);
+    const relative = path.win32.relative(logsRoot, logPath);
+    if (!relative || relative.startsWith('..') || path.win32.isAbsolute(relative)) {
+        throw new ColabEnvironmentError('window_identity_log_uri_invalid', 'The extension log URI is outside the default stable profile log root.');
+    }
+    const segments = relative.split(/[\\/]+/);
+    if (segments.length !== 4 || !segments[0] || segments[0] === '.' || segments[0] === '..' ||
+        segments[2] !== 'exthost' || segments[3] !== context.extension.id) {
+        throw new ColabEnvironmentError('window_identity_log_uri_invalid', 'The extension log URI does not have the reviewed window/exthost/extension suffix.');
+    }
+    const match = /^window([1-9]\d*)$/.exec(segments[1]);
+    const windowId = match ? Number(match[1]) : Number.NaN;
+    if (!Number.isSafeInteger(windowId) || windowId <= 0) {
+        throw new ColabEnvironmentError('window_identity_log_uri_invalid', 'The extension log URI does not contain a positive safe window identifier.');
+    }
+    return windowId;
 }
 
 async function resolveRequestedFolder(value: string): Promise<{ uri: string; label: string; path: string }> {

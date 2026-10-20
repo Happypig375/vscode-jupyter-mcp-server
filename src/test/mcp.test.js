@@ -214,7 +214,9 @@ async function main() {
         assert.strictEqual(value.windows[0].window.workspace.kind, 'empty');
         assert.deepStrictEqual(value.windows[0].window.notebooks, { total: 0, fileBacked: 0, untitled: 0, dirty: 0, visibleEditors: 0, activeEditor: false });
         assert.strictEqual(value.windows[0].window.textDocuments.activeEditor, false);
-        assert.strictEqual(value.peerWindowCorrespondence.availability, 'not-exposed');
+        assert.strictEqual(value.peerWindowCorrespondence.availability, 'unavailable');
+        assert.strictEqual(value.peerWindowCorrespondence.evidenceOnly, true);
+        assert.deepStrictEqual(value.peerWindowCorrespondence.mappings, []);
         assert.strictEqual(value.snapshot.retained, false);
         assert.ok(!value.blockers.includes('peer_window_correspondence_not_exposed'));
         assert.ok(value.limitations.some((item) => item.includes('correspondence')));

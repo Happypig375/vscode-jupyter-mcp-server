@@ -42,7 +42,7 @@ async function fixture(options: { native?: boolean; restart?: boolean } = {}): P
     const appData = path.join(temp, 'AppData', 'Roaming');
     const localAppData = path.join(temp, 'AppData', 'Local');
     const profile = temp;
-    const extensionId = 'hadrian.jupyter-mcp';
+    const extensionId = 'Happypig375.vscode-jupyter-mcp-server';
     const root = options.restart ? path.join(appData, 'Code', 'User', 'globalStorage', extensionId) : path.join(temp, 'storage');
     const extensionPath = options.restart ? path.join(profile, '.vscode', 'extensions', 'jupyter-mcp-0.5.0') : path.join(temp, 'extension');
     await fs.mkdir(root, { recursive: true }); await fs.mkdir(extensionPath, { recursive: true });
@@ -53,7 +53,11 @@ async function fixture(options: { native?: boolean; restart?: boolean } = {}): P
     let quitWatchdog: (() => Promise<void>) | undefined;
     const result: Fixture = {
         root, temp, identity,
-        context: { globalStorageUri: fileUri(root), extensionPath, extension: { id: extensionId }, subscriptions: disposables },
+        context: {
+            globalStorageUri: fileUri(root),
+            logUri: fileUri(path.join(appData, 'Code', 'logs', '20261021T010203', 'window1', 'exthost', extensionId)),
+            extensionPath, extension: { id: extensionId }, subscriptions: disposables
+        },
         deps: {
             now: () => 1_800_000_000_000,
             uuid: crypto.randomUUID,
@@ -223,17 +227,152 @@ test('read-only preflight reports bounded state and sanitized exact application 
         assert.strictEqual(result.application.commit, COMMIT);
         assert.strictEqual(result.application.mainProcessPid, PID);
         assert.strictEqual(result.application.actualWindowCount, 1);
+        assert.deepStrictEqual(result.application.nativeWindows, [{ id: 1, rendererProcessPid: 28920 }]);
+        assert.deepStrictEqual(result.windowIdentity, {
+            source: 'extension_log_uri', status: 'verified', sourceVersion: '1.142.0', sourceCommit: COMMIT,
+            nativeWindowId: 1, rendererProcessPid: 28920, observedNativeWindowIds: [1], failureCode: null
+        });
         assert.ok(result.blockers.includes('automatic_restart_workspace_present'));
         assert.ok(result.blockers.includes('open_document_present'));
         assert.ok(result.blockers.includes('terminal_present'));
         const serialized = JSON.stringify(result);
-        for (const secret of ['private-project-name', 'private-workspace-identity', 'secret-notebook', 'TOP SECRET CONTENT', 'ANOTHER SECRET', 'private-tab-title', 'PRIVATE TAB INPUT', 'private-shell', 'secret-command', 'private-debug-name', '--crash-reporter-id']) {
+        for (const secret of ['private-project-name', 'private-workspace-identity', 'secret-notebook', 'TOP SECRET CONTENT', 'ANOTHER SECRET', 'private-tab-title', 'PRIVATE TAB INPUT', 'private-shell', 'secret-command', 'private-debug-name', '--crash-reporter-id', '20261021T010203']) {
             assert.ok(!serialized.includes(secret), `preflight leaked ${secret}`);
         }
         assert.deepStrictEqual(state.calls, []);
         assert.deepStrictEqual(state.workspaceUpdates, []);
         assert.strictEqual(probeCalls, 0, 'read-only inspection must not run the marker-binding native probe');
     } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('window identity uses the exact reviewed logUri and unique current native status row', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        f.context.logUri = fileUri(path.join(f.temp, 'AppData', 'Roaming', 'Code', 'logs', '20261021T020304', 'window2', 'exthost', f.context.extension.id));
+        f.deps.runCodeStatus = async () => status(`--crash-reporter-id ${CRASH}`, PID, 2);
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.windowIdentity.status, 'verified');
+        assert.strictEqual(result.windowIdentity.nativeWindowId, 2);
+        assert.strictEqual(result.windowIdentity.rendererProcessPid, 28921);
+        assert.deepStrictEqual(result.windowIdentity.observedNativeWindowIds, [1, 2]);
+        assert.ok(!JSON.stringify(result).includes('20261021T020304'));
+        assert.deepStrictEqual(state.calls, []);
+        assert.strictEqual(f.quitCalls, 0);
+
+        f.context.extension.id = f.context.extension.id.toLowerCase();
+        f.context.logUri = fileUri(path.join(f.temp, 'AppData', 'Roaming', 'Code', 'logs', '20261021T020305', 'window2', 'exthost', f.context.extension.id));
+        const normalized = parsed(await manager.inspect());
+        assert.strictEqual(normalized.windowIdentity.status, 'verified');
+        assert.strictEqual(normalized.windowIdentity.nativeWindowId, 2);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('unsupported startup arguments preserve identity evidence while remaining a preparation blocker', async () => {
+    const f = await fixture({ restart: true, native: true });
+    try {
+        f.deps.runCodeStatus = async () => status('--remote-debugging-port=59267 C:\\private-workspace');
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.application.status, 'unsupported');
+        assert.strictEqual(result.application.startupArguments, 'unsupported');
+        assert.strictEqual(result.application.failureCode, 'startup_arguments_unsupported');
+        assert.strictEqual(result.windowIdentity.status, 'verified');
+        assert.strictEqual(result.windowIdentity.nativeWindowId, 1);
+        assert.ok(result.blockers.includes('startup_arguments_unsupported'));
+        assert.ok(!JSON.stringify(result).includes('private-workspace'));
+        assert.strictEqual(f.quitCalls, 0);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('window identity fails closed for malformed, ambiguous and unsupported source evidence', async () => {
+    const invalidLogUris: Array<[string, (valid: any, appData: string, extensionId: string) => any]> = [
+        ['authority', (valid) => rawUri(`file://remote-host${valid.path}`)],
+        ['outside root', (_valid, appData, extensionId) => fileUri(path.join(appData, 'Code', 'other-logs', 'session', 'window1', 'exthost', extensionId))],
+        ['window zero', (_valid, appData, extensionId) => fileUri(path.join(appData, 'Code', 'logs', 'session', 'window0', 'exthost', extensionId))],
+        ['wrong exact suffix', (_valid, appData) => fileUri(path.join(appData, 'Code', 'logs', 'session', 'window1', 'exthost', 'happypig375.vscode-jupyter-mcp-server'))],
+        ['extra segment', (_valid, appData, extensionId) => fileUri(path.join(appData, 'Code', 'logs', 'session', 'extra', 'window1', 'exthost', extensionId))],
+        ['non-file scheme', (valid) => rawUri(`vscode-remote:${valid.path}`)],
+        ['query', (valid) => rawUri(`${valid.toString()}?private=1`)],
+        ['fragment', (valid) => rawUri(`${valid.toString()}#private`)],
+        ['UNC path', (_valid, _appData, extensionId) => rawUri(`file:////server/share/logs/session/window1/exthost/${extensionId}`)],
+        ['dot segment', (valid) => rawUri(valid.toString().replace('/session/window1/', '/session/../session/window1/'))]
+    ];
+    for (const [name, alter] of invalidLogUris) {
+        const f = await fixture({ restart: true });
+        try {
+            const appData = f.deps.env.APPDATA!;
+            const valid = fileUri(path.join(appData, 'Code', 'logs', 'session', 'window1', 'exthost', f.context.extension.id));
+            f.context.logUri = valid;
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const positive = parsed(await manager.inspect());
+            assert.strictEqual(positive.windowIdentity.status, 'verified', `${name} must start from an exact-root positive control`);
+            assert.strictEqual(positive.windowIdentity.nativeWindowId, 1);
+
+            f.context.logUri = alter(valid, appData, f.context.extension.id);
+            const result = parsed(await manager.inspect());
+            assert.strictEqual(result.windowIdentity.status, 'unavailable', name);
+            assert.strictEqual(result.windowIdentity.failureCode, 'window_identity_log_uri_invalid', name);
+            assert.strictEqual(result.windowIdentity.nativeWindowId, null);
+            assert.strictEqual(result.windowIdentity.rendererProcessPid, null);
+            assert.strictEqual(f.quitCalls, 0);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+
+    const wrongCommit = await fixture({ restart: true });
+    try {
+        wrongCommit.deps.runCodeStatus = async () => status().replace(COMMIT, 'a'.repeat(40));
+        const manager = createColabEnvironmentForTest(wrongCommit.context, wrongCommit.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.windowIdentity.status, 'unsupported');
+        assert.strictEqual(result.windowIdentity.failureCode, 'window_identity_commit_unsupported');
+    } finally { wrongCommit.dispose(); await fs.rm(wrongCommit.temp, { recursive: true, force: true }); }
+});
+
+test('window identity rejects duplicate native rows and a derived ID absent from current status', async () => {
+    const duplicate = await fixture({ restart: true });
+    try {
+        duplicate.deps.runCodeStatus = async () => status() + '    1     190   28921  window [1] (Second)\n';
+        const manager = createColabEnvironmentForTest(duplicate.context, duplicate.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.windowIdentity.status, 'mismatch');
+        assert.strictEqual(result.windowIdentity.failureCode, 'window_identity_native_rows_invalid');
+    } finally { duplicate.dispose(); await fs.rm(duplicate.temp, { recursive: true, force: true }); }
+
+    const absent = await fixture({ restart: true });
+    try {
+        absent.context.logUri = fileUri(path.join(absent.temp, 'AppData', 'Roaming', 'Code', 'logs', 'session', 'window3', 'exthost', absent.context.extension.id));
+        absent.deps.runCodeStatus = async () => status(`--crash-reporter-id ${CRASH}`, PID, 2);
+        const manager = createColabEnvironmentForTest(absent.context, absent.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.windowIdentity.status, 'mismatch');
+        assert.strictEqual(result.windowIdentity.failureCode, 'window_identity_status_row_mismatch');
+    } finally { absent.dispose(); await fs.rm(absent.temp, { recursive: true, force: true }); }
+});
+
+test('window identity rejects duplicate renderer PIDs with distinct IDs and more than 64 local rows', async () => {
+    const duplicatePid = await fixture({ restart: true });
+    try {
+        duplicatePid.deps.runCodeStatus = async () => status() + '    1     190   28920  window [2] (Second)\n';
+        const manager = createColabEnvironmentForTest(duplicatePid.context, duplicatePid.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.application.actualWindowCount, 2);
+        assert.deepStrictEqual(result.application.nativeWindows.map((row: any) => row.id), [1, 2]);
+        assert.strictEqual(result.windowIdentity.status, 'mismatch');
+        assert.strictEqual(result.windowIdentity.failureCode, 'window_identity_native_rows_invalid');
+    } finally { duplicatePid.dispose(); await fs.rm(duplicatePid.temp, { recursive: true, force: true }); }
+
+    const oversized = await fixture({ restart: true });
+    try {
+        oversized.deps.runCodeStatus = async () => status(`--crash-reporter-id ${CRASH}`, PID, 65);
+        const manager = createColabEnvironmentForTest(oversized.context, oversized.deps); await manager.initialize();
+        const result = parsed(await manager.inspect());
+        assert.strictEqual(result.application.actualWindowCount, 65);
+        assert.deepStrictEqual(result.application.nativeWindows, []);
+        assert.strictEqual(result.windowIdentity.status, 'mismatch');
+        assert.strictEqual(result.windowIdentity.failureCode, 'window_identity_native_rows_invalid');
+        assert.deepStrictEqual(result.windowIdentity.observedNativeWindowIds, []);
+    } finally { oversized.dispose(); await fs.rm(oversized.temp, { recursive: true, force: true }); }
 });
 
 test('preflight reports an invalid configured native port without probing or mutating', async () => {
@@ -349,7 +488,7 @@ test('failed initialization never publishes a partially initialized global manag
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jupyter-mcp-failed-environment-'));
     try {
         const storageFile = path.join(temp, 'not-a-directory'); await fs.writeFile(storageFile, 'x');
-        const context = { globalStorageUri: fileUri(storageFile), extensionPath: temp, extension: { id: 'hadrian.jupyter-mcp' }, subscriptions: [] } as any;
+        const context = { globalStorageUri: fileUri(storageFile), logUri: fileUri(path.join(temp, 'logs', 'window1', 'exthost', 'hadrian.jupyter-mcp')), extensionPath: temp, extension: { id: 'hadrian.jupyter-mcp' }, subscriptions: [] } as any;
         await assert.rejects(() => initializeColabEnvironment(context));
         await rejectsCode(() => prepareColabEnvironment(), 'environment_not_initialized');
     } finally { await fs.rm(temp, { recursive: true, force: true }); }

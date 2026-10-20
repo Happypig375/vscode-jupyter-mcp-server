@@ -17,6 +17,8 @@ const IDS = {
     e: '00000000-0000-4000-8000-000000000005'
 } as const;
 const NAMES = new Map<string, string>([[IDS.a, 'window-a'], [IDS.b, 'window-b'], [IDS.c, 'window-c'], [IDS.d, 'window-d']]);
+const NATIVE_IDS = new Map<string, number>([[IDS.a, 1], [IDS.b, 2], [IDS.c, 3], [IDS.d, 4]]);
+const COMMIT = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
 
 function freePort(): Promise<number> {
     return new Promise((resolve, reject) => {
@@ -39,9 +41,24 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, message: str
     throw new Error(message);
 }
 
-function localPreflight(windowId: string, options: { native?: boolean; actualWindowCount?: number; blockers?: string[]; pid?: number; version?: string; schemaVersion?: number } = {}): string {
+function localPreflight(windowId: string, options: {
+    native?: boolean; actualWindowCount?: number; blockers?: string[]; pid?: number; version?: string; schemaVersion?: number;
+    nativeWindowId?: number; observedNativeWindowIds?: number[]; identityStatus?: 'verified' | 'unsupported' | 'unavailable' | 'mismatch';
+    identityCommit?: string; rendererProcessPid?: number; applicationStatus?: 'verified' | 'unsupported' | 'unavailable' | 'mismatch';
+    startupArguments?: 'supported' | 'unsupported' | 'unavailable'; applicationFailureCode?: string | null;
+    localHost?: boolean; defaultInstall?: 'verified' | 'unsupported'; supportedVersion?: string; versionSupported?: boolean;
+    nativeRendererProcessPids?: number[];
+} = {}): string {
     const native = options.native ?? windowId === IDS.d;
     const name = NAMES.get(windowId) ?? windowId;
+    const actualWindowCount = options.actualWindowCount ?? 4;
+    const observedNativeWindowIds = options.observedNativeWindowIds ?? Array.from({ length: actualWindowCount }, (_, index) => index + 1);
+    const nativeWindowId = options.nativeWindowId ?? (actualWindowCount === 1 ? 1 : NATIVE_IDS.get(windowId) ?? 1);
+    const nativeWindows = observedNativeWindowIds.map((id, index) => ({
+        id, rendererProcessPid: options.nativeRendererProcessPids?.[index] ?? 28920 + id
+    }));
+    const rendererProcessPid = options.rendererProcessPid ?? nativeWindows.find(row => row.id === nativeWindowId)?.rendererProcessPid ?? 28920 + nativeWindowId;
+    const identityStatus = options.identityStatus ?? 'verified';
     return JSON.stringify({
         schemaVersion: options.schemaVersion ?? 1, observedAt: 1_800_000_000_000, readOnly: true,
         nativeBinding: {
@@ -50,8 +67,17 @@ function localPreflight(windowId: string, options: { native?: boolean; actualWin
             exactWindowBinding: 'not-established', correspondenceReason: 'debug-targets-do-not-expose-vscode-peer-window-ids',
             peerSecret: 'must-not-cross-boundary'
         },
+        windowIdentity: {
+            source: 'extension_log_uri', status: identityStatus, sourceVersion: '1.142.0',
+            sourceCommit: options.identityCommit ?? COMMIT,
+            nativeWindowId: identityStatus === 'verified' ? nativeWindowId : null,
+            rendererProcessPid: identityStatus === 'verified' ? rendererProcessPid : null,
+            observedNativeWindowIds,
+            failureCode: identityStatus === 'verified' ? null : 'window_identity_unavailable',
+            privateLogPath: 'must-not-cross-boundary'
+        },
         window: {
-            localHost: true, trusted: true,
+            localHost: options.localHost ?? true, trusted: true,
             workspace: { kind: name === 'window-d' ? 'empty' : 'workspace', folderCount: name === 'window-d' ? 0 : 1 },
             notebooks: { total: 0, fileBacked: 0, untitled: 0, dirty: 0, visibleEditors: 0, activeEditor: false },
             textDocuments: { total: 0, fileBacked: 0, untitled: 0, dirty: 0, blocking: 0, visibleEditors: 0, activeEditor: false },
@@ -59,10 +85,13 @@ function localPreflight(windowId: string, options: { native?: boolean; actualWin
             quitPolicy: { confirmBeforeClose: 'never', restoreWindows: 'all' }
         },
         application: {
-            status: 'verified', version: options.version ?? '1.142.0', supportedVersion: '1.142.0', versionSupported: true,
-            commit: '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1', mainProcessPid: options.pid ?? 1234,
-            mainProcessIdentity: 'verified', defaultInstall: 'verified', startupArguments: 'supported',
-            actualWindowCount: options.actualWindowCount ?? 4, failureCode: null
+            status: options.applicationStatus ?? 'verified', version: options.version ?? '1.142.0',
+            supportedVersion: options.supportedVersion ?? '1.142.0', versionSupported: options.versionSupported ?? true,
+            commit: COMMIT, mainProcessPid: options.pid ?? 1234,
+            mainProcessIdentity: 'verified', defaultInstall: options.defaultInstall ?? 'verified', startupArguments: options.startupArguments ?? 'supported',
+            actualWindowCount,
+            nativeWindows,
+            failureCode: options.applicationFailureCode ?? null
         },
         blockers: options.blockers ?? (native ? [] : ['native_binding_unavailable', 'automatic_restart_workspace_present']),
         peerSecret: 'must-not-cross-boundary'
@@ -79,10 +108,51 @@ function testPreflightAggregationBoundaries(): void {
     assert.deepStrictEqual(native.supportedNextOperation.candidateWindowIds, [IDS.d]);
     assert.ok(!native.blockers.includes('peer_window_correspondence_not_exposed'));
     assert.ok(native.limitations.some((value: string) => value.includes('correspondence')));
+    assert.strictEqual(native.peerWindowCorrespondence.availability, 'verified');
+    assert.deepStrictEqual(native.peerWindowCorrespondence.mappings, [{ windowId: IDS.d, nativeWindowId: 1, rendererProcessPid: 28921 }]);
 
     const restart = aggregated([{ windowId: IDS.d, text: localPreflight(IDS.d, { actualWindowCount: 1, native: false, blockers: ['native_binding_unavailable'] }) }]);
     assert.strictEqual(restart.supportedNextOperation.status, 'available');
     assert.strictEqual(restart.supportedNextOperation.reasonCode, 'single_empty_window_candidate_requires_prepare_revalidation');
+
+    const identityUnavailable = aggregated([{ windowId: IDS.d, text: localPreflight(IDS.d, {
+        actualWindowCount: 1, native: true, blockers: [], identityStatus: 'unavailable'
+    }) }]);
+    assert.strictEqual(identityUnavailable.peerWindowCorrespondence.availability, 'unavailable');
+    assert.strictEqual(identityUnavailable.peerWindowCorrespondence.reasonCode, 'peer_window_identity_unavailable');
+    assert.strictEqual(identityUnavailable.supportedNextOperation.status, 'available', 'identity evidence must not change recommendation eligibility');
+
+    const unsupportedStartup = aggregated([{ windowId: IDS.d, text: localPreflight(IDS.d, {
+        actualWindowCount: 1, native: true, blockers: ['startup_arguments_unsupported'],
+        applicationStatus: 'unsupported', startupArguments: 'unsupported', applicationFailureCode: 'startup_arguments_unsupported'
+    }) }]);
+    assert.strictEqual(unsupportedStartup.peerWindowCorrespondence.availability, 'verified');
+    assert.strictEqual(unsupportedStartup.supportedNextOperation.status, 'blocked');
+    assert.ok(unsupportedStartup.blockers.includes('startup_arguments_unsupported'));
+
+    for (const [options, reasonCode] of [
+        [{ localHost: false }, 'peer_window_identity_local_host_required'],
+        [{ defaultInstall: 'unsupported' as const }, 'peer_window_identity_application_unverified'],
+        [{ versionSupported: false }, 'peer_window_identity_application_unverified'],
+        [{ supportedVersion: '1.141.0' }, 'peer_window_identity_application_unverified']
+    ] as const) {
+        const contradictory = aggregated([{ windowId: IDS.d, text: localPreflight(IDS.d, {
+            actualWindowCount: 1, native: true, blockers: [], ...options
+        }) }]);
+        assert.strictEqual(contradictory.peerWindowCorrespondence.availability, 'unavailable');
+        assert.strictEqual(contradictory.peerWindowCorrespondence.reasonCode, reasonCode);
+        assert.deepStrictEqual(contradictory.peerWindowCorrespondence.mappings, []);
+        assert.strictEqual(contradictory.supportedNextOperation.status, 'available', 'correspondence correction must not change recommendation policy');
+    }
+
+    const duplicatePeerUuid = aggregated([
+        { windowId: IDS.c, text: localPreflight(IDS.c, { actualWindowCount: 2, nativeWindowId: 1 }) },
+        { windowId: IDS.c, text: localPreflight(IDS.c, { actualWindowCount: 2, nativeWindowId: 2 }) }
+    ]);
+    assert.strictEqual(duplicatePeerUuid.peerWindowCorrespondence.availability, 'unavailable');
+    assert.strictEqual(duplicatePeerUuid.peerWindowCorrespondence.reasonCode, 'peer_window_identity_duplicate_registration');
+    assert.strictEqual(duplicatePeerUuid.peerWindowCorrespondence.duplicatePeerIdCount, 1);
+    assert.deepStrictEqual(duplicatePeerUuid.peerWindowCorrespondence.mappings, []);
 
     const stale = aggregated([
         { windowId: IDS.d, text: localPreflight(IDS.d, { actualWindowCount: 1, native: false, blockers: ['native_binding_unavailable'] }) },
@@ -96,11 +166,36 @@ function testPreflightAggregationBoundaries(): void {
     assert.strictEqual(nativeBlocked.supportedNextOperation.status, 'blocked');
 
     const nativeMultiWindow = aggregated([
-        { windowId: IDS.c, text: localPreflight(IDS.c, { actualWindowCount: 2, native: true, blockers: [] }) },
-        { windowId: IDS.d, text: localPreflight(IDS.d, { actualWindowCount: 2, native: true, blockers: [] }) }
+        { windowId: IDS.c, text: localPreflight(IDS.c, { actualWindowCount: 2, native: true, blockers: [], nativeWindowId: 1 }) },
+        { windowId: IDS.d, text: localPreflight(IDS.d, { actualWindowCount: 2, native: true, blockers: [], nativeWindowId: 2 }) }
     ]);
     assert.strictEqual(nativeMultiWindow.supportedNextOperation.status, 'blocked');
     assert.ok(nativeMultiWindow.blockers.includes('multiple_app_windows'));
+    assert.strictEqual(nativeMultiWindow.peerWindowCorrespondence.availability, 'verified');
+    assert.deepStrictEqual(nativeMultiWindow.peerWindowCorrespondence.observedNativeWindowIds, [1, 2]);
+
+    const duplicateDerived = aggregated([
+        { windowId: IDS.c, text: localPreflight(IDS.c, { actualWindowCount: 2, nativeWindowId: 1 }) },
+        { windowId: IDS.d, text: localPreflight(IDS.d, { actualWindowCount: 2, nativeWindowId: 1 }) }
+    ]);
+    assert.strictEqual(duplicateDerived.peerWindowCorrespondence.availability, 'unavailable');
+    assert.strictEqual(duplicateDerived.peerWindowCorrespondence.reasonCode, 'peer_window_identity_set_mismatch');
+    assert.deepStrictEqual(duplicateDerived.peerWindowCorrespondence.mappings, []);
+
+    const duplicateRendererPid = aggregated([
+        { windowId: IDS.c, text: localPreflight(IDS.c, { actualWindowCount: 2, nativeWindowId: 1, nativeRendererProcessPids: [30001, 30001] }) },
+        { windowId: IDS.d, text: localPreflight(IDS.d, { actualWindowCount: 2, nativeWindowId: 2, nativeRendererProcessPids: [30001, 30001] }) }
+    ]);
+    assert.strictEqual(duplicateRendererPid.peerWindowCorrespondence.availability, 'unavailable');
+    assert.strictEqual(duplicateRendererPid.peerWindowCorrespondence.reasonCode, 'peer_window_identity_native_rows_invalid');
+    assert.deepStrictEqual(duplicateRendererPid.peerWindowCorrespondence.mappings, []);
+
+    const extraNativeWindow = aggregated([
+        { windowId: IDS.c, text: localPreflight(IDS.c, { actualWindowCount: 3, nativeWindowId: 1 }) },
+        { windowId: IDS.d, text: localPreflight(IDS.d, { actualWindowCount: 3, nativeWindowId: 2 }) }
+    ]);
+    assert.strictEqual(extraNativeWindow.peerWindowCorrespondence.availability, 'unavailable');
+    assert.strictEqual(extraNativeWindow.peerWindowCorrespondence.reasonCode, 'peer_window_identity_set_mismatch');
 
     const inconsistent = aggregated([
         { windowId: IDS.c, text: localPreflight(IDS.c, { actualWindowCount: 2, native: true, blockers: [], pid: 1234 }) },
@@ -117,7 +212,10 @@ function testPreflightAggregationBoundaries(): void {
         '{',
         'x'.repeat(65 * 1024),
         localPreflight(IDS.d, { schemaVersion: 2 }),
-        localPreflight(IDS.d, { version: '1.142.0 private' })
+        localPreflight(IDS.d, { version: '1.142.0 private' }),
+        (() => { const value = JSON.parse(localPreflight(IDS.d)); value.windowIdentity.nativeWindowId = -1; return JSON.stringify(value); })(),
+        (() => { const value = JSON.parse(localPreflight(IDS.d)); value.windowIdentity.failureCode = 'contradictory_verified_state'; return JSON.stringify(value); })(),
+        (() => { const value = JSON.parse(localPreflight(IDS.d)); value.application.nativeWindows = new Array(65).fill({ id: 1, rendererProcessPid: 2 }); return JSON.stringify(value); })()
     ]) {
         const invalid = aggregated([{ windowId: IDS.d, text }]);
         assert.strictEqual(invalid.respondingPeerCount, 0);
@@ -281,8 +379,10 @@ async function main(): Promise<void> {
         assert.strictEqual(preflight.appWindowCountMatchesConnectedPeerCount, true);
         assert.strictEqual(preflight.supportedNextOperation.status, 'blocked');
         assert.deepStrictEqual(preflight.supportedNextOperation.candidateWindowIds, []);
-        assert.strictEqual(preflight.peerWindowCorrespondence.availability, 'not-exposed');
+        assert.strictEqual(preflight.peerWindowCorrespondence.availability, 'verified');
         assert.strictEqual(preflight.peerWindowCorrespondence.countEqualityDoesNotEstablishMapping, true);
+        assert.deepStrictEqual(preflight.peerWindowCorrespondence.observedNativeWindowIds, [1, 2, 3, 4]);
+        assert.strictEqual(preflight.peerWindowCorrespondence.mappings.length, 4);
         assert.ok(!preflight.blockers.includes('peer_window_correspondence_not_exposed'));
         assert.ok(preflight.blockers.includes('multiple_app_windows'));
         assert.ok(!JSON.stringify(preflight).includes('must-not-cross-boundary'));
