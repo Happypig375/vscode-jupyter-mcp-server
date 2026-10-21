@@ -631,7 +631,7 @@ class ColabEnvironmentManager {
             const initialWorkspace = captureRestorationWorkspaceState();
             const requestedFolder = folderUri === undefined ? undefined : await resolveRequestedFolder(folderUri);
             assertSameRestorationWorkspace(initialWorkspace, captureRestorationWorkspaceState());
-            if (requestedFolder && !initialWorkspace.workspace.roots.some(root => root.uri === requestedFolder.uri)) {
+            if (requestedFolder && !initialWorkspace.workspace.roots.some(root => root.uri === requestedFolder.requestedUri)) {
                 throw new ColabEnvironmentError('workspace_mismatch', 'folderUri must match one existing root of the configured Workspace.');
             }
 
@@ -1811,7 +1811,7 @@ function nativeWindowIdFromLogUri(
     return windowId;
 }
 
-async function resolveRequestedFolder(value: string): Promise<{ uri: string; label: string; path: string }> {
+async function resolveRequestedFolder(value: string): Promise<{ uri: string; requestedUri: string; label: string; path: string }> {
     if (typeof value !== 'string' || value.length > 4096 || !value.startsWith('file:///')) {
         throw new ColabEnvironmentError('folder_uri_invalid', 'folderUri must be an absolute local file URI.');
     }
@@ -1822,6 +1822,7 @@ async function resolveRequestedFolder(value: string): Promise<{ uri: string; lab
         uri.fsPath.includes('\0') || (process.platform === 'win32' && uri.fsPath.startsWith('\\\\'))) {
         throw new ColabEnvironmentError('folder_uri_invalid', 'folderUri must identify one local folder without an authority, query or fragment.');
     }
+    const requestedUri = uri.toString();
     let folderPath: string;
     try {
         folderPath = await fs.realpath(uri.fsPath);
@@ -1835,7 +1836,7 @@ async function resolveRequestedFolder(value: string): Promise<{ uri: string; lab
         if (error instanceof ColabEnvironmentError) throw error;
         throw new ColabEnvironmentError('folder_unavailable', 'The requested local folder is unavailable.');
     }
-    return { uri: vscode.Uri.file(folderPath).toString(), label: path.basename(folderPath) || folderPath, path: folderPath };
+    return { uri: vscode.Uri.file(folderPath).toString(), requestedUri, label: path.basename(folderPath) || folderPath, path: folderPath };
 }
 
 async function assertCleanEmptyWindow(): Promise<void> {

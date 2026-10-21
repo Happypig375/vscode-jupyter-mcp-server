@@ -616,6 +616,46 @@ test('restored-workspace folderUri may only identify an existing root and never 
     } finally { mismatched.dispose(); await fs.rm(mismatched.temp, { recursive: true, force: true }); }
 });
 
+test('restored-workspace matches only the exact configured URI for an aliased root', async () => {
+    const matched = await fixture({ restart: true });
+    try {
+        const configured = await configuredWorkspace(matched);
+        const aliasPath = path.join(matched.temp, 'project-alias');
+        await fs.symlink(configured.root.fsPath, aliasPath, process.platform === 'win32' ? 'junction' : 'dir');
+        const aliasUri = fileUri(aliasPath);
+        const canonicalUri = fileUri(await fs.realpath(aliasPath));
+        assert.notStrictEqual(aliasUri.toString(), canonicalUri.toString(), 'the fixture must exercise a real URI alias');
+        state.folders = [{ name: 'Research', uri: aliasUri }];
+
+        const manager = createColabEnvironmentForTest(matched.context, matched.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(aliasUri.toString(), 'restore-clean-workspace'));
+        assert.strictEqual(prepared.status, 'restart_requested');
+        const receipt = JSON.parse(await fs.readFile(path.join(matched.root, 'colab-environment-receipts', `${prepared.preparationId}.json`), 'utf8'));
+        assert.deepStrictEqual(receipt.restorationSnapshot.workspace.roots, [{ uri: aliasUri.toString(), name: 'Research' }]);
+        assert.strictEqual(await matched.runScheduledQuit(), true);
+        assert.deepStrictEqual(state.workspaceUpdates, []);
+    } finally { matched.dispose(); await fs.rm(matched.temp, { recursive: true, force: true }); }
+
+    const unlisted = await fixture({ restart: true });
+    try {
+        const configured = await configuredWorkspace(unlisted);
+        const aliasPath = path.join(unlisted.temp, 'project-alias');
+        await fs.symlink(configured.root.fsPath, aliasPath, process.platform === 'win32' ? 'junction' : 'dir');
+        const aliasUri = fileUri(aliasPath);
+        const canonicalUri = fileUri(await fs.realpath(aliasPath));
+        assert.notStrictEqual(aliasUri.toString(), canonicalUri.toString(), 'the negative fixture must identify the same directory differently');
+        state.folders = [{ name: 'Research', uri: aliasUri }];
+
+        const manager = createColabEnvironmentForTest(unlisted.context, unlisted.deps); await manager.initialize();
+        await rejectsCode(() => manager.prepare(canonicalUri.toString(), 'restore-clean-workspace'), 'workspace_mismatch');
+        assert.strictEqual(unlisted.quitCalls, 0);
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+        await assert.rejects(() => fs.stat(path.join(unlisted.root, 'colab-environment-active.json')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+        assert.deepStrictEqual(await fs.readdir(path.join(unlisted.root, 'colab-environment-receipts')), []);
+        assert.deepStrictEqual(state.workspaceUpdates, []);
+    } finally { unlisted.dispose(); await fs.rm(unlisted.temp, { recursive: true, force: true }); }
+});
+
 test('restored tab snapshot preserves multiplicity and group membership while ignoring within-group order', async () => {
     const reordered = await fixture({ restart: true });
     try {
@@ -1141,12 +1181,74 @@ test('restored durable receipt rejects unknown modes, malformed snapshots, incon
 test('restored receipt reserves helper headroom before claiming the active slot', async () => {
     const f = await fixture({ restart: true });
     try {
-        await configuredWorkspace(f);
-        state.folders = Array.from({ length: 64 }, (_, index) => ({
-            name: `Root ${index}`,
-            uri: fileUri(path.join(f.temp, `root-${index}-${'x'.repeat(860)}`))
-        }));
+        const configured = await configuredWorkspace(f);
+        const maxReceiptBytes = 64 * 1024;
+        const helperHeadroomBytes = 2 * 1024;
+        const headroomBoundary = maxReceiptBytes - helperHeadroomBytes;
+        const ids = [
+            '00000000-0000-4000-8000-000000000001',
+            '00000000-0000-4000-8000-000000000002',
+            '00000000-0000-4000-8000-000000000003'
+        ];
+        const rootNames = Array.from({ length: 64 }, (_, index) => `Root ${index}`);
+        const candidateFor = (rootUris: string[]) => {
+            const snapshot = {
+                schema: 1,
+                workspace: {
+                    uri: state.workspaceFile.toString(), kind: 'file',
+                    roots: rootUris.map((uri, index) => ({ uri, name: rootNames[index] }))
+                },
+                tabGroups: [[
+                    { kind: 'text', uri: configured.text.toString() },
+                    { kind: 'notebook', uri: configured.notebook.toString(), notebookType: 'jupyter-notebook' }
+                ]],
+                documents: {
+                    text: [{ uri: configured.text.toString(), version: 7 }],
+                    notebooks: [{ uri: configured.notebook.toString(), version: 11 }]
+                },
+                savedState: {
+                    untitledWorkspaces: [],
+                    backupRegistry: { workspaces: 1, folders: 0, emptyWindows: 0 }
+                }
+            };
+            return {
+                schema: 1, preparationId: ids[0], nonce: ids[1], status: 'arming_restart',
+                createdAt: f.deps.now(), deadline: f.deps.now() + 120_000,
+                workspaceUri: state.workspaceFile.toString(),
+                expectedWindowLabel: rootNames.join(', ').slice(0, 512),
+                port: 59267, generatedWorkspace: false,
+                restartMode: 'restore-clean-workspace', restorationSnapshot: snapshot, restartRequired: true,
+                installedCommit: COMMIT, main: f.identity,
+                executablePath: path.resolve(f.deps.execPath),
+                userDataDir: path.resolve(f.deps.env.APPDATA!, 'Code'),
+                extensionsDir: path.resolve(f.deps.env.USERPROFILE!, '.vscode', 'extensions'),
+                helperToken: ids[2]
+            };
+        };
+
+        // Derive the ASCII padding from the complete pre-helper candidate. The
+        // fixed root URI prefixes avoid multiplying the host's temporary-path
+        // length, while this calculation accounts for the remaining host paths.
+        const rootPrefixes = rootNames.map((_name, index) => `file:///fixture-root-${index}-`);
+        const baseBytes = Buffer.byteLength(JSON.stringify(candidateFor(rootPrefixes)));
+        const paddingBytes = headroomBoundary - baseBytes;
+        assert.ok(paddingBytes > 0, 'the bounded fixture must begin below the helper-headroom boundary');
+        const commonPadding = Math.floor(paddingBytes / rootPrefixes.length);
+        const remainder = paddingBytes % rootPrefixes.length;
+        const rootUris = rootPrefixes.map((prefix, index) =>
+            `${prefix}${'x'.repeat(commonPadding + (index === 0 ? remainder : 0))}`
+        );
+        state.folders = rootUris.map((uri, index) => ({ name: rootNames[index], uri: rawUri(uri) }));
+
+        const candidate = candidateFor(rootUris);
+        const candidateBytes = Buffer.byteLength(JSON.stringify(candidate));
+        const snapshotBytes = Buffer.byteLength(JSON.stringify(candidate.restorationSnapshot));
+        assert.strictEqual(candidateBytes, headroomBoundary, 'candidate must reach the exact reserved-headroom boundary');
+        assert.ok(snapshotBytes < maxReceiptBytes, 'the snapshot itself must remain inside its independent 64 KiB bound');
+        assert.ok(rootUris.every(uri => uri.length <= 4096), 'every constructed root URI must remain contract-valid');
+
         const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        let uuidIndex = 0; f.deps.uuid = () => ids[uuidIndex++] ?? ids[2];
         await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'preparation_receipt_too_large');
         assert.strictEqual(operationGateStateForTest().restartPending, false);
         await assert.rejects(() => fs.stat(path.join(f.root, 'colab-environment-active.json')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
