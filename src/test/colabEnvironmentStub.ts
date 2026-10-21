@@ -48,6 +48,7 @@ export function reset(): void {
         trusted: true, remoteName: undefined, folders: undefined, workspaceFile: undefined,
         notebooks: [], documents: [], visibleNotebooks: [], activeNotebook: undefined,
         terminals: [], visibleEditors: [], activeEditor: undefined, tabs: [], calls: [],
+        tabGroups: undefined,
         configuredPort: 0, confirmBeforeClose: 'never', restoreWindows: 'all', activeDebugSession: undefined,
         workspaceUpdates: [], workspaceUpdateResult: true, onWorkspaceUpdate: undefined
     });
@@ -57,6 +58,31 @@ reset();
 export const version = '1.142.0';
 export const StatusBarAlignment = { Right: 2 };
 export const Uri = { parse: (value: string) => new TestUri(value), file: fileUri };
+export class TabInputText { constructor(readonly uri: any) {} }
+export class TabInputTextDiff { constructor(readonly original: any, readonly modified: any) {} }
+export class TabInputCustom { constructor(readonly uri: any, readonly viewType: string) {} }
+export class TabInputNotebook { constructor(readonly uri: any, readonly notebookType: string) {} }
+export class TabInputNotebookDiff { constructor(readonly original: any, readonly modified: any, readonly notebookType: string) {} }
+export class TabInputWebview { constructor(readonly viewType: string) {} }
+export class TabInputTerminal {}
+export const NotebookCellKind = { Markup: 1, Code: 2 };
+export class NotebookCellData { constructor(public kind: number, public value: string, public languageId: string) {} }
+export class NotebookRange { constructor(public start: number, public end: number) {} }
+export class NotebookData { constructor(public cells: NotebookCellData[]) {} }
+export const NotebookEdit = {
+    insertCells: (index: number, cells: NotebookCellData[]) => ({ index, cells }),
+    replaceCells: (range: NotebookRange, cells: NotebookCellData[]) => ({ range, cells }),
+    deleteCells: (range: NotebookRange) => ({ range })
+};
+export class WorkspaceEdit { set(_uri: any, _edits: any[]) {} }
+export class CancellationTokenSource {
+    private listeners: Array<() => void> = [];
+    token = { isCancellationRequested: false, onCancellationRequested: (listener: () => void) => { this.listeners.push(listener); return { dispose() {} }; } };
+    cancel() { this.token.isCancellationRequested = true; for (const listener of this.listeners) listener(); }
+    dispose() { this.listeners = []; }
+}
+export const extensions = { getExtension: () => undefined };
+export const lm = { tools: [] as any[] };
 export const env = { get appHost() { return 'desktop'; }, get remoteName() { return state.remoteName; } };
 export const workspace = {
     get isTrusted() { return state.trusted; },
@@ -83,7 +109,7 @@ export const window = {
     get visibleTextEditors() { return state.visibleEditors; },
     get activeTextEditor() { return state.activeEditor; },
     tabGroups: {
-        get all() { return [{ tabs: state.tabs }]; },
+        get all() { return state.tabGroups ?? [{ tabs: state.tabs }]; },
         close: async (tab: any) => { const index = state.tabs.indexOf(tab); if (index < 0) return false; state.tabs.splice(index, 1); return true; }
     },
     createStatusBarItem: () => ({ text: '', show() {}, dispose() {} })

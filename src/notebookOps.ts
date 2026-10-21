@@ -326,6 +326,10 @@ function invalidateExecutionGeneration(uri: string): void { executionGenerations
 export function hasPendingNotebookExecutionCommand(notebookUri: string): boolean {
     return !!pendingExecutionCommands.get(notebookUri)?.size;
 }
+export function hasGlobalNotebookExecutionWork(): boolean {
+    pruneExecutionRuns();
+    return pendingExecutionCommands.size > 0 || [...executionRuns.values()].some(runs => runs.some(run => !TERMINAL_STATES.has(run.state)));
+}
 function dispatchTrackedCell(notebookUri: string, work: () => Thenable<unknown>): Promise<unknown> {
     const pending = pendingExecutionCommands.get(notebookUri) ?? new Set<Promise<unknown>>();
     // Preserve synchronous command dispatch; the executor also turns a synchronous
@@ -540,6 +544,22 @@ async function observeActiveKernel(nb: vscode.NotebookDocument): Promise<ActiveK
     } catch {
         return { state: 'unavailable', reason: 'Jupyter active-kernel lookup failed; runtime state could not be observed.' };
     }
+}
+
+/** Every open notebook must be affirmatively disconnected before workspace restore. */
+export async function assertNoExposedNotebookKernelsForRestart(timeoutMs = 2_000): Promise<void> {
+    const notebooks = [...vscode.workspace.notebookDocuments];
+    if (notebooks.length > 64) throw Object.assign(new Error('Too many open notebooks to inspect safely.'), { code: 'notebook_inventory_unbounded' });
+    await Promise.all(notebooks.map(async notebook => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const observation = await Promise.race([
+            observeActiveKernel(notebook),
+            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), timeoutMs); })
+        ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
+        if (!observation) throw Object.assign(new Error('Public Jupyter kernel lookup timed out.'), { code: 'kernel_observation_unavailable' });
+        if (observation.state === 'active') throw Object.assign(new Error('An open notebook exposes an active kernel.'), { code: 'active_kernel_present' });
+        if (observation.state !== 'none') throw Object.assign(new Error('Public Jupyter kernel state could not be observed.'), { code: 'kernel_observation_unavailable' });
+    }));
 }
 
 type ExecutionRuntimeFailure = { reasonCode: string; reason: string; kernelStatusAtStop?: string };

@@ -2,10 +2,10 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel, assertNoColabSetup, acquireDesktopLease, SetupDeps } from '../colabSetup';
+import { configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel, assertNoColabSetup, acquireDesktopLease, hasGlobalColabSetupWork, SetupDeps } from '../colabSetup';
 import { createColabNativeDriverForTest } from '../colabNative';
 import { DesktopSetupError } from '../colabDesktop';
-import { runNotebookCells, getExecution, interruptKernels, hasPendingNotebookExecutionCommand } from '../notebookOps';
+import { runNotebookCells, getExecution, interruptKernels, hasGlobalNotebookExecutionWork, hasPendingNotebookExecutionCommand } from '../notebookOps';
 import { state, reset, uri } from './colabSetupStub';
 
 const ref = 'file:///test.ipynb';
@@ -117,6 +117,7 @@ async function main() {
             while (!state.finishUserCommand && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1));
             assert.strictEqual(typeof state.finishUserCommand, 'function');
             assert.strictEqual(hasPendingNotebookExecutionCommand(ref), true);
+            assert.strictEqual(hasGlobalNotebookExecutionWork(), true, 'unsettled notebook dispatch remains globally enumerable');
             await interruptKernels([ref]);
             const interrupted = JSON.parse(await getExecution(ref, { executionId: running.executionId, waitMs: 1000 }));
             assert.strictEqual(interrupted.status, 'unavailable');
@@ -138,6 +139,7 @@ async function main() {
             state.finishUserCommand(settlement === 'resolve' ? undefined : new Error('private command detail'));
             await new Promise((resolve) => setImmediate(resolve));
             assert.strictEqual(hasPendingNotebookExecutionCommand(ref), false);
+            assert.strictEqual(hasGlobalNotebookExecutionWork(), false, 'settled terminal execution releases the global busy signal');
             const recovered = await result(f, 'm7ae91d89');
             assert.strictEqual(recovered.ready, true);
             assert.ok(!JSON.stringify(recovered).includes('private command detail'));
@@ -478,9 +480,9 @@ async function main() {
     });
     await test('tracked setup can be recovered and cancelled; request wait does not cancel', async () => {
         const f = fixture(); state.startupMode = 'hang'; const r = JSON.parse(await configureColab(ref, { waitMs: 0 }, f.deps));
-        assert.strictEqual(r.status, 'running'); assert.throws(() => assertNoColabSetup(ref), /still active/);
+        assert.strictEqual(r.status, 'running'); assert.throws(() => assertNoColabSetup(ref), /still active/); assert.strictEqual(hasGlobalColabSetupWork(), true);
         const cancelled = JSON.parse(await getColabSetup(ref, r.setupId, 1000, true)); assert.strictEqual(cancelled.ready, false); assert.strictEqual(cancelled.status, 'cancelled');
-        assertNoColabSetup(ref); await assert.rejects(() => getColabSetup('file:///wrong', r.setupId), /No matching/);
+        assertNoColabSetup(ref); assert.strictEqual(hasGlobalColabSetupWork(), false); await assert.rejects(() => getColabSetup('file:///wrong', r.setupId), /No matching/);
     });
     await test('wait bounds and unknown setup fail before work', async () => {
         const f = fixture(); await assert.rejects(() => configureColab(ref, { waitMs: -1 }, f.deps), /waitMs/); await assert.rejects(() => getColabSetup(ref, 'missing'), /No matching/);

@@ -57,6 +57,12 @@ export interface KernelFileDeps {
 const activeTargets = new Set<string>();
 const activeKernels = new WeakSet<ActiveKernelLike>();
 const unsettledKernels = new WeakSet<ActiveKernelLike>();
+let activeTransferOperations = 0;
+let unsettledTransferOperations = 0;
+
+export function hasGlobalFileTransferWork(): boolean {
+    return activeTransferOperations > 0 || unsettledTransferOperations > 0;
+}
 class TransferFailure extends Error {
     constructor(message: string, readonly unsettled = false) { super(message); }
 }
@@ -149,7 +155,9 @@ async function nativeStep<T>(kernel: ActiveKernelLike, current: () => Promise<vo
         // It must not quarantine the selected kernel or block a corrected explicit URI.
         if (!binding && pending && !settled) {
             unsettledKernels.add(kernel);
-            void pending.then(() => unsettledKernels.delete(kernel), () => unsettledKernels.delete(kernel));
+            unsettledTransferOperations++;
+            const release = () => { unsettledKernels.delete(kernel); unsettledTransferOperations = Math.max(0, unsettledTransferOperations - 1); };
+            void pending.then(release, release);
         }
     }
 }
@@ -249,6 +257,7 @@ async function receipt(kernel: ActiveKernelLike, code: string, nonce: string, as
             source.cancel();
             if (dispatched && pending) {
                 unsettledKernels.add(kernel);
+                unsettledTransferOperations++;
                 // Observe completion without waiting on an iterator that ignores cancellation.
                 const close = async () => {
                     if (!iterator && pending) {
@@ -260,7 +269,12 @@ async function receipt(kernel: ActiveKernelLike, code: string, nonce: string, as
                     await pending?.catch(() => undefined);
                     return true;
                 };
-                void close().then((settled) => { if (settled) unsettledKernels.delete(kernel); }, () => undefined);
+                void close().then((settled) => {
+                    if (settled) {
+                        unsettledKernels.delete(kernel);
+                        unsettledTransferOperations = Math.max(0, unsettledTransferOperations - 1);
+                    }
+                }, () => undefined);
             }
         }
         source.dispose();
@@ -290,6 +304,7 @@ async function boundedKernel(ref: string, deps: KernelFileDeps, token?: vscode.C
 async function withTransfer<T>(ref: string, deps: KernelFileDeps, work: (kernel: ActiveKernelLike, current: () => Promise<void>) => Promise<T>, token?: vscode.CancellationToken): Promise<T> {
     if (activeTargets.has(ref)) throw new Error('A file transfer is already active for this notebook.');
     activeTargets.add(ref);
+    activeTransferOperations++;
     let kernel: ActiveKernelLike | undefined;
     let ownsKernel = false;
     let invalidated = false;
@@ -312,6 +327,7 @@ async function withTransfer<T>(ref: string, deps: KernelFileDeps, work: (kernel:
         status?.dispose();
         if (kernel && ownsKernel) activeKernels.delete(kernel);
         activeTargets.delete(ref);
+        activeTransferOperations = Math.max(0, activeTransferOperations - 1);
     }
 }
 function failureReason(error: unknown): string { return error instanceof TransferFailure ? error.message : 'kernel execution or receipt validation failed'; }

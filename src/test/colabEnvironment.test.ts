@@ -10,9 +10,10 @@ import {
     ColabEnvironmentContextForTest, ColabEnvironmentDependenciesForTest, ColabEnvironmentError,
     ColabEnvironmentReceiptForTest, HELPER_SOURCE_FOR_TEST, ProcessIdentity,
     buildProcessIdentityPowerShellForTest, createColabEnvironmentForTest, initializeColabEnvironment, parseCodeStatusForTest, prepareColabEnvironment,
-    resolveInstalledCodeCliForTest, resolveLocalGlobalStoragePathForTest, retryWatchdogReceiptReadForTest, validateDefaultWindowsInstallForTest
+    inspectSavedStateMetadataForTest, resolveInstalledCodeCliForTest, resolveLocalGlobalStoragePathForTest, retryWatchdogReceiptReadForTest, validateDefaultWindowsInstallForTest
 } from '../colabEnvironment';
-import { fileUri, rawUri, reset, state, userDataUri } from './colabEnvironmentStub';
+import { fileUri, rawUri, reset, state, TabInputNotebook, TabInputText, TabInputWebview, userDataUri } from './colabEnvironmentStub';
+import { acquireRestartExclusion, beginLocalOperation, operationGateStateForTest } from '../operationGate';
 
 const PID = 33940;
 const COMMIT = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
@@ -36,9 +37,9 @@ interface Fixture {
     quitCalls: number;
 }
 
-async function fixture(options: { native?: boolean; restart?: boolean } = {}): Promise<Fixture> {
+async function fixture(options: { native?: boolean; restart?: boolean; spacedPaths?: boolean } = {}): Promise<Fixture> {
     reset();
-    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jupyter-mcp-colab-environment-'));
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), options.spacedPaths ? 'jupyter mcp colab environment-' : 'jupyter-mcp-colab-environment-'));
     const appData = path.join(temp, 'AppData', 'Roaming');
     const localAppData = path.join(temp, 'AppData', 'Local');
     const profile = temp;
@@ -46,6 +47,12 @@ async function fixture(options: { native?: boolean; restart?: boolean } = {}): P
     const root = options.restart ? path.join(appData, 'Code', 'User', 'globalStorage', extensionId) : path.join(temp, 'storage');
     const extensionPath = options.restart ? path.join(profile, '.vscode', 'extensions', 'jupyter-mcp-0.5.0') : path.join(temp, 'extension');
     await fs.mkdir(root, { recursive: true }); await fs.mkdir(extensionPath, { recursive: true });
+    if (options.restart) {
+        await fs.mkdir(path.join(appData, 'Code', 'Workspaces'), { recursive: true });
+        await fs.writeFile(path.join(appData, 'Code', 'User', 'globalStorage', 'storage.json'), JSON.stringify({
+            backupWorkspaces: { workspaces: [{ id: 'configured', configURIPath: 'file:///configured.code-workspace' }], folders: [], emptyWindows: [] }
+        }));
+    }
     const disposables: Array<{ dispose(): unknown }> = [];
     const identity = { pid: PID, executablePath: path.join(localAppData, 'Programs', 'Microsoft VS Code', 'Code.exe'), creationTime: CREATION };
     let quitCalls = 0;
@@ -70,6 +77,9 @@ async function fixture(options: { native?: boolean; restart?: boolean } = {}): P
             runCodeStatus: async () => status(),
             inspectProcess: async () => identity,
             reservePort: async () => 59267,
+            assertNoActiveKernels: async () => undefined,
+            hasBackgroundWork: () => false,
+            inspectSavedState: inspectSavedStateMetadataForTest,
             armHelper: async (_exe, _helper, receiptPath, receipt) => {
                 const value = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
                 assert.strictEqual(value.preparationId, receipt.preparationId);
@@ -92,6 +102,35 @@ async function fixture(options: { native?: boolean; restart?: boolean } = {}): P
     return result;
 }
 
+async function configuredWorkspace(f: Fixture, kind: 'file' | 'untitled' = 'file'): Promise<{ root: any; text: any; notebook: any; workspaceFile: any }> {
+    const rootPath = path.join(f.temp, 'project');
+    const textPath = path.join(rootPath, 'notes.txt');
+    const notebookPath = path.join(rootPath, 'research.ipynb');
+    await fs.mkdir(rootPath, { recursive: true });
+    await fs.writeFile(textPath, 'invented fixture');
+    await fs.writeFile(notebookPath, '{}');
+    const root = fileUri(rootPath), textUri = fileUri(textPath), notebookUri = fileUri(notebookPath);
+    let workspaceFile: any;
+    if (kind === 'file') {
+        const workspacePath = path.join(f.temp, 'research.code-workspace');
+        await fs.writeFile(workspacePath, '{"folders":[]}');
+        workspaceFile = fileUri(workspacePath);
+    } else {
+        const current = path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces', 'current');
+        await fs.mkdir(current, { recursive: true });
+        workspaceFile = rawUri(`untitled:${path.join(current, 'workspace.json').replace(/\\/g, '/')}`);
+    }
+    state.workspaceFile = workspaceFile;
+    state.folders = [{ name: 'Research', uri: root }];
+    state.documents = [{ uri: textUri, isDirty: false, isUntitled: false, version: 7 }];
+    state.notebooks = [{ uri: notebookUri, isDirty: false, isUntitled: false, version: 11, notebookType: 'jupyter-notebook' }];
+    state.tabGroups = [{ tabs: [
+        { label: 'notes.txt', input: new TabInputText(textUri), isDirty: false },
+        { label: 'research.ipynb', input: new TabInputNotebook(notebookUri, 'jupyter-notebook'), isDirty: false }
+    ] }];
+    return { root, text: textUri, notebook: notebookUri, workspaceFile };
+}
+
 function parsed(value: string): any { return JSON.parse(value); }
 async function rejectsCode(work: () => Promise<unknown>, code: string): Promise<void> {
     await assert.rejects(work, (error: ColabEnvironmentError) => error.code === code);
@@ -106,13 +145,28 @@ function helperHarness(options: {
     spawnError?: boolean;
     readFailuresAfterArm?: number;
     disarmDuringInspection?: boolean;
+    restored?: boolean;
 }) {
     const id = crypto.randomUUID(), token = crypto.randomUUID(), receiptPath = 'C:\\receipt.json';
     let now = 1_800_000_000_000;
-    const receipt: any = { schema: 1, preparationId: id, helperToken: token, status: 'arming_restart', deadline: now + 10_000,
+    const receipt: any = { schema: 1, preparationId: id, nonce: crypto.randomUUID(), helperToken: token, status: 'arming_restart',
+        createdAt: now, deadline: now + 120_000, workspaceUri: 'file:///C:/workspace', expectedWindowLabel: 'workspace', generatedWorkspace: true,
         main: { pid: 123, executablePath: 'C:\\Code.exe', creationTime: CREATION }, executablePath: 'C:\\Code.exe',
         workspacePath: 'C:\\workspace', userDataDir: 'C:\\user', extensionsDir: 'C:\\extensions', port: 59267 };
+    if (options.restored) Object.assign(receipt, {
+        restartMode: 'restore-clean-workspace', restartRequired: true, generatedWorkspace: false, installedCommit: COMMIT,
+        workspacePath: undefined, folderPreparation: undefined,
+        restorationSnapshot: {
+            schema: 1,
+            workspace: { uri: receipt.workspaceUri, kind: 'file', roots: [{ uri: 'file:///C:/project', name: 'Research' }] },
+            tabGroups: [], documents: { text: [], notebooks: [] },
+            savedState: { untitledWorkspaces: [], backupRegistry: { workspaces: 1, folders: 0, emptyWindows: 0 } }
+        }
+    });
     const files = new Map<string, Buffer>([[receiptPath, Buffer.from(JSON.stringify(receipt))]]);
+    files.set(path.join('C:\\user', 'User', 'globalStorage', 'storage.json'), Buffer.from(JSON.stringify({
+        backupWorkspaces: { workspaces: [{ id: 'configured', configURIPath: 'file:///configured.code-workspace' }], folders: [], emptyWindows: [] }
+    })));
     const timers: Array<() => void> = []; const launches: Array<{ executable: string; args: string[]; options: any }> = [];
     let exits = 0; let inspections = 0; let armed = false; let remainingReadFailures = options.readFailuresAfterArm ?? 0;
     const fakeFs = {
@@ -120,6 +174,7 @@ function helperHarness(options: {
             if (armed && remainingReadFailures-- > 0) throw new Error('transient read');
             const value = files.get(file); if (!value) throw new Error('missing'); return value;
         },
+        readdirSync: () => [],
         writeFileSync: (file: string, value: string) => { if (files.has(file)) throw Object.assign(new Error('exists'), { code: 'EEXIST' }); files.set(file, Buffer.from(value)); },
         renameSync: (from: string, to: string) => { const value = files.get(from); if (!value) throw new Error('missing temp'); files.delete(from); files.set(to, value); },
         rmSync: (file: string) => { files.delete(file); }
@@ -158,6 +213,10 @@ function helperHarness(options: {
         runTimer: () => { const timer = timers.shift(); assert.ok(timer, 'expected helper timer'); timer!(); },
         get receipt() { return JSON.parse(files.get(receiptPath)!.toString('utf8')); },
         mutateReceipt: (change: (value: any) => void) => { const value = JSON.parse(files.get(receiptPath)!.toString('utf8')); change(value); files.set(receiptPath, Buffer.from(JSON.stringify(value))); },
+        mutateStorage: (change: (value: any) => void) => {
+            const storagePath = path.join('C:\\user', 'User', 'globalStorage', 'storage.json');
+            const value = JSON.parse(files.get(storagePath)!.toString('utf8')); change(value); files.set(storagePath, Buffer.from(JSON.stringify(value)));
+        },
         failNextReads: (count: number) => { remainingReadFailures = count; },
         advance: (milliseconds: number) => { now += milliseconds; },
         launches, get exits() { return exits; }, get inspections() { return inspections; }
@@ -507,6 +566,749 @@ test('normal status invocation resolves the versioned CLI only through the pinne
     } finally { await fs.rm(temp, { recursive: true, force: true }); }
 });
 
+test('restored-workspace mode snapshots configured file and untitled Workspaces without conversion', async () => {
+    for (const kind of ['file', 'untitled'] as const) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f, kind);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+            assert.strictEqual(prepared.status, 'restart_requested', kind);
+            assert.strictEqual(prepared.restartMode, 'restore-clean-workspace');
+            assert.strictEqual(prepared.restartRequired, true);
+            assert.strictEqual(prepared.environmentReady, false);
+            assert.strictEqual(await f.runScheduledQuit(), true);
+            assert.strictEqual(f.quitCalls, 1);
+            assert.deepStrictEqual(state.workspaceUpdates, [], 'restored mode never converts a workspace');
+            assert.deepStrictEqual(state.calls, [], 'restored mode does not close, save or open resources');
+            const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`), 'utf8'));
+            assert.strictEqual(receipt.folderPreparation, undefined);
+            assert.strictEqual(receipt.workspacePath, undefined);
+            assert.strictEqual(receipt.restorationSnapshot.workspace.kind, kind);
+            assert.deepStrictEqual(receipt.restorationSnapshot.workspace.roots, [{ uri: state.folders[0].uri.toString(), name: 'Research' }]);
+            assert.strictEqual(receipt.restorationSnapshot.tabGroups[0].length, 2);
+            assert.deepStrictEqual(receipt.restorationSnapshot.savedState.backupRegistry, { workspaces: 1, folders: 0, emptyWindows: 0 });
+            assert.ok(Number.isSafeInteger(receipt.quitDispatchApprovedAt));
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace folderUri may only identify an existing root and never changes workspace shape', async () => {
+    const matched = await fixture({ restart: true });
+    try {
+        const configured = await configuredWorkspace(matched);
+        const manager = createColabEnvironmentForTest(matched.context, matched.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(configured.root.toString(), 'restore-clean-workspace'));
+        assert.strictEqual(prepared.status, 'restart_requested');
+        assert.strictEqual(await matched.runScheduledQuit(), true);
+        assert.deepStrictEqual(state.workspaceUpdates, []);
+        assert.deepStrictEqual(state.folders, [{ name: 'Research', uri: configured.root }]);
+    } finally { matched.dispose(); await fs.rm(matched.temp, { recursive: true, force: true }); }
+
+    const mismatched = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(mismatched);
+        const other = path.join(mismatched.temp, 'other-project'); await fs.mkdir(other);
+        const manager = createColabEnvironmentForTest(mismatched.context, mismatched.deps); await manager.initialize();
+        await rejectsCode(() => manager.prepare(fileUri(other).toString(), 'restore-clean-workspace'), 'workspace_mismatch');
+        assert.strictEqual(mismatched.quitCalls, 0);
+        assert.deepStrictEqual(state.workspaceUpdates, []);
+    } finally { mismatched.dispose(); await fs.rm(mismatched.temp, { recursive: true, force: true }); }
+});
+
+test('restored tab snapshot preserves multiplicity and group membership while ignoring within-group order', async () => {
+    const reordered = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(reordered);
+        const manager = createColabEnvironmentForTest(reordered.context, reordered.deps); await manager.initialize();
+        await manager.prepare(undefined, 'restore-clean-workspace');
+        state.tabGroups[0].tabs.reverse();
+        assert.strictEqual(await reordered.runScheduledQuit(), true, 'within-group tab ordering is intentionally not durable');
+    } finally { reordered.dispose(); await fs.rm(reordered.temp, { recursive: true, force: true }); }
+
+    for (const change of ['multiplicity', 'group'] as const) {
+        const f = await fixture({ restart: true });
+        try {
+            const configured = await configuredWorkspace(f);
+            const duplicate = { label: 'notes duplicate', input: new TabInputText(configured.text), isDirty: false };
+            state.tabGroups = [{ tabs: [state.tabGroups[0].tabs[0], duplicate] }, { tabs: [state.tabGroups[0].tabs[1]] }];
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            await manager.prepare(undefined, 'restore-clean-workspace');
+            if (change === 'multiplicity') state.tabGroups[0].tabs.pop();
+            else state.tabGroups = [{ tabs: [state.tabGroups[0].tabs[0]] }, { tabs: [duplicate, state.tabGroups[1].tabs[0]] }];
+            assert.strictEqual(await f.runScheduledQuit(), false, change);
+            assert.strictEqual(f.quitCalls, 0, change);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('working native binding returns restored preparation without restart or disconnected-kernel checks', async () => {
+    const f = await fixture({ restart: true, native: true, spacedPaths: true });
+    try {
+        await configuredWorkspace(f);
+        const userDataDir = path.join(f.deps.env.APPDATA!, 'Code');
+        const extensionsDir = path.join(f.deps.env.USERPROFILE!, '.vscode', 'extensions');
+        let statusCalls = 0, savedStateCalls = 0, markerCalls = 0;
+        f.deps.probeNative = async () => { markerCalls++; return true; };
+        f.deps.runCodeStatus = async () => {
+            statusCalls++;
+            return status(`--user-data-dir ${userDataDir} --extensions-dir ${extensionsDir} --remote-debugging-port=59267`);
+        };
+        f.deps.inspectSavedState = async () => { savedStateCalls++; throw new Error('restart-only saved state must not be inspected'); };
+        f.deps.assertNoActiveKernels = async () => { throw Object.assign(new Error('active'), { code: 'active_kernel_present' }); };
+        f.deps.hasBackgroundWork = () => true;
+        state.documents = [{ uri: rawUri('untitled:native-dirty-text'), isDirty: true, isUntitled: true, version: 17 }];
+        state.notebooks = [{ uri: rawUri('untitled:native-dirty-notebook'), isDirty: true, isUntitled: true, version: 23 }];
+        state.tabGroups = [{ tabs: [{ label: 'dirty webview', input: new TabInputWebview('native-ready'), isDirty: true }] }];
+        state.terminals = [{}]; state.activeDebugSession = { id: 'native-ready-debug' };
+        state.restoreWindows = 'none'; state.confirmBeforeClose = 'always';
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const ready = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        assert.strictEqual(ready.status, 'environment_ready');
+        assert.strictEqual(ready.environmentReady, true);
+        assert.strictEqual(ready.restartRequired, false);
+        assert.strictEqual(operationGateStateForTest().restartPending, false, 'native-ready return releases the provisional prepare exclusion');
+        assert.strictEqual(f.quitCalls, 0);
+        assert.strictEqual(statusCalls, 2, 'native-ready mode sandwiches a fresh marker proof between app/window identity checks');
+        assert.strictEqual(markerCalls, 2);
+        assert.strictEqual(savedStateCalls, 0, 'native-ready mode does not inspect restart-only saved state');
+        const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${ready.preparationId}.json`), 'utf8'));
+        assert.strictEqual(receipt.restorationSnapshot.savedState, undefined);
+        assert.strictEqual(receipt.restorationSnapshot.tabGroups, undefined);
+        assert.strictEqual(receipt.restorationSnapshot.documents, undefined);
+        state.trusted = false;
+        const untrusted = parsed(await manager.get(ready.preparationId));
+        assert.strictEqual(untrusted.status, 'workspace_untrusted');
+        assert.strictEqual(untrusted.environmentReady, false);
+        state.trusted = true;
+        state.documents = [{ uri: rawUri('untitled:after-ready'), isDirty: true, isUntitled: true, version: 1 }];
+        state.notebooks = [];
+        state.tabGroups = [{ tabs: [{ label: 'webview', input: new TabInputWebview('after-ready'), isDirty: false }] }];
+        state.terminals = [{}]; state.activeDebugSession = { id: 'after-ready' };
+        const polled = parsed(await manager.get(ready.preparationId));
+        assert.strictEqual(polled.environmentReady, true, 'ready polling checks only Workspace identity, trust and a fresh native bind');
+        assert.strictEqual(polled.restartRequired, false);
+        assert.strictEqual(statusCalls, 2, 'ready polling does not repeat restart-only process checks');
+        assert.strictEqual(markerCalls, 3, 'the trusted ready poll adds only one fresh marker proof');
+        assert.strictEqual(savedStateCalls, 0);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('native-ready preparation revalidates the exact Workspace and ordered roots around marker probing', async () => {
+    const f = await fixture({ restart: true, native: true });
+    try {
+        await configuredWorkspace(f);
+        let statusCalls = 0;
+        f.deps.runCodeStatus = async () => { statusCalls++; return status(); };
+        f.deps.probeNative = async () => { state.folders[0].name = 'changed-during-marker-probe'; return true; };
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'restoration_snapshot_changed');
+        assert.strictEqual(statusCalls, 0, 'changed Workspace identity stops before process corroboration');
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('restart exclusion counts in-flight mutations and admits only the explicit read-only allowlist', async () => {
+    const finishMutation = beginLocalOperation('create_notebook', {});
+    assert.throws(() => acquireRestartExclusion(), (error: any) => error.code === 'mutation_in_progress');
+    finishMutation();
+    const exclusion = acquireRestartExclusion();
+    assert.strictEqual(operationGateStateForTest().restartPending, true);
+    assert.throws(() => beginLocalOperation('close_colab_terminals', {}), (error: any) => error.code === 'restart_in_progress');
+    const finishRead = beginLocalOperation('get_execution', {}); finishRead();
+    exclusion.release();
+    assert.deepStrictEqual(operationGateStateForTest(), { activeMutations: 0, restartPending: false });
+});
+
+test('restored-workspace mode fails closed for policy, work, kernel and saved-state blockers', async () => {
+    const cases: Array<[string, (f: Fixture) => Promise<void> | void, string]> = [
+        ['terminal', () => { state.terminals = [{}]; }, 'terminal_present'],
+        ['dirty document', () => { state.documents[0].isDirty = true; }, 'open_document_unsupported'],
+        ['restore policy', () => { state.restoreWindows = 'one'; }, 'restore_policy_unsupported'],
+        ['unsupported tab', () => { state.tabGroups[0].tabs[0].input = new TabInputWebview('invented'); }, 'tab_input_unsupported'],
+        ['background work', (f) => { f.deps.hasBackgroundWork = () => true; }, 'background_work_present'],
+        ['active kernel', (f) => { f.deps.assertNoActiveKernels = async () => { throw Object.assign(new Error('active'), { code: 'active_kernel_present' }); }; }, 'active_kernel_present'],
+        ['unknown kernel', (f) => { f.deps.assertNoActiveKernels = async () => { throw Object.assign(new Error('unknown'), { code: 'kernel_observation_unavailable' }); }; }, 'kernel_observation_unavailable'],
+        ['extra native window', (f) => { f.deps.runCodeStatus = async () => status('', PID, 2); }, 'application_identity_unverified'],
+        ['other untitled Workspace', async (f) => { await fs.mkdir(path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces', 'other')); }, 'other_untitled_workspace_present'],
+        ['empty-window backup', async (f) => { await fs.writeFile(path.join(f.deps.env.APPDATA!, 'Code', 'User', 'globalStorage', 'storage.json'), JSON.stringify({ backupWorkspaces: { workspaces: [], folders: [], emptyWindows: [{ backupFolder: 'empty' }] } })); }, 'empty_window_backup_present']
+    ];
+    for (const [name, change, code] of cases) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f); await change(f);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), code);
+            assert.strictEqual(f.quitCalls, 0, name);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace receipt disarms when resources, saved metadata or tracked work change before quit', async () => {
+    const changes: Array<[string, (f: Fixture) => Promise<void> | void]> = [
+        ['root', () => { state.folders[0].name = 'Changed'; }],
+        ['tab', () => { state.tabGroups[0].tabs.pop(); }],
+        ['terminal', () => { state.terminals = [{}]; }],
+        ['dirty', () => { state.notebooks[0].isDirty = true; }],
+        ['background', (f) => { f.deps.hasBackgroundWork = () => true; }],
+        ['saved-count', async (f) => {
+            await fs.writeFile(path.join(f.deps.env.APPDATA!, 'Code', 'User', 'globalStorage', 'storage.json'), JSON.stringify({
+                backupWorkspaces: { workspaces: [], folders: [], emptyWindows: [] }
+            }));
+        }]
+    ];
+    for (const [name, change] of changes) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+            await change(f);
+            assert.strictEqual(await f.runScheduledQuit(), false, name);
+            assert.strictEqual(f.quitCalls, 0, name);
+            const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`), 'utf8'));
+            assert.strictEqual(receipt.status, 'failed', name);
+            assert.strictEqual(receipt.failure, 'quit_preflight_changed', name);
+            assert.strictEqual(operationGateStateForTest().restartPending, false, name);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace final synchronous check catches GUI mutation during the last await', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        const originalInspect = f.deps.inspectProcess;
+        let mutateOnObservation = true;
+        f.deps.inspectProcess = async pid => {
+            const value = await originalInspect(pid);
+            if (mutateOnObservation) { mutateOnObservation = false; state.terminals = [{}]; }
+            return value;
+        };
+        assert.strictEqual(await f.runScheduledQuit(), false);
+        assert.strictEqual(f.quitCalls, 0);
+        const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`), 'utf8'));
+        assert.strictEqual(receipt.status, 'failed');
+        assert.strictEqual(receipt.failure, 'quit_preflight_changed');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('failed final disarm keeps its owning exclusion across unrelated terminal and expired receipt polls', async () => {
+    const f = await fixture({ restart: true, native: true });
+    try {
+        await configuredWorkspace(f);
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const oldReady = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        const receiptRoot = path.join(f.root, 'colab-environment-receipts');
+        const oldReadyPath = path.join(receiptRoot, `${oldReady.preparationId}.json`);
+        const oldReadyReceipt = JSON.parse(await fs.readFile(oldReadyPath, 'utf8'));
+        const oldFailedReceipt = {
+            ...oldReadyReceipt, preparationId: crypto.randomUUID(), nonce: crypto.randomUUID(),
+            status: 'failed', failure: 'older_failure'
+        };
+        await fs.writeFile(path.join(receiptRoot, `${oldFailedReceipt.preparationId}.json`), JSON.stringify(oldFailedReceipt));
+
+        state.configuredPort = 0;
+        f.deps.probeNative = async () => false;
+        const pending = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        const pendingPath = path.join(receiptRoot, `${pending.preparationId}.json`);
+        const pendingReceipt = JSON.parse(await fs.readFile(pendingPath, 'utf8'));
+        const expiredCreatedAt = f.deps.now() - 120_001;
+        const oldExpiredReceipt = {
+            ...pendingReceipt, preparationId: crypto.randomUUID(), nonce: crypto.randomUUID(), helperToken: crypto.randomUUID(),
+            status: 'restart_requested', createdAt: expiredCreatedAt, deadline: expiredCreatedAt + 120_000,
+            helperArmedAt: expiredCreatedAt + 1, quitDispatchApprovedAt: undefined
+        };
+        await fs.writeFile(path.join(receiptRoot, `${oldExpiredReceipt.preparationId}.json`), JSON.stringify(oldExpiredReceipt));
+
+        f.deps.receiptIoHooks = {
+            afterWrite: receipt => {
+                if (receipt.preparationId === pending.preparationId && receipt.status === 'restart_requested' &&
+                    Number.isSafeInteger(receipt.quitDispatchApprovedAt)) state.terminals = [{}];
+            },
+            beforeWrite: receipt => {
+                if (receipt.preparationId === pending.preparationId && receipt.status === 'failed') {
+                    throw new Error('invented final-disarm write failure');
+                }
+            }
+        };
+        assert.strictEqual(await f.runScheduledQuit(), false);
+        assert.strictEqual(operationGateStateForTest().restartPending, true);
+        assert.throws(() => beginLocalOperation('create_notebook', {}), (error: any) => error.code === 'restart_in_progress');
+        const uncertain = parsed(await manager.get(pending.preparationId));
+        assert.strictEqual(uncertain.status, 'restart_disarm_uncertain');
+        assert.strictEqual(uncertain.failure, 'restart_disarm_uncertain');
+
+        const oldReadyPoll = parsed(await manager.get(oldReady.preparationId));
+        assert.strictEqual(oldReadyPoll.status, 'native_binding_unavailable');
+        const oldFailedPoll = parsed(await manager.get(oldFailedReceipt.preparationId));
+        assert.strictEqual(oldFailedPoll.status, 'failed');
+        await rejectsCode(() => manager.get(oldExpiredReceipt.preparationId), 'restart_in_progress');
+        assert.strictEqual(operationGateStateForTest().restartPending, true, 'unrelated receipts cannot release or replace the owner block');
+        assert.throws(() => beginLocalOperation('create_notebook', {}), (error: any) => error.code === 'restart_in_progress');
+
+        f.deps.receiptIoHooks = undefined;
+        const durablyFailed = JSON.parse(await fs.readFile(pendingPath, 'utf8'));
+        durablyFailed.status = 'failed'; durablyFailed.failure = 'invented_cleanup_proof';
+        await fs.writeFile(pendingPath, JSON.stringify(durablyFailed));
+        assert.strictEqual(parsed(await manager.get(pending.preparationId)).status, 'failed');
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('failed receipt read-back retains the uncertain owner block until its durable terminal receipt is polled', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        const originalArm = f.deps.armHelper;
+        f.deps.armHelper = async (...args) => { await originalArm(...args); state.tabGroups[0].tabs.pop(); };
+        let failNextRead = false;
+        f.deps.receiptIoHooks = {
+            afterWrite: receipt => { if (receipt.status === 'failed') failNextRead = true; },
+            beforeRead: () => {
+                if (!failNextRead) return;
+                failNextRead = false;
+                throw new Error('invented durable read-back failure');
+            }
+        };
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'restart_disarm_uncertain');
+        assert.strictEqual(operationGateStateForTest().restartPending, true);
+        assert.throws(() => beginLocalOperation('save_notebooks', {}), (error: any) => error.code === 'restart_in_progress');
+
+        const files = await fs.readdir(path.join(f.root, 'colab-environment-receipts'));
+        assert.strictEqual(files.length, 1);
+        const preparationId = files[0].replace(/\.json$/, '');
+        const failed = parsed(await manager.get(preparationId));
+        assert.strictEqual(failed.status, 'failed');
+        assert.strictEqual(operationGateStateForTest().restartPending, false, 'the owning durable terminal proof releases its own block');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('initial acquisition binds an expired active receipt before uncertain terminalization', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const pending = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        const receiptPath = path.join(f.root, 'colab-environment-receipts', `${pending.preparationId}.json`);
+        const activePath = path.join(f.root, 'colab-environment-active.json');
+        const original = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
+
+        await fs.writeFile(receiptPath, JSON.stringify({ ...original, status: 'failed', failure: 'invented_seed_release' }));
+        assert.strictEqual(parsed(await manager.get(pending.preparationId)).status, 'failed');
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+
+        const createdAt = f.deps.now() - 120_001;
+        const expired = {
+            ...original, status: 'restart_requested', failure: undefined, createdAt, deadline: createdAt + 120_000,
+            helperArmedAt: createdAt + 1, quitDispatchApprovedAt: undefined
+        };
+        await fs.writeFile(receiptPath, JSON.stringify(expired));
+        await fs.writeFile(activePath, JSON.stringify({ schema: 1, preparationId: pending.preparationId }));
+        let failNextRead = false;
+        f.deps.receiptIoHooks = {
+            afterWrite: receipt => {
+                if (receipt.preparationId === pending.preparationId && receipt.status === 'failed') failNextRead = true;
+            },
+            beforeRead: preparationId => {
+                if (preparationId !== pending.preparationId || !failNextRead) return;
+                failNextRead = false;
+                throw new Error('invented expired-receipt read-back failure');
+            }
+        };
+
+        await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'restart_disarm_uncertain');
+        assert.strictEqual(operationGateStateForTest().restartPending, true, 'the expired receipt owns the retained uncertain exclusion');
+        assert.throws(() => beginLocalOperation('create_notebook', {}), (error: any) => error.code === 'restart_in_progress');
+
+        f.deps.receiptIoHooks = undefined;
+        assert.strictEqual(parsed(await manager.get(pending.preparationId)).status, 'failed');
+        assert.strictEqual(operationGateStateForTest().restartPending, false, 'only the same durable terminal receipt releases the transferred block');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('prepare request holds one exclusion across successful adopted-expiry cleanup and receipt creation', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const seed = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        const receiptRoot = path.join(f.root, 'colab-environment-receipts');
+        const activePath = path.join(f.root, 'colab-environment-active.json');
+        const seedPath = path.join(receiptRoot, `${seed.preparationId}.json`);
+        const template = JSON.parse(await fs.readFile(seedPath, 'utf8'));
+
+        await fs.writeFile(seedPath, JSON.stringify({ ...template, status: 'failed', failure: 'invented_seed_release' }));
+        assert.strictEqual(parsed(await manager.get(seed.preparationId)).status, 'failed');
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+
+        const now = f.deps.now();
+        const expiredCreatedAt = now - 120_001;
+        const adoptedExpired = {
+            ...template, status: 'restart_requested', failure: undefined,
+            createdAt: expiredCreatedAt, deadline: expiredCreatedAt + 120_000, helperArmedAt: expiredCreatedAt + 1
+        };
+        const unrelatedPending = {
+            ...template, preparationId: crypto.randomUUID(), nonce: crypto.randomUUID(), helperToken: crypto.randomUUID(),
+            status: 'restart_requested', failure: undefined, createdAt: now, deadline: now + 120_000, helperArmedAt: now + 1
+        };
+        const unrelatedExpired = {
+            ...unrelatedPending, preparationId: crypto.randomUUID(), nonce: crypto.randomUUID(), helperToken: crypto.randomUUID(),
+            createdAt: expiredCreatedAt, deadline: expiredCreatedAt + 120_000, helperArmedAt: expiredCreatedAt + 1
+        };
+        await fs.writeFile(seedPath, JSON.stringify(adoptedExpired));
+        await fs.writeFile(path.join(receiptRoot, `${unrelatedPending.preparationId}.json`), JSON.stringify(unrelatedPending));
+        await fs.writeFile(path.join(receiptRoot, `${unrelatedExpired.preparationId}.json`), JSON.stringify(unrelatedExpired));
+        await fs.writeFile(activePath, JSON.stringify({ schema: 1, preparationId: seed.preparationId }));
+
+        const observed = new Set<string>();
+        const boundaryFailures: string[] = [];
+        let checkingBoundary = false;
+        const assertRequestStillOwnsExclusion = async (boundary: string): Promise<void> => {
+            if (checkingBoundary) return;
+            checkingBoundary = true;
+            try {
+                observed.add(boundary);
+                if (!operationGateStateForTest().restartPending) boundaryFailures.push(`${boundary}: exclusion absent before probes`);
+                let admittedMutation: (() => void) | undefined;
+                try {
+                    admittedMutation = beginLocalOperation('create_notebook', {});
+                    boundaryFailures.push(`${boundary}: mutation was admitted`);
+                } catch (error) {
+                    if ((error as any)?.code !== 'restart_in_progress') boundaryFailures.push(`${boundary}: mutation returned ${(error as any)?.code ?? error}`);
+                } finally { admittedMutation?.(); }
+                for (const candidate of [unrelatedPending, unrelatedExpired]) {
+                    try {
+                        await manager.get(candidate.preparationId);
+                        boundaryFailures.push(`${boundary}: unrelated ${candidate.preparationId} poll was admitted`);
+                    } catch (error) {
+                        if ((error as any)?.code !== 'restart_in_progress') boundaryFailures.push(`${boundary}: unrelated poll returned ${(error as any)?.code ?? error}`);
+                    }
+                }
+                if (!operationGateStateForTest().restartPending) boundaryFailures.push(`${boundary}: polls released the exclusion`);
+            } finally { checkingBoundary = false; }
+        };
+        f.deps.restorationLifecycleHook = boundary => assertRequestStillOwnsExclusion(boundary);
+        f.deps.reservePort = async () => {
+            await assertRequestStillOwnsExclusion('reserve_port');
+            return 59267;
+        };
+
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        assert.strictEqual(prepared.status, 'restart_requested');
+        assert.deepStrictEqual([...observed].sort(), ['active_released', 'new_receipt', 'reserve_port', 'terminal_proven']);
+        assert.strictEqual(boundaryFailures.length, 0, boundaryFailures.join('; '));
+        assert.strictEqual(operationGateStateForTest().restartPending, true, 'the returned pending receipt owns the transferred exclusion');
+        assert.strictEqual(JSON.parse(await fs.readFile(path.join(receiptRoot, `${unrelatedPending.preparationId}.json`), 'utf8')).status, 'restart_requested');
+        assert.strictEqual(JSON.parse(await fs.readFile(path.join(receiptRoot, `${unrelatedExpired.preparationId}.json`), 'utf8')).status, 'restart_requested');
+        await rejectsCode(() => manager.get(unrelatedPending.preparationId), 'restart_in_progress');
+        await rejectsCode(() => manager.get(unrelatedExpired.preparationId), 'restart_in_progress');
+
+        f.deps.restorationLifecycleHook = undefined;
+        const preparedPath = path.join(receiptRoot, `${prepared.preparationId}.json`);
+        const durableOwner = JSON.parse(await fs.readFile(preparedPath, 'utf8'));
+        durableOwner.status = 'failed'; durableOwner.failure = 'invented_matching_owner_recovery';
+        await fs.writeFile(preparedPath, JSON.stringify(durableOwner));
+        assert.strictEqual(parsed(await manager.get(prepared.preparationId)).status, 'failed');
+        assert.strictEqual(operationGateStateForTest().restartPending, false, 'only the matching durable owner releases after request return');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('prepare request failure before receipt binding releases its provisional exclusion', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        f.deps.restorationLifecycleHook = boundary => {
+            if (boundary === 'new_receipt') throw new Error('invented receipt-construction boundary failure');
+        };
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'restored_workspace_preparation_failed');
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+        const finish = beginLocalOperation('create_notebook', {}); finish();
+        await assert.rejects(() => fs.stat(path.join(f.root, 'colab-environment-active.json')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('restored-workspace recomputes the snapshot after helper arming and never leaves approval live on failure', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        const originalArm = f.deps.armHelper;
+        f.deps.armHelper = async (...args) => { await originalArm(...args); state.tabGroups[0].tabs.pop(); };
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'restoration_snapshot_changed');
+        assert.strictEqual(f.quitCalls, 0);
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+        const files = await fs.readdir(path.join(f.root, 'colab-environment-receipts'));
+        const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', files[0]), 'utf8'));
+        assert.strictEqual(receipt.status, 'failed');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('a restored failure after receipt creation but before helper dispatch releases the exclusion', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        const inspectSaved = f.deps.inspectSavedState;
+        let savedReads = 0, armCalls = 0;
+        f.deps.inspectSavedState = async (...args) => {
+            const observed = await inspectSaved(...args);
+            savedReads++;
+            return savedReads >= 4
+                ? { ...observed, backupRegistry: { ...observed.backupRegistry, workspaces: observed.backupRegistry.workspaces + 1 } }
+                : observed;
+        };
+        let failNextRead = false;
+        f.deps.receiptIoHooks = {
+            afterWrite: receipt => { if (receipt.status === 'failed') failNextRead = true; },
+            beforeRead: () => {
+                if (!failNextRead) return;
+                failNextRead = false;
+                throw new Error('invented pre-helper failure read-back error');
+            }
+        };
+        f.deps.armHelper = async () => { armCalls++; };
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'restoration_metadata_changed');
+        assert.strictEqual(armCalls, 0);
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+        await assert.rejects(() => fs.stat(path.join(f.root, 'colab-environment-active.json')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+        const files = await fs.readdir(path.join(f.root, 'colab-environment-receipts'));
+        const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', files[0]), 'utf8'));
+        assert.strictEqual(receipt.status, 'failed');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('restored-workspace startup arguments accept only an unambiguous current path', async () => {
+    const allowed = await fixture({ restart: true });
+    try {
+        const configured = await configuredWorkspace(allowed);
+        allowed.deps.runCodeStatus = async () => status(`--new-window ${configured.root.fsPath}`);
+        const manager = createColabEnvironmentForTest(allowed.context, allowed.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        assert.strictEqual(prepared.status, 'restart_requested');
+    } finally { allowed.dispose(); await fs.rm(allowed.temp, { recursive: true, force: true }); }
+
+    for (const args of ['--unknown-flag', 'C:\\different-root']) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f); f.deps.runCodeStatus = async () => status(args);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'startup_arguments_unsupported');
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace metadata reader rejects missing, malformed and oversized registry state without cleanup', async () => {
+    for (const value of [undefined, '{', JSON.stringify({ backupWorkspaces: { workspaces: [], folders: [] } }), 'x'.repeat(1024 * 1024 + 1)]) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            const storage = path.join(f.deps.env.APPDATA!, 'Code', 'User', 'globalStorage', 'storage.json');
+            if (value === undefined) await fs.unlink(storage); else await fs.writeFile(storage, value);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'restoration_metadata_unavailable');
+            assert.strictEqual(f.quitCalls, 0);
+            assert.strictEqual((await fs.readdir(path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces'))).length, 0, 'metadata inspection must not clean state');
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored durable receipt rejects unknown modes, malformed snapshots, inconsistent identities and files at the 64 KiB bound', async () => {
+    for (const mutation of ['mode', 'snapshot', 'identity', 'oversized'] as const) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+            const receiptPath = path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`);
+            if (mutation === 'oversized') await fs.writeFile(receiptPath, ' '.repeat(64 * 1024));
+            else {
+                const receipt = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
+                if (mutation === 'mode') receipt.restartMode = 'unknown-mode';
+                else if (mutation === 'snapshot') receipt.restorationSnapshot.tabGroups = 'invalid';
+                else receipt.workspaceUri = 'file:///C:/different.code-workspace';
+                await fs.writeFile(receiptPath, JSON.stringify(receipt));
+            }
+            await rejectsCode(() => manager.get(prepared.preparationId), 'preparation_not_found');
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored receipt reserves helper headroom before claiming the active slot', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        state.folders = Array.from({ length: 64 }, (_, index) => ({
+            name: `Root ${index}`,
+            uri: fileUri(path.join(f.temp, `root-${index}-${'x'.repeat(860)}`))
+        }));
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'preparation_receipt_too_large');
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+        await assert.rejects(() => fs.stat(path.join(f.root, 'colab-environment-active.json')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+        assert.deepStrictEqual(await fs.readdir(path.join(f.root, 'colab-environment-receipts')), []);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('restored-workspace expiry and quit veto remain terminal for the original receipt', async () => {
+    const veto = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(veto);
+        const manager = createColabEnvironmentForTest(veto.context, veto.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        await veto.runQuitWatchdog();
+        const failed = parsed(await manager.get(prepared.preparationId));
+        assert.strictEqual(failed.status, 'failed'); assert.strictEqual(failed.failure, 'quit_not_confirmed');
+        assert.strictEqual(veto.quitCalls, 0);
+    } finally { veto.dispose(); await fs.rm(veto.temp, { recursive: true, force: true }); }
+
+    const expired = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(expired);
+        const manager = createColabEnvironmentForTest(expired.context, expired.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        expired.deps.now = () => 1_800_000_120_001;
+        const failed = parsed(await manager.get(prepared.preparationId));
+        assert.strictEqual(failed.status, 'failed'); assert.strictEqual(failed.failure, 'preparation_timeout');
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+        assert.strictEqual(await expired.runScheduledQuit(), false, 'an expired receipt cannot reissue the delayed quit');
+        assert.strictEqual(expired.quitCalls, 0);
+    } finally { expired.dispose(); await fs.rm(expired.temp, { recursive: true, force: true }); }
+});
+
+test('durably failed restored receipts release the mutation exclusion on poll and initialization', async () => {
+    for (const recovery of ['poll', 'initialize'] as const) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+            const receiptPath = path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`);
+            const receipt = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
+            receipt.status = 'failed'; receipt.failure = 'app_launch_failed';
+            await fs.writeFile(receiptPath, JSON.stringify(receipt));
+            if (recovery === 'poll') {
+                const failed = parsed(await manager.get(prepared.preparationId));
+                assert.strictEqual(failed.status, 'failed');
+            } else {
+                f.dispose();
+                const restoredContext: ColabEnvironmentContextForTest = { ...f.context, subscriptions: [] };
+                const restored = createColabEnvironmentForTest(restoredContext, f.deps); await restored.initialize();
+                for (const disposable of restoredContext.subscriptions) disposable.dispose();
+            }
+            assert.strictEqual(operationGateStateForTest().restartPending, false, recovery);
+            const finish = beginLocalOperation('create_notebook', {}); finish();
+            await assert.rejects(() => fs.stat(path.join(f.root, 'colab-environment-active.json')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('same-main extension-host reload disarms restored-workspace receipts before or after quit approval', async () => {
+    for (const approved of [false, true]) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+            if (approved) assert.strictEqual(await f.runScheduledQuit(), true);
+            f.dispose();
+            const reloadedContext: ColabEnvironmentContextForTest = { ...f.context, subscriptions: [] };
+            const reloaded = createColabEnvironmentForTest(reloadedContext, f.deps); await reloaded.initialize();
+            const failed = parsed(await reloaded.get(prepared.preparationId));
+            assert.strictEqual(failed.status, 'failed', String(approved));
+            assert.strictEqual(failed.failure, 'owner_reloaded', String(approved));
+            for (const disposable of reloadedContext.subscriptions) disposable.dispose();
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('post-restore verification tolerates unloaded documents and pruned backup counts while preserving process and resource proof', async () => {
+    const f = await fixture({ restart: true, spacedPaths: true });
+    try {
+        await configuredWorkspace(f);
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        assert.strictEqual(await f.runScheduledQuit(), true);
+        const receiptPath = path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`);
+        const receipt = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
+        const preSpawnAt = receipt.createdAt + 1_000;
+        receipt.preSpawnAt = preSpawnAt;
+        receipt.launchedAt = preSpawnAt + 500;
+        receipt.launchPid = 777;
+        receipt.status = 'app_launched';
+        await fs.writeFile(receiptPath, JSON.stringify(receipt));
+        f.dispose();
+
+        const newPid = PID + 100;
+        const createdBeforeSpawnEvent = new Date(preSpawnAt + 10).toISOString();
+        f.deps.env.VSCODE_PID = String(newPid);
+        f.deps.now = () => preSpawnAt + 1_000;
+        f.deps.inspectProcess = async pid => ({ pid, executablePath: f.identity.executablePath, creationTime: createdBeforeSpawnEvent });
+        f.deps.runCodeStatus = async () => status(`--user-data-dir ${receipt.userDataDir} --extensions-dir ${receipt.extensionsDir} --remote-debugging-port=${receipt.port}`, newPid);
+        f.deps.probeNative = async () => true;
+        state.documents = [];
+        state.notebooks = [];
+        await fs.writeFile(path.join(f.deps.env.APPDATA!, 'Code', 'User', 'globalStorage', 'storage.json'), JSON.stringify({
+            backupWorkspaces: { workspaces: [], folders: [], emptyWindows: [] }
+        }));
+        const restoredContext: ColabEnvironmentContextForTest = { ...f.context, subscriptions: [] };
+        const restored = createColabEnvironmentForTest(restoredContext, f.deps); await restored.initialize();
+        const ready = parsed(await restored.get(prepared.preparationId));
+        assert.strictEqual(ready.status, 'environment_ready');
+        assert.strictEqual(ready.environmentReady, true);
+        assert.strictEqual(ready.runtimeReady, false);
+        assert.notStrictEqual(receipt.launchPid, newPid, 'spawn child PID is not assumed to be the VS Code main PID');
+        assert.ok(Date.parse(createdBeforeSpawnEvent) < receipt.launchedAt, 'process creation may precede the recorded spawn-event time');
+        f.deps.assertNoActiveKernels = async () => { throw Object.assign(new Error('active after readiness'), { code: 'active_kernel_present' }); };
+        f.deps.hasBackgroundWork = () => true;
+        state.documents = [{ uri: rawUri('untitled:after-ready'), isDirty: true, isUntitled: true, version: 1 }];
+        state.tabGroups = [{ tabs: [{ label: 'webview', input: new TabInputWebview('after-ready'), isDirty: false }] }];
+        state.terminals = [{}]; state.activeDebugSession = { id: 'after-ready' };
+        const repolled = parsed(await restored.get(prepared.preparationId));
+        assert.strictEqual(repolled.environmentReady, true, 'ready receipts do not reapply pre-quit editor, terminal, kernel or saved-state gates');
+        for (const disposable of restoredContext.subscriptions) disposable.dispose();
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('post-restore verification withholds readiness for missing resources, extra windows or violated saved-state invariants', async () => {
+    for (const mismatch of ['missing-tab', 'extra-window', 'empty-backup', 'other-untitled-workspace'] as const) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+            assert.strictEqual(await f.runScheduledQuit(), true);
+            const receiptPath = path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`);
+            const receipt = JSON.parse(await fs.readFile(receiptPath, 'utf8'));
+            receipt.preSpawnAt = receipt.createdAt + 1_000; receipt.launchedAt = receipt.createdAt + 1_500;
+            receipt.launchPid = 777; receipt.status = 'app_launched'; await fs.writeFile(receiptPath, JSON.stringify(receipt));
+            f.dispose();
+            const newPid = PID + 200;
+            f.deps.env.VSCODE_PID = String(newPid); f.deps.now = () => receipt.createdAt + 2_000;
+            f.deps.inspectProcess = async pid => ({ pid, executablePath: f.identity.executablePath, creationTime: new Date(receipt.preSpawnAt + 10).toISOString() });
+            f.deps.runCodeStatus = async () => status(`--user-data-dir ${receipt.userDataDir} --extensions-dir ${receipt.extensionsDir} --remote-debugging-port=${receipt.port}`, newPid, mismatch === 'extra-window' ? 2 : 1);
+            f.deps.probeNative = async () => true;
+            if (mismatch === 'missing-tab') state.tabGroups[0].tabs.pop();
+            if (mismatch === 'empty-backup') {
+                await fs.writeFile(path.join(f.deps.env.APPDATA!, 'Code', 'User', 'globalStorage', 'storage.json'), JSON.stringify({
+                    backupWorkspaces: { workspaces: [], folders: [], emptyWindows: [{ backupFolder: 'new-empty' }] }
+                }));
+            }
+            if (mismatch === 'other-untitled-workspace') await fs.mkdir(path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces', 'other'));
+            const restoredContext: ColabEnvironmentContextForTest = { ...f.context, subscriptions: [] };
+            const restored = createColabEnvironmentForTest(restoredContext, f.deps); await restored.initialize();
+            const pending = parsed(await restored.get(prepared.preparationId));
+            assert.strictEqual(pending.environmentReady, false, mismatch);
+            assert.strictEqual(pending.status, 'app_launched', mismatch);
+            for (const disposable of restoredContext.subscriptions) disposable.dispose();
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
 test('a native port without a workspace opens an isolated folder and never claims readiness alone', async () => {
     const f = await fixture({ native: true });
     try {
@@ -715,7 +1517,7 @@ test('fixed helper has no forced termination and an invalid token cannot mutate 
     assert.doesNotMatch(HELPER_SOURCE_FOR_TEST, /taskkill|Stop-Process|\.kill\s*\(/i);
     assert.doesNotMatch(HELPER_SOURCE_FOR_TEST, /ErrorAction SilentlyContinue/);
     assert.match(HELPER_SOURCE_FOR_TEST, /ErrorAction Stop/);
-    assert.match(HELPER_SOURCE_FOR_TEST, /if\(p\).*return setTimeout\(poll,250\)/);
+    assert.match(HELPER_SOURCE_FOR_TEST, /if\(p\)\{[\s\S]*return setTimeout\(poll,250\)/);
     assert.match(HELPER_SOURCE_FOR_TEST, /quit_not_confirmed/);
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jupyter-mcp-helper-'));
     try {
@@ -951,6 +1753,42 @@ test('fixed helper waits for quit approval and exact original exit before acknow
     assert.strictEqual(failed.receipt.launchPid, undefined);
 });
 
+test('restored helper revalidates metadata and launches without a positional workspace argument', async () => {
+    const restored = helperHarness({ approved: true, observations: ['exited'], restored: true });
+    restored.runTimer();
+    assert.strictEqual(restored.launches.length, 1);
+    assert.deepStrictEqual(Array.from(restored.launches[0].args), [
+        '--user-data-dir', 'C:\\user', '--extensions-dir', 'C:\\extensions', '--remote-debugging-port=59267'
+    ]);
+    assert.ok(!restored.launches[0].args.includes('--new-window'));
+    assert.ok(!restored.launches[0].args.includes('C:\\workspace'));
+    restored.runTimer();
+    assert.strictEqual(restored.receipt.status, 'app_launched');
+    assert.ok(Number.isSafeInteger(restored.receipt.preSpawnAt));
+    assert.ok(restored.receipt.launchedAt >= restored.receipt.preSpawnAt);
+
+    const changed = helperHarness({ approved: true, observations: ['exited'], restored: true });
+    changed.mutateStorage(value => { value.backupWorkspaces.folders.push({ folderUri: 'file:///C:/other' }); });
+    changed.runTimer();
+    assert.strictEqual(changed.receipt.status, 'failed');
+    assert.strictEqual(changed.receipt.failure, 'restoration_state_changed');
+    assert.strictEqual(changed.launches.length, 0);
+
+    const tampered = helperHarness({ approved: true, observations: ['exited'], restored: true });
+    tampered.mutateReceipt(value => { value.restorationSnapshot.workspace.roots[0].name = 'Changed'; });
+    tampered.runTimer();
+    assert.strictEqual(tampered.receipt.status, 'failed');
+    assert.strictEqual(tampered.receipt.failure, 'helper_receipt_invalid');
+    assert.strictEqual(tampered.launches.length, 0);
+
+    const invalidMode = helperHarness({ approved: true, observations: ['exited'], restored: true });
+    invalidMode.mutateReceipt(value => { value.restartMode = 'unknown-mode'; });
+    invalidMode.runTimer();
+    assert.strictEqual(invalidMode.receipt.status, 'failed');
+    assert.strictEqual(invalidMode.receipt.failure, 'helper_receipt_invalid');
+    assert.strictEqual(invalidMode.launches.length, 0);
+});
+
 test('fixed helper retries unknown receipt/process observations but permanently rejects changed identity', async () => {
     const transient = helperHarness({ approved: true, readFailuresAfterArm: 1, observations: ['error', 'malformed', 'live', 'exited'] });
     transient.runTimer();
@@ -970,7 +1808,7 @@ test('fixed helper retries unknown receipt/process observations but permanently 
     assert.strictEqual(changed.launches.length, 0);
 
     const bounded = helperHarness({ approved: true, observations: ['error'] });
-    bounded.advance(10_001); bounded.runTimer();
+    bounded.advance(120_001); bounded.runTimer();
     assert.strictEqual(bounded.receipt.status, 'failed'); assert.strictEqual(bounded.receipt.failure, 'quit_not_confirmed');
     assert.strictEqual(bounded.launches.length, 0);
 });
@@ -1002,9 +1840,11 @@ test('fixed helper times out against a still-live original process without launc
         assert.strictEqual(lines.length, 2); assert.strictEqual(path.resolve(lines[0]).toLowerCase(), path.resolve(process.execPath).toLowerCase());
         const helper = path.join(temp, 'helper.cjs'), receiptPath = path.join(temp, 'receipt.json');
         const id = crypto.randomUUID(), token = crypto.randomUUID();
-        const receipt = { schema: 1, preparationId: id, helperToken: token, status: 'arming_restart', deadline: Date.now() + 5_000,
+        const createdAt = Date.now();
+        const receipt = { schema: 1, preparationId: id, nonce: crypto.randomUUID(), helperToken: token, status: 'arming_restart',
+            createdAt, deadline: createdAt + 5_000, workspaceUri: fileUri(temp).toString(), expectedWindowLabel: 'helper-veto', generatedWorkspace: false,
             main: { pid: process.pid, executablePath: process.execPath, creationTime: lines[1] }, executablePath: process.execPath,
-            workspacePath: temp, userDataDir: temp, extensionsDir: temp, port: 59267, quitDispatchApprovedAt: Date.now() };
+            workspacePath: temp, userDataDir: temp, extensionsDir: temp, port: 59267, quitDispatchApprovedAt: createdAt };
         await fs.writeFile(helper, HELPER_SOURCE_FOR_TEST); await fs.writeFile(receiptPath, JSON.stringify(receipt));
         const child = spawnSync(process.execPath, [helper, receiptPath, id, token], { timeout: 15_000 });
         assert.strictEqual(child.status, 0);

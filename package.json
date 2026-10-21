@@ -72,7 +72,7 @@
           "minimum": 0,
           "maximum": 65535,
           "scope": "machine",
-          "description": "Optional loopback Chromium debugging port for native Colab setup. 0 uses JUPYTER_MCP_NATIVE_DEBUG_PORT. prepare_colab_environment can enable a port through a tracked normal restart from a supported clean empty Windows window; no Orca or VS Code smoke driver is used."
+          "description": "Optional loopback Chromium debugging port for native Colab setup. 0 uses JUPYTER_MCP_NATIVE_DEBUG_PORT. prepare_colab_environment can enable a port through a tracked normal restart from a supported clean empty window or strictly verified clean configured Workspace on the pinned default Windows build; no Orca or VS Code smoke driver is used."
         }
       }
     },

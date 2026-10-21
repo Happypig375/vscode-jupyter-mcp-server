@@ -127,6 +127,9 @@ export function assertNoColabSetup(ref: string): void {
         throw new Error('Colab setup is still active for this notebook. Inspect or cancel it before another notebook operation.');
     }
 }
+export function hasGlobalColabSetupWork(): boolean {
+    return [...setups.values()].some(job => !job.endedAt || job.cleanupPending);
+}
 export async function configureColab(ref: string, options: SetupOptions = {}, deps = defaults): Promise<string> {
     const wait = validateWait(options.waitMs, 1000);
     if (options.serverAlias !== undefined) validateServerAlias(options.serverAlias);

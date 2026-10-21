@@ -25,6 +25,7 @@ import { checkColabRuntime, downloadFile, uploadFile } from './kernelFiles';
 import { getColabEnvironmentPreparation, inspectColabEnvironmentPreflightLocal, prepareColabEnvironment } from './colabEnvironment';
 import { closeColabTerminals, listColabTerminals } from './colabTerminals';
 import { assertNoColabSetup, configureColab, getColabSetup, listColabSetupKernels, mountColabServer, selectColabSetupKernel } from './colabSetup';
+import { beginLocalOperation } from './operationGate';
 
 export type LocalOperation =
     | 'inspect_colab_environment_preflight'
@@ -70,6 +71,15 @@ function notebookRef(args: Args): string {
 
 /** Execute one validated tool operation against notebooks owned by this VS Code window. */
 export async function executeLocalOperation(operation: LocalOperation, args: Args): Promise<string> {
+    const finishOperation = beginLocalOperation(operation, args);
+    try {
+        return await executeLocalOperationInsideGate(operation, args);
+    } finally {
+        finishOperation();
+    }
+}
+
+async function executeLocalOperationInsideGate(operation: LocalOperation, args: Args): Promise<string> {
     const ids = args.cellIds as Array<string | number> | undefined;
     if (['configure_kernel', 'mount_colab_server', 'select_kernel', 'edit_cells', 'run_cells', 'restart_kernels', 'interrupt_kernels', 'move_cells', 'clear_cell_outputs', 'upload_file', 'download_file', 'check_colab'].includes(operation)) {
         for (const ref of typeof args.notebookRef === 'string' ? [args.notebookRef] : Array.isArray(args.notebookRefs) ? args.notebookRefs : []) assertNoColabSetup(String(ref));
@@ -82,7 +92,7 @@ export async function executeLocalOperation(operation: LocalOperation, args: Arg
         case 'close_colab_terminals':
             return closeColabTerminals(args.inventoryId as string, args.terminalRefs as string[]);
         case 'prepare_colab_environment':
-            return prepareColabEnvironment(args.folderUri as string | undefined);
+            return prepareColabEnvironment(args.folderUri as string | undefined, args.restartMode as 'restore-clean-workspace' | undefined);
         case 'get_colab_environment_preparation':
             return getColabEnvironmentPreparation(args.preparationId as string);
         case 'create_notebook':

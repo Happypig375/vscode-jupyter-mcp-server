@@ -237,10 +237,13 @@ async function main() {
     });
 
     await check('desktop preparation schemas reject notebook refs, launch flags and scripts', async () => {
-        for (const arguments_ of [{ notebookRef: 'file:///C:/x.ipynb' }, { args: ['--unsafe'] }, { script: 'x' }, { folderUri: 42 }]) {
+        for (const arguments_ of [{ notebookRef: 'file:///C:/x.ipynb' }, { args: ['--unsafe'] }, { script: 'x' }, { folderUri: 42 }, { restartMode: 'unknown' }, { restartMode: 1 }]) {
             const response = await client.callTool({ name: 'prepare_colab_environment', arguments: arguments_ });
             assert.ok(response.isError);
         }
+        const routedRestore = await client.callTool({ name: 'prepare_colab_environment', arguments: { restartMode: 'restore-clean-workspace' } });
+        assert.ok(routedRestore.isError);
+        assert.match(routedRestore.content[0].text, /configured.*Workspace/i, 'the exact enum must pass strict schema validation and reach the bounded route');
         const missing = await client.callTool({ name: 'get_colab_environment_preparation', arguments: {} });
         assert.ok(missing.isError);
     });

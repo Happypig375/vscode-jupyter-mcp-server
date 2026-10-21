@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { CancellationTokenSource } from './vscodeStub';
-import { ActiveKernelLike, checkColabRuntime, ColabFileSystem, downloadFile, KernelFileDeps, MAX_KERNEL_TRANSFER_BYTES, TRANSFER_CHUNK_BYTES, TRANSFER_TAG, uploadFile } from '../kernelFiles';
+import { ActiveKernelLike, checkColabRuntime, ColabFileSystem, downloadFile, hasGlobalFileTransferWork, KernelFileDeps, MAX_KERNEL_TRANSFER_BYTES, TRANSFER_CHUNK_BYTES, TRANSFER_TAG, uploadFile } from '../kernelFiles';
 
 function decode(code: string) {
     const outer = code.match(/b64decode\("([A-Za-z0-9+/=]+)"\)/)!;
@@ -160,9 +160,22 @@ async function lifecycleTests() {
         kernel.files.set('/tmp/input', Buffer.from('payload'));
         return { kernel, host, d: { ...deps(kernel, host), executionTimeoutMs: 20, cleanupTimeoutMs: 10 } };
     };
+    {
+        const { kernel, d } = make();
+        d.executionTimeoutMs = 1_000;
+        let releaseKernel!: () => void;
+        const kernelGate = new Promise<void>(resolve => { releaseKernel = resolve; });
+        d.getKernel = async () => { await kernelGate; return kernel; };
+        const pending = uploadFile(args, undefined, d);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(hasGlobalFileTransferWork(), true, 'an in-flight transfer is enumerable before kernel lookup settles');
+        releaseKernel(); await pending;
+        assert.strictEqual(hasGlobalFileTransferWork(), false, 'a normally completed transfer releases its enumerable guard');
+    }
     for (const upload of [true, false]) {
         const { kernel, host, d } = make(); kernel.hang = () => true;
         await assert.rejects(upload ? uploadFile(args, undefined, d) : downloadFile({ ...args, hostPath: dest }, undefined, d), /timed out/);
+        assert.strictEqual(hasGlobalFileTransferWork(), true, 'unsettled kernel I/O remains globally enumerable after the tool returns');
         assert.strictEqual(kernel.sources.length, 1, 'no queued cleanup after unsettled execution');
         assert.strictEqual(kernel.returned, 1, 'stalled iterator.return must not block caller');
         assert.strictEqual(kernel.cancelledExecutions, 1, 'deadline requests public execution cancellation');
