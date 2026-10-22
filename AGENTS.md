@@ -20,7 +20,12 @@ pin to installed stable Windows VS Code 1.143.0, commit
 corrections are preserved. Independent source review, structural checks and
 deterministic fixture suites pass. Isolated native-picker and corrected
 cleanup-only fixtures pass; preserve the full environment fixture's failed
-cleanup receipt and its separate passing behavior assertions. Default-profile
+cleanup receipt and its separate passing behavior assertions. A separately
+reviewed append-only fixture observed the first folder conversion replace its
+extension host and a later owned-folder append preserve the host activation/PID,
+exact Workspace/first root and fresh environment readiness. Both owned windows
+quit normally; independent process/port checks pass. Keep this claim limited
+to the isolated settled observation, without real Jupyter/Colab. Default-profile
 installation/restoration and real Colab readiness remain unverified. See the
 23 October record in `TRANSFER_DIAGNOSIS.md`; do not infer broader compatibility
 from these checks or the earlier 1.142.0 checks.

@@ -146,10 +146,26 @@ The earlier failed full receipt remains
 Exact private source, package, launch, process, receipt and independent-review
 records remain in the research workspace.
 
+A separate, independently reviewed **workspace-append-only** fixture then
+observed the initial single-folder conversion replace its extension host.
+Appending one later owned folder kept the same host activation/PID, exact
+Workspace and first root, and fresh MCP environment readiness. The same MCP
+owner remained; no display-label parity is claimed. Both owned windows quit
+normally, and independent process/port checks passed. The fixture hashes
+`aaf7a9a22f3cb653652a1f75a4423559d6b47857ea293379d7258c048bdd7dcb`,
+its test-only helper hashes
+`950aa33c33529106ee4ec6256fc3c44cbb22beb91251d06a131f0681285bae61`,
+and its passing receipt hashes
+`ae4dd8931999f6e972d012d87993a262a00b52041bd5735e17625cbad611c0d6`.
+The helper also records in-process version 1.143.0. This is an isolated settled
+observation, without real Jupyter/Colab or default-profile validation; it does
+not reclassify the earlier full environment fixture failure. Eleven invented
+helper controls and both syntax checks passed before the single live attempt.
+Production and the accepted private VSIX remain unchanged.
+
 These fixtures verify bounded behavior against the prelaunch installed
 version/commit files; they do not supply an in-process product-commit receipt.
 A fresh profile also does not isolate every built-in application service.
-Later-root append without a second refresh was not tested in this 1.143.0 pass.
 Default-profile installation, reload, recovery/restoration and real
 Colab/kernel/filesystem readiness remain pending. The active research host is
 unchanged and must not be reloaded while its calculations or transfers remain

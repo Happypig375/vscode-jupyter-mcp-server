@@ -2,7 +2,7 @@
 // It uses a fresh profile, empty extension directory, and a bundled development extension
 // whose manifest has no Jupyter dependency. It never opens Colab, authentication, or user data.
 // This does not test the missing-port restart/bootstrap path.
-// Usage: node src/test/colabEnvironment.live.cjs <absolute Code.exe> <new evidence directory> [--cleanup-only]
+// Usage: node src/test/colabEnvironment.live.cjs <absolute Code.exe> <new evidence directory> [--cleanup-only|--workspace-append-only]
 // Cleanup-only establishes the two owned development windows but opens no notebooks.
 'use strict';
 
@@ -19,8 +19,9 @@ const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/cli
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const [codeArg, evidenceArg, mode] = process.argv.slice(2);
-if (mode !== undefined && mode !== '--cleanup-only') throw new Error('Unknown fixture mode.');
+if (mode !== undefined && mode !== '--cleanup-only' && mode !== '--workspace-append-only') throw new Error('Unknown fixture mode.');
 const cleanupOnly = mode === '--cleanup-only';
+const appendOnly = mode === '--workspace-append-only';
 if (!codeArg || !path.isAbsolute(codeArg) || !evidenceArg || !path.isAbsolute(evidenceArg)) {
     throw new Error('Explicit absolute Code executable and new evidence directory required.');
 }
@@ -38,6 +39,7 @@ const receipt = {
     userNotebookUsed: false
 };
 receipt.cleanupOnly = cleanupOnly;
+receipt.workspaceAppendOnly = appendOnly;
 let child;
 let control;
 let client;
@@ -194,7 +196,7 @@ async function main() {
         version: '0.0.1',
         engines: { vscode: '^1.106.0' },
         main: './extension.cjs',
-        activationEvents: ['onStartupFinished']
+        activationEvents: [appendOnly ? '*' : 'onStartupFinished']
     }, null, 2));
     await fs.writeFile(path.join(cleanupExtension, 'extension.cjs'), [
         "'use strict';",
@@ -217,8 +219,25 @@ async function main() {
         '  item.command = command;',
         '  item.show();',
         '  context.subscriptions.push(item);',
+        ...(appendOnly ? [
+            `  require('./append-probe.cjs').activate(context, ${JSON.stringify({
+                nonce: cleanupNonce,
+                markerPrefix: 'MCP isolated fixture append ' + cleanupNonce,
+                stateDirectory: path.join(evidence, 'append-states'),
+                requestPath: path.join(evidence, 'append-request.json'),
+                acknowledgmentPath: path.join(evidence, 'append-ack.json'),
+                settledPath: path.join(evidence, 'append-settled.json'),
+                appendRootUri: pathToFileURL(path.join(evidence, 'later-root')).toString(),
+                appendRootName: 'fixture-later-root'
+            })});`
+        ] : []),
         '};'
     ].join('\n'));
+    if (appendOnly) {
+        await fs.mkdir(path.join(evidence, 'append-states'));
+        await fs.mkdir(path.join(evidence, 'later-root'));
+        await fs.copyFile(path.join(ROOT, 'src', 'test', 'colabWorkspaceAppend.helper.cjs'), path.join(cleanupExtension, 'append-probe.cjs'));
+    }
 
     await fs.writeFile(path.join(user, 'settings.json'), JSON.stringify({
         'jupyterMcp.enabled': true,
@@ -235,7 +254,7 @@ async function main() {
     receipt.temporaryProfileSettings = { confirmSaveUntitledWorkspace: false };
 
     const diskNotebook = path.join(evidence, 'fixture-open.ipynb');
-    if (!cleanupOnly) await fs.writeFile(diskNotebook, JSON.stringify({
+    if (!cleanupOnly && !appendOnly) await fs.writeFile(diskNotebook, JSON.stringify({
         cells: [{ cell_type: 'markdown', metadata: {}, source: ['# Isolated fixture'] }],
         metadata: {},
         nbformat: 4,
@@ -362,6 +381,129 @@ async function main() {
     assert.strictEqual(new URL(ready.value.workspaceUri).protocol, 'untitled:');
     assert.strictEqual(ready.value.folderUri, prepareReceipt.folderUri);
     assert.strictEqual(ready.value.expectedWindowLabel, finalWindowLabel);
+
+    if (appendOnly) {
+        const stateDirectory = path.join(evidence, 'append-states');
+        const readStates = async () => {
+            const names = await fs.readdir(stateDirectory);
+            assert.ok(names.length > 0 && names.length <= 8, 'unexpected activation-record count');
+            assert.ok(names.every(name => /^activation-[0-9a-f-]{36}\.json$/.test(name)), 'unexpected activation record');
+            const values = await Promise.all(names.map(name => fs.readFile(path.join(stateDirectory, name), 'utf8').then(JSON.parse)));
+            for (const value of values) {
+                assert.strictEqual(value.schema, 'colab-workspace-append-state-v1');
+                assert.strictEqual(value.nonce, cleanupNonce);
+                assert.strictEqual(value.vscodeVersion, '1.143.0');
+                assert.ok(Number.isInteger(value.extensionHostPid) && value.extensionHostPid > 0);
+                assert.match(value.activationId, /^[0-9a-f-]{36}$/);
+            }
+            return values;
+        };
+        const beforeStates = await readStates();
+        const originalRoot = { uri: prepareReceipt.folderUri, name: prepareReceipt.expectedWindowLabel };
+        const preparedRoot = { uri: ready.value.folderUri, name: finalWindowLabel };
+        const prior = beforeStates.filter(value => value.workspaceUri === null && JSON.stringify(value.roots) === JSON.stringify([originalRoot]));
+        const current = beforeStates.filter(value => value.workspaceUri === ready.value.workspaceUri && JSON.stringify(value.roots) === JSON.stringify([preparedRoot]));
+        assert.strictEqual(prior.length, 1, 'one original-folder activation must precede conversion');
+        assert.strictEqual(current.length, 1, 'one exact prepared-Workspace activation required');
+        const liveState = current[0];
+        assert.notStrictEqual(prior[0].extensionHostPid, liveState.extensionHostPid, 'first conversion must refresh the extension host');
+        assert.notStrictEqual(prior[0].activationId, liveState.activationId);
+        assert.ok(Date.parse(prior[0].observedAt) <= Date.parse(liveState.observedAt));
+        receipt.folderConversionActivations = { before: prior[0], after: liveState };
+
+        const marker = 'MCP isolated fixture append ' + cleanupNonce + ' ' + liveState.activationId;
+        const targets = await fetch(`http://127.0.0.1:${debugPort}/json/list`).then(response => response.json());
+        const pages = targets.filter(item => item.type === 'page' && /workbench(?:\.html)?/.test(item.url));
+        assert.strictEqual(pages.length, 2, 'only the two owned fixture windows may remain');
+        assert.strictEqual(pages.filter(page => page.id === initialTargetId).length, 1);
+        const matches = [];
+        for (const page of pages) {
+            assert.ok(page.webSocketDebuggerUrl.startsWith(`ws://127.0.0.1:${debugPort}/`));
+            const probe = await connectDebugger(page.webSocketDebuggerUrl);
+            try {
+                const result = await probe.command('Runtime.evaluate', {
+                    expression: `[...document.querySelectorAll('.statusbar-item')].filter(e => e.textContent.trim() === ${JSON.stringify(marker)}).length`,
+                    returnByValue: true
+                });
+                assert.ok(result.result?.value === 0 || result.result?.value === 1);
+                if (result.result?.value === 1) matches.push(page);
+            } finally { probe.close(); }
+        }
+        assert.strictEqual(matches.length, 1, 'exact prepared-host marker must bind one renderer');
+        assert.notStrictEqual(matches[0].id, initialTargetId);
+        const request = {
+            schema: 'colab-workspace-append-request-v1', nonce: cleanupNonce,
+            activationId: liveState.activationId, extensionHostPid: liveState.extensionHostPid,
+            expectedWorkspaceUri: ready.value.workspaceUri, expectedRoot: preparedRoot,
+            requestedAt: new Date().toISOString()
+        };
+        await fs.writeFile(path.join(evidence, 'append-request.json'), JSON.stringify(request), { flag: 'wx' });
+        const appendControl = await connectDebugger(matches[0].webSocketDebuggerUrl);
+        try {
+            const clicked = await appendControl.command('Runtime.evaluate', {
+                expression: `(() => {
+                    const visible = e => { const s = getComputedStyle(e), r = e.getBoundingClientRect(); return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0; };
+                    const items = [...document.querySelectorAll('.statusbar-item')].filter(e => visible(e) && e.textContent.trim() === ${JSON.stringify(marker)});
+                    if (items.length !== 1) return false;
+                    const actions = [...items[0].querySelectorAll('a,button,[role="button"]')].filter(visible);
+                    const action = actions.length === 1 ? actions[0] : items[0].matches('a,button,[role="button"]') ? items[0] : undefined;
+                    if (!action) return false;
+                    action.click(); return true;
+                })()`,
+                returnByValue: true
+            });
+            assert.strictEqual(clicked.result?.value, true, 'one exact append action must be dispatched');
+        } finally { appendControl.close(); }
+        const settled = await until(async () => {
+            try { return JSON.parse(await fs.readFile(path.join(evidence, 'append-settled.json'), 'utf8')); }
+            catch { return false; }
+        }, 'Append did not settle in its original extension host.', 10_000);
+        const acknowledgement = JSON.parse(await fs.readFile(path.join(evidence, 'append-ack.json'), 'utf8'));
+        assert.strictEqual(acknowledgement.schema, 'colab-workspace-append-ack-v1');
+        assert.strictEqual(acknowledgement.nonce, cleanupNonce);
+        assert.strictEqual(acknowledgement.accepted, true);
+        assert.match(acknowledgement.invocationId, /^[0-9a-f-]{36}$/);
+        assert.ok(Date.parse(acknowledgement.requestedAt) >= Date.parse(request.requestedAt));
+        assert.strictEqual(acknowledgement.before.schema, liveState.schema);
+        assert.strictEqual(acknowledgement.before.nonce, cleanupNonce);
+        assert.strictEqual(acknowledgement.before.activationId, liveState.activationId);
+        assert.strictEqual(acknowledgement.before.extensionHostPid, liveState.extensionHostPid);
+        assert.strictEqual(acknowledgement.before.workspaceUri, liveState.workspaceUri);
+        assert.deepStrictEqual(acknowledgement.before.roots, [preparedRoot]);
+        assert.strictEqual(settled.schema, 'colab-workspace-append-settled-v1');
+        assert.strictEqual(settled.nonce, cleanupNonce);
+        assert.strictEqual(settled.invocationId, acknowledgement.invocationId);
+        assert.strictEqual(settled.state.schema, liveState.schema);
+        assert.strictEqual(settled.state.nonce, cleanupNonce);
+        assert.strictEqual(settled.state.vscodeVersion, '1.143.0');
+        assert.strictEqual(fileUriKey(acknowledgement.appendedRoot.uri), path.resolve(evidence, 'later-root').toLowerCase());
+        assert.strictEqual(acknowledgement.appendedRoot.name, 'fixture-later-root');
+        assert.strictEqual(settled.state.activationId, liveState.activationId);
+        assert.strictEqual(settled.state.extensionHostPid, liveState.extensionHostPid);
+        assert.strictEqual(settled.state.workspaceUri, liveState.workspaceUri);
+        assert.deepStrictEqual(settled.state.roots, [preparedRoot, acknowledgement.appendedRoot]);
+        const postText = await callText('get_colab_environment_preparation', { preparationId: prepareReceipt.preparationId, windowId: ready.owner.windowId });
+        const post = JSON.parse(postText);
+        assert.strictEqual(post.status, 'environment_ready');
+        assert.strictEqual(post.environmentReady, true);
+        assert.strictEqual(post.runtimeReady, false);
+        assert.strictEqual(post.workspaceUri, ready.value.workspaceUri);
+        assert.strictEqual(post.folderUri, ready.value.folderUri);
+        const afterGroups = await listNotebooks();
+        assertGroupShape(afterGroups);
+        assert.deepStrictEqual(afterGroups.map(group => group.windowId).sort(), ready.groups.map(group => group.windowId).sort());
+        assert.ok(afterGroups.every(group => group.notebooks.length === 0));
+        assert.deepStrictEqual((await readStates()).map(value => value.activationId).sort(), beforeStates.map(value => value.activationId).sort());
+        receipt.workspaceAppend = { request, acknowledgement, settled, afterGroups, readyReceipt: post };
+        receipt.assertions = {
+            firstConversionRefreshedHost: true, laterAppendPreservedHostAndActivation: true,
+            exactWorkspaceAndFirstRootPreserved: true, exactSecondRootAppended: true,
+            sameMcpOwnerAndFreshNativeReadiness: true, runtimeReadyFalse: true,
+            notebooksOpened: false, noJupyterDependency: true, noSmokeDriver: true
+        };
+        receipt.passed = true;
+        return;
+    }
 
     if (cleanupOnly) {
         receipt.assertions = {
