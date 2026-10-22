@@ -81,3 +81,76 @@ This resolves the live upload/download check at these sizes and on this runtime.
 **Checks.** `npm run typecheck`, `npm run compile`, `npm run compile:test`, the synthetic suite (new tests cover compressed and incompressible chunks, the purge tag in every request, the absence of nested payloads, error receipts with cleanup, and refusal at the budget with a fresh budget for a new kernel object), and the real-Python suite (native 65.6 MB round trip, a new 1.42 MB kernel-route round trip whose largest request was 351,340 bytes, and the IPython replay). CI now installs IPython so the replay runs there instead of being skipped.
 
 **Limits.** The purge removes only tagged transfer sources. The 64 MiB budget is a conservative guard, not a measured Colab threshold. Native transfers remain the right route for large files and still need a mounted or opened Colab root.
+
+## 23 October: VS Code 1.143.0 source and isolated validation
+
+The recovery helper, environment gate and broker window-correspondence gate
+now pin installed stable Windows VS Code **1.143.0**, commit
+`2d0b7506a36c1d6db9a466440131a8e01eab2289`. The source change advances the
+existing pin; it does not broaden accepted builds or weaken workspace, process,
+marker, native-binding or runtime checks. The ordinary empty-window route keeps
+its existing version check; this update does not add a commit check to that route.
+
+The working tree already contained the reviewed v9 corrections for exact Welcome
+cleanup, notebook-cell document inventory, the bare untitled-Workspace identifier,
+the bounded backup-registry `remoteAuthority` field and historical launch-path provenance. Their
+before copies and diff were preserved separately from the new pin change.
+Historical review is attributed to its original scope; it does not by itself
+prove the identity of these final source bytes.
+
+Independent review accepted the bounded source change and private packaging.
+Typechecking, compilation and the full deterministic suite passed, including
+88 environment cases, 67 setup cases, 33 native-driver cases, broker routing,
+notebook serialization and the invented 65.6 MB transfer fixture. These tests do
+not use a real Colab runtime. The compiled candidate hashes
+`6d0fec22710e12d951fb3650dadc9a1361115e3ac9bcc78143ca56c7749b9ce1`.
+
+Two separate live fixtures used fresh profiles, empty extension directories,
+an isolated development extension and explicit loopback endpoints:
+
+- **Native picker.** All eight synthetic selections and the read-only listing
+  check passed. The normal browser-close acknowledgment was unconfirmed; the
+  later independent check found the exact fixture process and debug listener
+  absent. This is not a claim of acknowledged graceful shutdown.
+- **Environment.** All 13 behavior assertions passed, including generated-folder
+  conversion to the exact untitled Workspace, ownership checks and opening the
+  invented notebooks. Cleanup failed: one normal Quit closed the last-active
+  development window while the original remained. The fixture requested
+  termination of its owned spawned child and returned failure. That receipt
+  remains unchanged with `passed: false`.
+
+Installed public VS Code source and the isolated logs support this explanation
+of the second failure: with multiple development windows, normal Quit can close only the
+last-active one. No production MCP behavior was changed to address it. The test
+fixture now permits at most two normal Quit stages, bound to the original known
+targets and exact fresh marker. Each stage needs a new invocation UUID and a
+fresh acknowledgment carrying the run nonce. The public telemetry session ID is
+a constant placeholder in this fixture and is not ownership evidence.
+
+An independently reviewed **cleanup-only** attempt then established the two
+owned windows without opening notebooks. It recorded 2 → 1 → 0 windows, two
+distinct acknowledgments, normal child exit and no requested termination.
+Independent postchecks found the exact fixture PID and both debug/broker ports
+absent. Node exited zero, and the reviewer accepted this narrow cleanup closure
+and retention of the test correction. This separate success does not relabel or
+repeat the earlier full fixture. The launcher first failed before dispatch on an
+obsolete unversioned metadata path; that failure and its version-directory
+correction are preserved as well.
+
+The reviewed cleanup fixture hashes
+`9976970f647afd4c7b8a90da1f07df9c4f2b3946e6971d904acf15e5fe79a058`;
+its passing receipt hashes
+`136a38c09365b086b0d1f0ecafd82eec1665316174b62e916ff2ea331c103ec7`.
+The earlier failed full receipt remains
+`ab08ace5a1cd3bb9850444cc5fb049d9815a0574b97e19e3a7d648b74cac2d15`.
+Exact private source, package, launch, process, receipt and independent-review
+records remain in the research workspace.
+
+These fixtures verify bounded behavior against the prelaunch installed
+version/commit files; they do not supply an in-process product-commit receipt.
+A fresh profile also does not isolate every built-in application service.
+Later-root append without a second refresh was not tested in this 1.143.0 pass.
+Default-profile installation, reload, recovery/restoration and real
+Colab/kernel/filesystem readiness remain pending. The active research host is
+unchanged and must not be reloaded while its calculations or transfers remain
+unsettled. No Marketplace publication or general compatibility claim follows.

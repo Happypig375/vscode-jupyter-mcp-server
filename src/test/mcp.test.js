@@ -51,7 +51,7 @@ function makeDoc(type, data) {
 }
 
 const vscodeShim = {
-    version: '1.142.0',
+    version: '1.143.0',
     workspace: {
         getConfiguration: (section) => ({ get: (k, d) => {
             if (section === 'window' && k === 'confirmBeforeClose') return 'never';

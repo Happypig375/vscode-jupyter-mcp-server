@@ -8,8 +8,8 @@ const BROKER_PROTOCOL = 'jupyter-mcp-window-broker-v1';
 const MAX_CONTROL_BODY = 5 * 1024 * 1024;
 const PREFLIGHT_TIMEOUT_MS = 30_000;
 const MAX_WINDOW_LABEL_CODE_POINTS = 256;
-const WINDOW_IDENTITY_VERSION = '1.142.0';
-const WINDOW_IDENTITY_COMMIT = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
+const WINDOW_IDENTITY_VERSION = '1.143.0';
+const WINDOW_IDENTITY_COMMIT = '2d0b7506a36c1d6db9a466440131a8e01eab2289';
 
 export type BrokerRole = 'broker' | 'peer' | 'blocked' | 'stopped';
 

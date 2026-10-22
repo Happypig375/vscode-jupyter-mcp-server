@@ -9,20 +9,20 @@ import * as vm from 'vm';
 import {
     ColabEnvironmentContextForTest, ColabEnvironmentDependenciesForTest, ColabEnvironmentError,
     ColabEnvironmentReceiptForTest, HELPER_SOURCE_FOR_TEST, ProcessIdentity,
-    buildProcessIdentityPowerShellForTest, createColabEnvironmentForTest, initializeColabEnvironment, parseCodeStatusForTest, prepareColabEnvironment,
+    assertSafeRestoredInitialArgsForTest, buildProcessIdentityPowerShellForTest, createColabEnvironmentForTest, initializeColabEnvironment, parseCodeStatusForTest, prepareColabEnvironment,
     inspectSavedStateMetadataForTest, resolveInstalledCodeCliForTest, resolveLocalGlobalStoragePathForTest, retryWatchdogReceiptReadForTest, validateDefaultWindowsInstallForTest
 } from '../colabEnvironment';
 import { fileUri, rawUri, reset, state, TabInputNotebook, TabInputText, TabInputWebview, userDataUri } from './colabEnvironmentStub';
 import { acquireRestartExclusion, beginLocalOperation, operationGateStateForTest } from '../operationGate';
 
 const PID = 33940;
-const COMMIT = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
+const COMMIT = '2d0b7506a36c1d6db9a466440131a8e01eab2289';
 const CREATION = '2026-10-20T01:02:03.0000000Z';
 const CRASH = 'ca056795-5095-4ecf-8364-307fb2b6ee50';
 
 function status(args = `--crash-reporter-id ${CRASH}`, pid = PID, windows = 1): string {
     const rows = Array.from({ length: windows }, (_, index) => `    1     190   ${28920 + index}  window [${index + 1}] (Welcome - Visual Studio Code)`).join('\n');
-    return `Version:          Code 1.142.0 (${COMMIT}, 2026-10-15T03:02:17Z)\nOS Version:       Windows_NT x64 10.0.26100\nProcess Argv:     ${args}\nCPU % Mem MB     PID  Process\n    0      51   ${pid}  code\n${rows}\n`;
+    return `Version:          Code 1.143.0 (${COMMIT}, 2026-10-20T14:31:47-07:00)\nOS Version:       Windows_NT x64 10.0.26100\nProcess Argv:     ${args}\nCPU % Mem MB     PID  Process\n    0      51   ${pid}  code\n${rows}\n`;
 }
 
 interface Fixture {
@@ -71,7 +71,7 @@ async function fixture(options: { native?: boolean; restart?: boolean; spacedPat
             platform: options.restart ? 'win32' : process.platform,
             execPath: identity.executablePath,
             env: { APPDATA: appData, LOCALAPPDATA: localAppData, USERPROFILE: profile, VSCODE_PID: String(PID) },
-            vscodeVersion: '1.142.0',
+            vscodeVersion: '1.143.0',
             probeNative: async () => options.native === true,
             inspectNative: async () => ({ listenerAvailable: options.native === true, workbenchPageCount: options.native ? 1 : null }),
             runCodeStatus: async () => status(),
@@ -116,14 +116,18 @@ async function configuredWorkspace(f: Fixture, kind: 'file' | 'untitled' = 'file
         await fs.writeFile(workspacePath, '{"folders":[]}');
         workspaceFile = fileUri(workspacePath);
     } else {
-        const current = path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces', 'current');
+        const workspaceId = '1792448431555';
+        const current = path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces', workspaceId);
         await fs.mkdir(current, { recursive: true });
-        workspaceFile = rawUri(`untitled:${path.join(current, 'workspace.json').replace(/\\/g, '/')}`);
+        workspaceFile = rawUri(`untitled:${workspaceId}`);
     }
     state.workspaceFile = workspaceFile;
     state.folders = [{ name: 'Research', uri: root }];
     state.documents = [{ uri: textUri, isDirty: false, isUntitled: false, version: 7 }];
-    state.notebooks = [{ uri: notebookUri, isDirty: false, isUntitled: false, version: 11, notebookType: 'jupyter-notebook' }];
+    state.notebooks = [{
+        uri: notebookUri, isDirty: false, isUntitled: false, version: 11, notebookType: 'jupyter-notebook',
+        getCells: () => []
+    }];
     state.tabGroups = [{ tabs: [
         { label: 'notes.txt', input: new TabInputText(textUri), isDirty: false },
         { label: 'research.ipynb', input: new TabInputNotebook(notebookUri, 'jupyter-notebook'), isDirty: false }
@@ -146,6 +150,7 @@ function helperHarness(options: {
     readFailuresAfterArm?: number;
     disarmDuringInspection?: boolean;
     restored?: boolean;
+    initialFolderBackup?: any;
 }) {
     const id = crypto.randomUUID(), token = crypto.randomUUID(), receiptPath = 'C:\\receipt.json';
     let now = 1_800_000_000_000;
@@ -163,10 +168,15 @@ function helperHarness(options: {
             savedState: { untitledWorkspaces: [], backupRegistry: { workspaces: 1, folders: 0, emptyWindows: 0 } }
         }
     });
-    const files = new Map<string, Buffer>([[receiptPath, Buffer.from(JSON.stringify(receipt))]]);
-    files.set(path.join('C:\\user', 'User', 'globalStorage', 'storage.json'), Buffer.from(JSON.stringify({
+    const storage: any = {
         backupWorkspaces: { workspaces: [{ id: 'configured', configURIPath: 'file:///configured.code-workspace' }], folders: [], emptyWindows: [] }
-    })));
+    };
+    if (options.restored && options.initialFolderBackup !== undefined) {
+        storage.backupWorkspaces.folders.push(options.initialFolderBackup);
+        receipt.restorationSnapshot.savedState.backupRegistry.folders = 1;
+    }
+    const files = new Map<string, Buffer>([[receiptPath, Buffer.from(JSON.stringify(receipt))]]);
+    files.set(path.join('C:\\user', 'User', 'globalStorage', 'storage.json'), Buffer.from(JSON.stringify(storage)));
     const timers: Array<() => void> = []; const launches: Array<{ executable: string; args: string[]; options: any }> = [];
     let exits = 0; let inspections = 0; let armed = false; let remainingReadFailures = options.readFailuresAfterArm ?? 0;
     const fakeFs = {
@@ -225,7 +235,7 @@ function helperHarness(options: {
 
 test('version-matched status format identifies the exact primary and windows', async () => {
     const result = parseCodeStatusForTest(status('--enable-smoke-test-driver --remote-debugging-port=59267 --crash-reporter-id ' + CRASH), PID);
-    assert.strictEqual(result.version, '1.142.0'); assert.strictEqual(result.commit, COMMIT); assert.strictEqual(result.mainPid, PID);
+    assert.strictEqual(result.version, '1.143.0'); assert.strictEqual(result.commit, COMMIT); assert.strictEqual(result.mainPid, PID);
     assert.deepStrictEqual(result.processArgs.slice(0, 2), ['--enable-smoke-test-driver', '--remote-debugging-port=59267']);
     assert.deepStrictEqual(result.windows.map(window => window.id), [1]);
 });
@@ -239,7 +249,7 @@ test('status parser fails closed for malformed, other-PID, duplicate-primary and
 
 test('default Windows installation/profile derivation accepts only the pinned ordinary shape', async () => {
     const temp = path.join('C:\\Users', 'tester'); const appData = path.join(temp, 'AppData', 'Roaming'); const localAppData = path.join(temp, 'AppData', 'Local');
-    const input = { platform: 'win32' as NodeJS.Platform, version: '1.142.0', execPath: path.join(temp, 'AppData', 'Local', 'Programs', 'Microsoft VS Code', 'Code.exe'),
+    const input = { platform: 'win32' as NodeJS.Platform, version: '1.143.0', execPath: path.join(temp, 'AppData', 'Local', 'Programs', 'Microsoft VS Code', 'Code.exe'),
         env: { APPDATA: appData, LOCALAPPDATA: localAppData, USERPROFILE: temp }, globalStoragePath: path.join(appData, 'Code', 'User', 'globalStorage', 'hadrian.jupyter-mcp'),
         extensionPath: path.join(temp, '.vscode', 'extensions', 'jupyter-mcp-0.5.0'), extensionId: 'hadrian.jupyter-mcp', appHost: 'desktop' };
     const actual = validateDefaultWindowsInstallForTest(input);
@@ -288,7 +298,7 @@ test('read-only preflight reports bounded state and sanitized exact application 
         assert.strictEqual(result.application.actualWindowCount, 1);
         assert.deepStrictEqual(result.application.nativeWindows, [{ id: 1, rendererProcessPid: 28920 }]);
         assert.deepStrictEqual(result.windowIdentity, {
-            source: 'extension_log_uri', status: 'verified', sourceVersion: '1.142.0', sourceCommit: COMMIT,
+            source: 'extension_log_uri', status: 'verified', sourceVersion: '1.143.0', sourceCommit: COMMIT,
             nativeWindowId: 1, rendererProcessPid: 28920, observedNativeWindowIds: [1], failureCode: null
         });
         assert.ok(result.blockers.includes('automatic_restart_workspace_present'));
@@ -386,6 +396,31 @@ test('window identity fails closed for malformed, ambiguous and unsupported sour
         assert.strictEqual(result.windowIdentity.status, 'unsupported');
         assert.strictEqual(result.windowIdentity.failureCode, 'window_identity_commit_unsupported');
     } finally { wrongCommit.dispose(); await fs.rm(wrongCommit.temp, { recursive: true, force: true }); }
+});
+
+test('restoration refuses the previous build and mixed current-version old-commit identities before arming', async () => {
+    const previousCommit = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
+    for (const [hostVersion, statusVersion, statusCommit, expectedCode] of [
+        ['1.142.0', '1.142.0', previousCommit, 'unsupported_vscode_version'],
+        ['1.143.0', '1.142.0', previousCommit, 'application_identity_unverified'],
+        ['1.143.0', '1.143.0', previousCommit, 'application_identity_unverified']
+    ] as const) {
+        const f = await fixture({ restart: true, native: true });
+        try {
+            await configuredWorkspace(f);
+            f.deps.vscodeVersion = hostVersion;
+            f.deps.runCodeStatus = async () => status().replace('Code 1.143.0', `Code ${statusVersion}`).replace(COMMIT, statusCommit);
+            let arms = 0;
+            f.deps.armHelper = async () => { arms++; };
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const inspected = parsed(await manager.inspect());
+            assert.notStrictEqual(inspected.windowIdentity.status, 'verified');
+            assert.strictEqual(inspected.windowIdentity.nativeWindowId, null);
+            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), expectedCode);
+            assert.strictEqual(arms, 0, 'incompatible identity must not arm a helper');
+            assert.strictEqual(f.quitCalls, 0, 'incompatible identity must not quit');
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
 });
 
 test('window identity rejects duplicate native rows and a derived ID absent from current status', async () => {
@@ -556,10 +591,10 @@ test('failed initialization never publishes a partially initialized global manag
 test('normal status invocation resolves the versioned CLI only through the pinned code.cmd shape', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jupyter-mcp-code-cli-'));
     try {
-        const executable = path.join(temp, 'Code.exe'), cli = path.join(temp, '6d62b1d5da', 'resources', 'app', 'out', 'cli.js');
+        const executable = path.join(temp, 'Code.exe'), cli = path.join(temp, '2d0b7506a3', 'resources', 'app', 'out', 'cli.js');
         await fs.mkdir(path.dirname(cli), { recursive: true }); await fs.mkdir(path.join(temp, 'bin'), { recursive: true });
         await fs.writeFile(cli, '');
-        await fs.writeFile(path.join(temp, 'bin', 'code.cmd'), '@echo off\r\n"%~dp0..\\Code.exe" "%~dp0..\\6d62b1d5da\\resources\\app\\out\\cli.js" %*\r\n');
+        await fs.writeFile(path.join(temp, 'bin', 'code.cmd'), '@echo off\r\n"%~dp0..\\Code.exe" "%~dp0..\\2d0b7506a3\\resources\\app\\out\\cli.js" %*\r\n');
         assert.strictEqual(await resolveInstalledCodeCliForTest(executable), path.resolve(cli));
         await fs.writeFile(path.join(temp, 'bin', 'code.cmd'), 'Code.exe --status');
         await rejectsCode(() => resolveInstalledCodeCliForTest(executable), 'status_unavailable');
@@ -591,6 +626,181 @@ test('restored-workspace mode snapshots configured file and untitled Workspaces 
             assert.ok(Number.isSafeInteger(receipt.quitDispatchApprovedAt));
         } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
     }
+});
+
+test('restored-workspace closes one exact Welcome before snapshot and preserves user-tab multiplicity', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        const configured = await configuredWorkspace(f);
+        const welcome = { label: 'Welcome', input: undefined, isDirty: false };
+        const textTab = state.tabGroups[0].tabs[0];
+        const notebookTab = state.tabGroups[0].tabs[1];
+        const sameLabelNotebook = {
+            label: 'Welcome', input: new TabInputNotebook(configured.notebook, 'jupyter-notebook'), isDirty: false
+        };
+        state.tabGroups = [{ tabs: [welcome, notebookTab, sameLabelNotebook] }, { tabs: [textTab] }];
+
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        assert.strictEqual(prepared.status, 'restart_requested');
+        assert.strictEqual(state.tabCloseCalls.length, 1);
+        assert.strictEqual(state.tabCloseCalls[0][0], welcome);
+        assert.strictEqual(state.tabCloseCalls[0][1], true);
+        assert.deepStrictEqual(state.tabGroups[0].tabs, [notebookTab, sameLabelNotebook]);
+        assert.deepStrictEqual(state.tabGroups[1].tabs, [textTab]);
+
+        const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`), 'utf8'));
+        assert.deepStrictEqual(receipt.restorationSnapshot.tabGroups.map((group: any[]) => group.length).sort(), [1, 2]);
+        const notebookTabs = receipt.restorationSnapshot.tabGroups.flat().filter((tab: any) => tab.kind === 'notebook');
+        assert.strictEqual(notebookTabs.length, 2, 'same-resource notebook multiplicity survives Welcome cleanup');
+        assert.ok(notebookTabs.every((tab: any) => tab.uri === configured.notebook.toString()));
+        assert.deepStrictEqual(receipt.restorationSnapshot.documents.notebooks, [{ uri: configured.notebook.toString(), version: 11 }]);
+        assert.strictEqual(await f.runScheduledQuit(), true);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('restored-workspace never treats dirty, input-bearing or non-Welcome tabs as benign', async () => {
+    const cases: Array<[string, any, string]> = [
+        ['dirty Welcome', { label: 'Welcome', input: undefined, isDirty: true }, 'dirty_tab_present'],
+        ['input-bearing Welcome', { label: 'Welcome', input: new TabInputWebview('welcome'), isDirty: false }, 'tab_input_unsupported'],
+        ['other inputless tab', { label: 'Getting Started', input: undefined, isDirty: false }, 'tab_input_unsupported']
+    ];
+    for (const [name, invalid, code] of cases) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            const benign = { label: 'Welcome', input: undefined, isDirty: false };
+            state.tabGroups[0].tabs.unshift(invalid, benign);
+            let helperCalls = 0;
+            f.deps.armHelper = async () => { helperCalls++; };
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), code);
+            assert.strictEqual(state.tabCloseCalls.length, 0, name);
+            assert.ok(state.tabGroups[0].tabs.includes(benign), name);
+            assert.strictEqual(helperCalls, 0, name);
+            assert.strictEqual(f.quitCalls, 0, name);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace Welcome cleanup fails closed across refusal, cancellation and tab races', async () => {
+    for (const change of ['refused', 'cancelled', 'replacement', 'other-removed'] as const) {
+        const f = await fixture({ restart: true });
+        try {
+            const configured = await configuredWorkspace(f);
+            const welcome = { label: 'Welcome', input: undefined, isDirty: false };
+            const textTab = state.tabGroups[0].tabs[0];
+            state.tabGroups[0].tabs.unshift(welcome);
+            let helperCalls = 0;
+            f.deps.armHelper = async () => { helperCalls++; };
+            state.onTabClose = async (tab: any) => {
+                assert.strictEqual(tab, welcome);
+                if (change === 'refused') return false;
+                if (change === 'cancelled') { f.dispose(); return true; }
+                const tabs = state.tabGroups[0].tabs;
+                tabs.splice(tabs.indexOf(welcome), 1);
+                if (change === 'replacement') {
+                    tabs.unshift({ label: 'replacement', input: new TabInputText(configured.text), isDirty: false });
+                } else {
+                    tabs.splice(tabs.indexOf(textTab), 1);
+                }
+                return true;
+            };
+
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            const expected = change === 'refused' ? 'editor_present' : change === 'cancelled' ? 'cancelled' : 'restoration_snapshot_changed';
+            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), expected);
+            assert.strictEqual(state.tabCloseCalls.length, 1, change);
+            assert.strictEqual(helperCalls, 0, change);
+            assert.strictEqual(f.quitCalls, 0, change);
+            assert.strictEqual(operationGateStateForTest().restartPending, false, change);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace treats proven clean notebook cells as subordinate to their parent notebook', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        const cellDocuments = Array.from({ length: 272 }, (_, index) => ({
+            uri: rawUri(`vscode-notebook-cell:/invented/research.ipynb#cell-${index}`),
+            isDirty: false, isUntitled: false, version: index + 1
+        }));
+        state.documents.push(...cellDocuments);
+        state.notebooks[0].getCells = () => cellDocuments.map(document => ({ document }));
+
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+        assert.strictEqual(prepared.status, 'restart_requested');
+        const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`), 'utf8'));
+        assert.deepStrictEqual(receipt.restorationSnapshot.documents.text, [{ uri: state.documents[0].uri.toString(), version: 7 }]);
+        assert.deepStrictEqual(receipt.restorationSnapshot.documents.notebooks, [{ uri: state.notebooks[0].uri.toString(), version: 11 }]);
+        assert.strictEqual(await f.runScheduledQuit(), true, 'more than 256 clean cells must not exhaust the durable document bound');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('restored-workspace still rejects dirty or untitled notebook cell documents', async () => {
+    for (const property of ['isDirty', 'isUntitled'] as const) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            const cellDocument = {
+                uri: rawUri(`vscode-notebook-cell:/invented/research.ipynb#${property}`),
+                isDirty: false, isUntitled: false, version: 1, [property]: true
+            };
+            state.documents.push(cellDocument);
+            state.notebooks[0].getCells = () => [{ document: cellDocument }];
+
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'open_document_unsupported');
+            assert.strictEqual(f.quitCalls, 0, property);
+            assert.strictEqual(operationGateStateForTest().restartPending, false, property);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace retains the document bound for file-backed and unrelated virtual resources', async () => {
+    for (const kind of ['file', 'unrelated-virtual'] as const) {
+        const f = await fixture({ restart: true });
+        try {
+            await configuredWorkspace(f);
+            state.documents = Array.from({ length: 257 }, (_, index) => ({
+                uri: kind === 'file'
+                    ? fileUri(path.join(f.temp, 'invented-documents', `${index}.txt`))
+                    : rawUri(`vscode-notebook-cell:/invented/unrelated.ipynb#cell-${index}`),
+                isDirty: false, isUntitled: false, version: index + 1
+            }));
+            state.notebooks[0].getCells = () => [];
+
+            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'document_inventory_unbounded');
+            assert.strictEqual(f.quitCalls, 0, kind);
+            assert.strictEqual(operationGateStateForTest().restartPending, false, kind);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace retains the parent notebook version as a pre-quit mutation guard', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        await configuredWorkspace(f);
+        const cellDocument = {
+            uri: rawUri('vscode-notebook-cell:/invented/research.ipynb#version-guard'),
+            isDirty: false, isUntitled: false, version: 1
+        };
+        state.documents.push(cellDocument);
+        state.notebooks[0].getCells = () => [{ document: cellDocument }];
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
+        const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
+
+        state.notebooks[0].version++;
+        assert.strictEqual(await f.runScheduledQuit(), false);
+        assert.strictEqual(f.quitCalls, 0);
+        const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`), 'utf8'));
+        assert.strictEqual(receipt.status, 'failed');
+        assert.strictEqual(receipt.failure, 'quit_preflight_changed');
+        assert.strictEqual(operationGateStateForTest().restartPending, false);
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
 });
 
 test('restored-workspace folderUri may only identify an existing root and never changes workspace shape', async () => {
@@ -699,7 +909,8 @@ test('working native binding returns restored preparation without restart or dis
         f.deps.hasBackgroundWork = () => true;
         state.documents = [{ uri: rawUri('untitled:native-dirty-text'), isDirty: true, isUntitled: true, version: 17 }];
         state.notebooks = [{ uri: rawUri('untitled:native-dirty-notebook'), isDirty: true, isUntitled: true, version: 23 }];
-        state.tabGroups = [{ tabs: [{ label: 'dirty webview', input: new TabInputWebview('native-ready'), isDirty: true }] }];
+        const welcome = { label: 'Welcome', input: undefined, isDirty: false };
+        state.tabGroups = [{ tabs: [welcome, { label: 'dirty webview', input: new TabInputWebview('native-ready'), isDirty: true }] }];
         state.terminals = [{}]; state.activeDebugSession = { id: 'native-ready-debug' };
         state.restoreWindows = 'none'; state.confirmBeforeClose = 'always';
         const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
@@ -712,6 +923,7 @@ test('working native binding returns restored preparation without restart or dis
         assert.strictEqual(statusCalls, 2, 'native-ready mode sandwiches a fresh marker proof between app/window identity checks');
         assert.strictEqual(markerCalls, 2);
         assert.strictEqual(savedStateCalls, 0, 'native-ready mode does not inspect restart-only saved state');
+        assert.deepStrictEqual(state.tabCloseCalls, [], 'native-ready mode does not inspect or close Welcome tabs');
         const receipt = JSON.parse(await fs.readFile(path.join(f.root, 'colab-environment-receipts', `${ready.preparationId}.json`), 'utf8'));
         assert.strictEqual(receipt.restorationSnapshot.savedState, undefined);
         assert.strictEqual(receipt.restorationSnapshot.tabGroups, undefined);
@@ -1122,23 +1334,63 @@ test('a restored failure after receipt creation but before helper dispatch relea
     } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
 });
 
-test('restored-workspace startup arguments accept only an unambiguous current path', async () => {
-    const allowed = await fixture({ restart: true });
+test('restored-workspace treats one safe original launch path as historical provenance', async () => {
+    const f = await fixture({ restart: true });
     try {
-        const configured = await configuredWorkspace(allowed);
-        allowed.deps.runCodeStatus = async () => status(`--new-window ${configured.root.fsPath}`);
-        const manager = createColabEnvironmentForTest(allowed.context, allowed.deps); await manager.initialize();
+        const configured = await configuredWorkspace(f, 'untitled');
+        const historicalPath = 'C:\\HistoricalLaunchMarker\\Research';
+        assert.notStrictEqual(historicalPath, configured.root.fsPath);
+        f.deps.runCodeStatus = async () => status(`--new-window ${historicalPath} --crash-reporter-id ${CRASH}`);
+        const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
         const prepared = parsed(await manager.prepare(undefined, 'restore-clean-workspace'));
         assert.strictEqual(prepared.status, 'restart_requested');
-    } finally { allowed.dispose(); await fs.rm(allowed.temp, { recursive: true, force: true }); }
+        const persisted = await fs.readFile(
+            path.join(f.root, 'colab-environment-receipts', `${prepared.preparationId}.json`), 'utf8'
+        );
+        assert.ok(!persisted.includes('HistoricalLaunchMarker'), 'historical launch provenance is never persisted or replayed');
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
 
-    for (const args of ['--unknown-flag', 'C:\\different-root']) {
-        const f = await fixture({ restart: true });
-        try {
-            await configuredWorkspace(f); f.deps.runCodeStatus = async () => status(args);
-            const manager = createColabEnvironmentForTest(f.context, f.deps); await manager.initialize();
-            await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'startup_arguments_unsupported');
-        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+test('restored startup provenance accepts only one ordinary bounded Windows path', async () => {
+    for (const args of [
+        [],
+        ['--new-window'],
+        ['C:\\Current\\Root'],
+        ['C:\\Current\\Research.code-workspace'],
+        ['--new-window', 'D:/Historical/Research', '--crash-reporter-id', CRASH],
+        ['--crash-reporter-id', CRASH, 'C:\\Historical\\Research']
+    ]) assert.doesNotThrow(() => assertSafeRestoredInitialArgsForTest(args));
+
+    const rejected: Array<[string, string[]]> = [
+        ['unknown flag', ['--unknown-flag']],
+        ['multiple new-window flags', ['--new-window', '--new-window']],
+        ['relative path', ['relative\\path']],
+        ['drive-relative path', ['C:relative\\path']],
+        ['file URI', ['file:///C:/Historical/Research']],
+        ['other URI', ['vscode://historical/research']],
+        ['UNC path', ['\\\\server\\share']],
+        ['device path', ['\\\\?\\C:\\Historical\\Research']],
+        ['control character', [`C:\\Historical\\bad\u0001name`]],
+        ['whitespace-ambiguous path', ['C:\\Historical Research']],
+        ['double quote', ['"C:\\Historical\\Research"']],
+        ['single quote', ["C:\\Historical\\Research'"]],
+        ['less-than character', ['C:\\Historical\\bad<name']],
+        ['greater-than character', ['C:\\Historical\\bad>name']],
+        ['pipe character', ['C:\\Historical\\bad|name']],
+        ['question character', ['C:\\Historical\\bad?name']],
+        ['asterisk character', ['C:\\Historical\\bad*name']],
+        ['alternate-data-stream colon', ['C:\\Historical\\Research:stream']],
+        ['too long', [`C:\\${'x'.repeat(4094)}`]],
+        ['multiple positional paths', ['C:\\Historical\\One', 'D:\\Historical\\Two']],
+        ['dot segment', ['C:\\Historical\\.\\Research']],
+        ['dotdot segment', ['C:\\Historical\\..\\Research']]
+    ];
+    for (const [name, args] of rejected) {
+        assert.throws(
+            () => assertSafeRestoredInitialArgsForTest(args),
+            (error: ColabEnvironmentError) => error.code === 'startup_arguments_unsupported',
+            name
+        );
     }
 });
 
@@ -1153,6 +1405,88 @@ test('restored-workspace metadata reader rejects missing, malformed and oversize
             await rejectsCode(() => manager.prepare(undefined, 'restore-clean-workspace'), 'restoration_metadata_unavailable');
             assert.strictEqual(f.quitCalls, 0);
             assert.strictEqual((await fs.readdir(path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces'))).length, 0, 'metadata inspection must not clean state');
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+});
+
+test('restored-workspace registry strings share the bounded 4096-character ceiling', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        const configured = await configuredWorkspace(f);
+        const storagePath = path.join(f.deps.env.APPDATA!, 'Code', 'User', 'globalStorage', 'storage.json');
+        const writeFolder = async (folderUri: unknown, remoteAuthority: unknown): Promise<void> => {
+            await fs.writeFile(storagePath, JSON.stringify({ backupWorkspaces: {
+                workspaces: [{ id: 'configured', configURIPath: 'file:///configured.code-workspace' }],
+                folders: [{ folderUri, remoteAuthority }], emptyWindows: []
+            } }));
+        };
+
+        for (const length of [874, 4096]) {
+            await writeFolder('f'.repeat(length), 'r'.repeat(length));
+            const observed = await inspectSavedStateMetadataForTest(
+                path.join(f.deps.env.APPDATA!, 'Code'), configured.workspaceFile
+            );
+            assert.deepStrictEqual(observed.backupRegistry, { workspaces: 1, folders: 1, emptyWindows: 0 });
+        }
+
+        for (const invalidAuthority of ['r'.repeat(4097), 7]) {
+            await writeFolder('f'.repeat(874), invalidAuthority);
+            await rejectsCode(
+                () => inspectSavedStateMetadataForTest(path.join(f.deps.env.APPDATA!, 'Code'), configured.workspaceFile),
+                'restoration_metadata_unavailable'
+            );
+        }
+        await writeFolder('f'.repeat(4097), 'r'.repeat(874));
+        await rejectsCode(
+            () => inspectSavedStateMetadataForTest(path.join(f.deps.env.APPDATA!, 'Code'), configured.workspaceFile),
+            'restoration_metadata_unavailable'
+        );
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('restored-workspace metadata matches the real bare untitled Workspace directory identifier', async () => {
+    const f = await fixture({ restart: true });
+    try {
+        const workspaceId = '1792448431555';
+        await fs.mkdir(path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces', workspaceId));
+        const observed = await inspectSavedStateMetadataForTest(
+            path.join(f.deps.env.APPDATA!, 'Code'), rawUri(`untitled:${workspaceId}`)
+        );
+        assert.deepStrictEqual(observed.untitledWorkspaces, [{ name: workspaceId, kind: 'directory' }]);
+        assert.deepStrictEqual(observed.backupRegistry, { workspaces: 1, folders: 0, emptyWindows: 0 });
+    } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+});
+
+test('restored-workspace metadata rejects mismatched, ambiguous and malformed untitled identifiers', async () => {
+    const cases: Array<[string, (root: string) => Promise<any>, string]> = [
+        ['mismatch', async root => { await fs.mkdir(path.join(root, 'registered')); return rawUri('untitled:different'); }, 'untitled_workspace_ambiguous'],
+        ['ambiguous', async root => {
+            await fs.mkdir(path.join(root, 'registered')); await fs.mkdir(path.join(root, 'other'));
+            return rawUri('untitled:registered');
+        }, 'untitled_workspace_ambiguous'],
+        ['registered file', async root => { await fs.writeFile(path.join(root, 'registered'), '{}'); return rawUri('untitled:registered'); }, 'untitled_workspace_ambiguous']
+    ];
+    for (const [name, setup, code] of cases) {
+        const f = await fixture({ restart: true });
+        try {
+            const root = path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces');
+            const workspaceFile = await setup(root);
+            await rejectsCode(() => inspectSavedStateMetadataForTest(path.join(f.deps.env.APPDATA!, 'Code'), workspaceFile), code);
+        } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
+    }
+
+    for (const value of [
+        'untitled:', 'untitled:.', 'untitled:..', 'untitled:parent/child', 'untitled:parent\\child',
+        'untitled://authority/registered', 'untitled:registered?query=1', 'untitled:registered#fragment'
+    ]) {
+        const f = await fixture({ restart: true });
+        try {
+            const root = path.join(f.deps.env.APPDATA!, 'Code', 'Workspaces');
+            await fs.mkdir(path.join(root, 'registered'));
+            await rejectsCode(
+                () => inspectSavedStateMetadataForTest(path.join(f.deps.env.APPDATA!, 'Code'), rawUri(value)),
+                'untitled_workspace_ambiguous'
+            );
         } finally { f.dispose(); await fs.rm(f.temp, { recursive: true, force: true }); }
     }
 });
@@ -1864,6 +2198,7 @@ test('restored helper revalidates metadata and launches without a positional wor
     ]);
     assert.ok(!restored.launches[0].args.includes('--new-window'));
     assert.ok(!restored.launches[0].args.includes('C:\\workspace'));
+    assert.ok(!restored.launches[0].args.some((arg: string) => arg.includes('HistoricalLaunchMarker')), 'historical launch provenance is never replayed');
     restored.runTimer();
     assert.strictEqual(restored.receipt.status, 'app_launched');
     assert.ok(Number.isSafeInteger(restored.receipt.preSpawnAt));
@@ -1889,6 +2224,43 @@ test('restored helper revalidates metadata and launches without a positional wor
     assert.strictEqual(invalidMode.receipt.status, 'failed');
     assert.strictEqual(invalidMode.receipt.failure, 'helper_receipt_invalid');
     assert.strictEqual(invalidMode.launches.length, 0);
+});
+
+test('restored helper enforces the 4096-character registry bound at arm and before launch', async () => {
+    const folder = (length: number, remoteAuthority: unknown) => ({
+        folderUri: 'f'.repeat(length), remoteAuthority
+    });
+    for (const length of [874, 4096]) {
+        const valid = helperHarness({
+            approved: true, observations: ['exited'], restored: true,
+            initialFolderBackup: folder(length, 'r'.repeat(length))
+        });
+        assert.strictEqual(valid.receipt.status, 'restart_requested', `${length}-character strings must pass helper arming`);
+        valid.runTimer();
+        assert.strictEqual(valid.launches.length, 1, `${length}-character strings must pass the pre-launch metadata check`);
+        assert.strictEqual(valid.receipt.status, 'restart_requested');
+    }
+
+    for (const [name, invalidAuthority] of [['4097-character', 'r'.repeat(4097)], ['non-string', 7]] as const) {
+        const invalidAtArm = helperHarness({
+            approved: true, observations: ['exited'], restored: true,
+            initialFolderBackup: folder(874, invalidAuthority)
+        });
+        assert.strictEqual(invalidAtArm.receipt.status, 'failed', `${name} authority must fail helper arming`);
+        assert.strictEqual(invalidAtArm.receipt.failure, 'helper_receipt_invalid');
+        assert.strictEqual(invalidAtArm.launches.length, 0);
+
+        const invalidAfterArm = helperHarness({
+            approved: true, observations: ['exited'], restored: true,
+            initialFolderBackup: folder(874, 'r'.repeat(874))
+        });
+        assert.strictEqual(invalidAfterArm.receipt.status, 'restart_requested');
+        invalidAfterArm.mutateStorage(value => { value.backupWorkspaces.folders[0].remoteAuthority = invalidAuthority; });
+        invalidAfterArm.runTimer();
+        assert.strictEqual(invalidAfterArm.receipt.status, 'failed', `${name} authority must fail the pre-launch metadata check`);
+        assert.strictEqual(invalidAfterArm.receipt.failure, 'restoration_state_changed');
+        assert.strictEqual(invalidAfterArm.launches.length, 0);
+    }
 });
 
 test('fixed helper retries unknown receipt/process observations but permanently rejects changed identity', async () => {

@@ -12,8 +12,8 @@ import { assertNoExposedNotebookKernelsForRestart, hasGlobalNotebookExecutionWor
 import { acquireRestartExclusion, assertMutationAllowed, OperationGateError, RestartExclusion } from './operationGate';
 
 const SCHEMA = 1;
-const SUPPORTED_VERSION = '1.142.0';
-const SUPPORTED_COMMIT = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
+const SUPPORTED_VERSION = '1.143.0';
+const SUPPORTED_COMMIT = '2d0b7506a36c1d6db9a466440131a8e01eab2289';
 const SUPPORTED_EXTENSION_ID = 'Happypig375.vscode-jupyter-mcp-server';
 const MAX_NATIVE_WINDOWS = 64;
 const PREPARATION_MS = 120_000;
@@ -347,7 +347,7 @@ class ColabEnvironmentManager {
             tabs: {
                 total: tabs.length,
                 dirty: tabs.filter(tab => tab.isDirty).length,
-                benignWelcomeOnly: tabs.length === 1 && tabs[0].label === 'Welcome' && tabs[0].input === undefined && !tabs[0].isDirty
+                benignWelcomeOnly: tabs.length === 1 && isBenignWelcomeTab(tabs[0])
             },
             terminals: { total: vscode.window.terminals.length },
             debugging: { active: Boolean(vscode.debug.activeDebugSession) },
@@ -684,7 +684,7 @@ class ColabEnvironmentManager {
                 return this.present(receipt, true);
             }
 
-            const initial = captureRestorationPublicState();
+            const initial = await this.captureRestorationStateAfterWelcomeCleanup(prepareRequest);
             assertSameRestorationWorkspace(initialWorkspace, initial);
             const savedState = await this.deps.inspectSavedState(install.userDataDir, vscode.workspace.workspaceFile!);
             const snapshot: RestorationSnapshot = { ...initial, savedState };
@@ -811,6 +811,40 @@ class ColabEnvironmentManager {
         } finally {
             this.finishRestorePreparation(prepareRequest);
         }
+    }
+
+    private async captureRestorationStateAfterWelcomeCleanup(prepareRequest: symbol): Promise<RestorationPublicState> {
+        const assertRequestOwnsExclusion = (): void => {
+            const exclusion = this.restoreExclusion;
+            if (!exclusion || exclusion.prepareRequest !== prepareRequest) {
+                throw new OperationGateError('restart_exclusion_lost', 'The restored-workspace prepare request no longer owns its mutation exclusion.');
+            }
+            exclusion.handle.assertHeld();
+        };
+        assertRequestOwnsExclusion();
+        const tabs = vscode.window.tabGroups.all.flatMap(group => [...group.tabs]);
+        const candidates = tabs.filter(isBenignWelcomeTab);
+        if (candidates.length !== 1) return captureRestorationPublicState();
+
+        const candidate = candidates[0];
+        // Validate the complete proposed post-cleanup state before mutating the
+        // workbench. Only this exact benign tab is ignored by the proposal.
+        const expected = captureRestorationPublicState(candidate);
+        let closed = false;
+        try { closed = await vscode.window.tabGroups.close(candidate, true); }
+        catch { /* handled as a refused exact close below */ }
+        if (this.disposed) {
+            throw new ColabEnvironmentError('cancelled', 'Restored-workspace preparation was cancelled during Welcome-tab cleanup.');
+        }
+        assertRequestOwnsExclusion();
+        if (!closed) throw new ColabEnvironmentError('editor_present', 'The benign Welcome tab could not be closed.');
+
+        // A close await can yield to editor changes. Require the entire public
+        // state to equal the proposal so a replacement, removed user tab or
+        // changed group membership cannot become the approved snapshot.
+        const actual = captureRestorationPublicState();
+        assertSameRestorationPublicState(expected, actual);
+        return actual;
     }
 
     async get(preparationId: string): Promise<string> {
@@ -1182,7 +1216,7 @@ class ColabEnvironmentManager {
         const postLaunch = receipt?.restartMode === 'restore-clean-workspace' && receipt.restartRequired === true &&
             (receipt.status === 'app_launched' || receipt.status === 'environment_ready');
         if (postLaunch) assertRestoredLaunchArgs(status.processArgsLine, receipt!);
-        else if (!skipInitialArguments) assertSafeRestoredInitialArgs(status.processArgs, snapshot);
+        else if (!skipInitialArguments) assertSafeRestoredInitialArgs(status.processArgs);
         const windowId = nativeWindowIdFromLogUri(this.context, this.deps);
         if (status.windows[0].id !== windowId) {
             throw new ColabEnvironmentError('window_identity_status_row_mismatch', 'The extension window did not match the sole native VS Code window.');
@@ -1466,7 +1500,7 @@ function captureRestoredResourceState(): RestorationResourceState {
     return { ...workspace, tabGroups };
 }
 
-function captureRestorationPublicState(): RestorationPublicState {
+function captureRestorationPublicState(ignoredBenignWelcome?: vscode.Tab): RestorationPublicState {
     const workspace = captureRestorationWorkspaceState();
     const restoreWindows = classifyRestoreWindows(vscode.workspace.getConfiguration('window').get<string>('restoreWindows'));
     if (restoreWindows !== 'all' && restoreWindows !== 'preserve') {
@@ -1480,7 +1514,21 @@ function captureRestorationPublicState(): RestorationPublicState {
 
     const notebooks = [...vscode.workspace.notebookDocuments];
     const texts = [...vscode.workspace.textDocuments];
-    if (notebooks.length > MAX_RESTORE_ITEMS || texts.length > MAX_RESTORE_ITEMS) {
+    if (notebooks.length > MAX_RESTORE_ITEMS) {
+        throw new ColabEnvironmentError('document_inventory_unbounded', 'The open document inventory exceeded the restored-workspace bound.');
+    }
+    // Notebook cells also appear in workspace.textDocuments, but they are
+    // subordinate to the file-backed notebook already captured below. Exempt
+    // only exact cell-document identities exposed by those open notebooks;
+    // file-backed and unrelated virtual documents retain the original bound.
+    const notebookCellDocumentUris = new Set<string>();
+    for (const notebook of notebooks) {
+        for (const cell of notebook.getCells()) notebookCellDocumentUris.add(cell.document.uri.toString());
+    }
+    const independentTextCount = texts.reduce((count, document) => count + (
+        document.uri.scheme !== 'file' && notebookCellDocumentUris.has(document.uri.toString()) ? 0 : 1
+    ), 0);
+    if (independentTextCount > MAX_RESTORE_ITEMS) {
         throw new ColabEnvironmentError('document_inventory_unbounded', 'The open document inventory exceeded the restored-workspace bound.');
     }
     if (notebooks.some(document => document.isDirty || document.isUntitled || document.uri.scheme !== 'file')) {
@@ -1503,20 +1551,37 @@ function captureRestorationPublicState(): RestorationPublicState {
     }).sort(compareUriVersion);
 
     let tabCount = 0;
+    let ignoredWelcomeCount = 0;
     const tabGroups = vscode.window.tabGroups.all.map(group => {
         tabCount += group.tabs.length;
         if (tabCount > MAX_RESTORE_ITEMS) throw new ColabEnvironmentError('tab_inventory_unbounded', 'The tab inventory exceeded the restored-workspace bound.');
-        return [...group.tabs].map(tab => {
+        const identities: RestorationTab[] = [];
+        for (const tab of group.tabs) {
+            if (tab === ignoredBenignWelcome) {
+                ignoredWelcomeCount++;
+                if (!isBenignWelcomeTab(tab)) {
+                    throw new ColabEnvironmentError('tab_input_unsupported', 'Only one exact clean Welcome tab may be omitted before restored-workspace restart.');
+                }
+                continue;
+            }
             if (tab.isDirty) throw new ColabEnvironmentError('dirty_tab_present', 'Dirty tabs prevent restored-workspace restart.');
-            return restorationTabIdentity(tab.input);
-        }).sort(compareJson);
+            identities.push(restorationTabIdentity(tab.input));
+        }
+        return identities.sort(compareJson);
     }).filter(group => group.length > 0).sort(compareJson);
+    if (ignoredBenignWelcome && ignoredWelcomeCount !== 1) {
+        throw new ColabEnvironmentError('restoration_snapshot_changed', 'The benign Welcome tab changed before restored-workspace cleanup.');
+    }
 
     return {
         ...workspace,
         tabGroups,
         documents: { text: textDocuments, notebooks: notebookDocuments }
     };
+}
+
+function isBenignWelcomeTab(tab: vscode.Tab): boolean {
+    return tab.label === 'Welcome' && tab.input === undefined && !tab.isDirty;
 }
 
 function restorationTabIdentity(input: unknown): RestorationTab {
@@ -1614,9 +1679,14 @@ async function inspectSavedStateMetadata(userDataDir: string, workspaceFile: vsc
     if (workspaceFile.scheme === 'file') {
         if (entries.length !== 0) throw new ColabEnvironmentError('other_untitled_workspace_present', 'Another untitled Workspace is registered in the default profile.');
     } else {
-        const relative = path.relative(workspacesRoot, path.resolve(workspaceFile.fsPath));
-        const first = relative.split(/[\\/]+/)[0];
-        if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || !first || entries.length !== 1 || entries[0].name !== first) {
+        // VS Code exposes an untitled Workspace as untitled:<directory-id>,
+        // not as the configuration's absolute filesystem path. Match only that
+        // bounded bare identifier to the sole registered Workspace directory.
+        const workspaceId = workspaceFile.path;
+        if (workspaceFile.scheme !== 'untitled' || workspaceFile.authority || workspaceFile.query || workspaceFile.fragment ||
+            !workspaceId || workspaceId.length > 255 || workspaceId === '.' || workspaceId === '..' ||
+            /[\\/\0\r\n]/.test(workspaceId) || entries.length !== 1 ||
+            entries[0].kind !== 'directory' || entries[0].name !== workspaceId) {
             throw new ColabEnvironmentError('untitled_workspace_ambiguous', 'The current untitled Workspace did not uniquely match the default-profile Workspace registry.');
         }
     }
@@ -1648,7 +1718,7 @@ function boundedRegistryArray(value: unknown, kind: 'workspace' | 'folder' | 'em
         const record = item as Record<string, unknown>;
         const required = kind === 'workspace' ? ['id', 'configURIPath'] : kind === 'folder' ? ['folderUri'] : ['backupFolder'];
         if (required.some(key => typeof record[key] !== 'string' || !(record[key] as string).length || (record[key] as string).length > 4096) ||
-            (record.remoteAuthority !== undefined && (typeof record.remoteAuthority !== 'string' || record.remoteAuthority.length > 256))) {
+            (record.remoteAuthority !== undefined && (typeof record.remoteAuthority !== 'string' || record.remoteAuthority.length > 4096))) {
             throw new ColabEnvironmentError('restoration_metadata_unavailable', 'Backup registry entry was malformed.');
         }
     }
@@ -1666,7 +1736,7 @@ function assertWorkspaceConversionSafe(): void {
         throw new ColabEnvironmentError('open_document_present', 'Close user documents before workspace preparation.');
     }
     const tabs = vscode.window.tabGroups.all.flatMap(group => [...group.tabs]);
-    if (tabs.some(tab => tab.label !== 'Welcome' || tab.input !== undefined || tab.isDirty)) {
+    if (tabs.some(tab => !isBenignWelcomeTab(tab))) {
         throw new ColabEnvironmentError('editor_present', 'Close editor tabs before workspace preparation.');
     }
 }
@@ -1857,7 +1927,7 @@ async function assertCleanEmptyWindow(): Promise<void> {
         throw new ColabEnvironmentError('open_document_present', 'Close all user documents before automatic VS Code restart.');
     }
     let tabs = vscode.window.tabGroups.all.flatMap(group => [...group.tabs]);
-    if (tabs.length === 1 && tabs[0].label === 'Welcome' && tabs[0].input === undefined && !tabs[0].isDirty) {
+    if (tabs.length === 1 && isBenignWelcomeTab(tabs[0])) {
         const closed = await vscode.window.tabGroups.close(tabs[0], true);
         if (!closed) throw new ColabEnvironmentError('editor_present', 'The benign Welcome tab could not be closed.');
         tabs = vscode.window.tabGroups.all.flatMap(group => [...group.tabs]);
@@ -1906,20 +1976,23 @@ function withoutCrashReporter(args: string[]): string[] {
     return remaining;
 }
 
-function assertSafeRestoredInitialArgs(args: string[], snapshot: RestorationWorkspaceState): void {
+function assertSafeRestoredInitialArgs(args: string[]): void {
     const remaining = withoutCrashReporter(args);
     const newWindows = remaining.filter(value => value === '--new-window').length;
     if (newWindows > 1) throw new ColabEnvironmentError('startup_arguments_unsupported', 'Multiple --new-window arguments are unsupported.');
     if (newWindows === 1) remaining.splice(remaining.indexOf('--new-window'), 1);
     if (!remaining.length) return;
-    if (remaining.length !== 1 || remaining[0].startsWith('-') || /\s/.test(remaining[0])) {
-        throw new ColabEnvironmentError('startup_arguments_unsupported', 'Only one unambiguous current Workspace/root positional path is accepted.');
+    const candidate = remaining[0] ?? '';
+    const segments = candidate.length >= 3 ? candidate.slice(3).split(/[\\/]/) : [];
+    if (remaining.length !== 1 || candidate.length > 4096 || !/^[A-Za-z]:[\\/]/.test(candidate) ||
+        /\s|[\u0000-\u001f\u007f-\u009f"'<>|?*]/.test(candidate) || candidate.slice(2).includes(':') ||
+        segments.some(segment => segment === '.' || segment === '..')) {
+        throw new ColabEnvironmentError('startup_arguments_unsupported', 'Only one unambiguous ordinary Windows launch path is accepted.');
     }
-    const candidates = snapshot.workspace.roots.map(root => vscode.Uri.parse(root.uri).fsPath);
-    if (snapshot.workspace.kind === 'file') candidates.push(vscode.Uri.parse(snapshot.workspace.uri).fsPath);
-    if (!candidates.some(candidate => samePath(candidate, remaining[0]))) {
-        throw new ColabEnvironmentError('startup_arguments_unsupported', 'The positional startup path did not match this configured Workspace.');
-    }
+}
+
+export function assertSafeRestoredInitialArgsForTest(args: string[]): void {
+    assertSafeRestoredInitialArgs(args);
 }
 
 function assertRestoredLaunchArgs(processArgsLine: string, receipt: Receipt): void {
@@ -2207,7 +2280,7 @@ function validRestorationTab(tab: any): boolean {
 // honors a receipt that the surviving extension host has disarmed.
 export const HELPER_SOURCE_FOR_TEST = String.raw`'use strict';
 const fs=require('fs'),path=require('path'),cp=require('child_process');
-const [receiptPath,id,token]=process.argv.slice(2); const MAX=65536,META=1048576,LIFE=120000,ITEMS=256,COMMIT='6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
+const [receiptPath,id,token]=process.argv.slice(2); const MAX=65536,META=1048576,LIFE=120000,ITEMS=256,COMMIT='2d0b7506a36c1d6db9a466440131a8e01eab2289';
 function read(){const b=fs.readFileSync(receiptPath);if(b.length>=MAX)throw Error('receipt too large');return JSON.parse(b.toString('utf8'));}
 function write(v){const s=JSON.stringify(v);if(Buffer.byteLength(s)>=MAX)throw Error('receipt too large');const t=receiptPath+'.'+process.pid+'.tmp';try{fs.writeFileSync(t,s,{encoding:'utf8',flag:'wx'});try{fs.renameSync(t,receiptPath);}catch(e){if(e.code!=='EEXIST'&&e.code!=='EPERM')throw e;fs.rmSync(receiptPath,{force:true});fs.renameSync(t,receiptPath);}}finally{try{fs.rmSync(t,{force:true});}catch{}}}
 function fail(code){try{const r=read();if(r.preparationId===id&&r.helperToken===token){r.status='failed';r.failure=code;write(r);}}catch{}process.exit(0);}
@@ -2222,7 +2295,7 @@ function tab(v){if(!v||!['text','notebook','custom','text-diff','notebook-diff']
 function snapshot(v){if(!v||v.schema!==1||!v.workspace||!['file','untitled'].includes(v.workspace.kind)||!bounded(v.workspace.uri,4096)||(v.workspace.kind==='file'?!/^file:/i.test(v.workspace.uri):!/^untitled:/i.test(v.workspace.uri))||!Array.isArray(v.workspace.roots)||!v.workspace.roots.length||v.workspace.roots.length>64||v.workspace.roots.some(x=>!x||!file(x.uri)||!bounded(x.name,512)))return false;if(!Array.isArray(v.tabGroups)||v.tabGroups.length>ITEMS||v.tabGroups.some(g=>!Array.isArray(g)||g.length>ITEMS||g.some(x=>!tab(x)))||v.tabGroups.reduce((n,g)=>n+g.length,0)>ITEMS)return false;if(!v.documents||!versions(v.documents.text)||!versions(v.documents.notebooks))return false;const s=v.savedState,b=s&&s.backupRegistry;return !!s&&Array.isArray(s.untitledWorkspaces)&&s.untitledWorkspaces.length<=64&&s.untitledWorkspaces.every(x=>x&&bounded(x.name,255)&&['file','directory'].includes(x.kind))&&b&&Number.isSafeInteger(b.workspaces)&&b.workspaces>=0&&b.workspaces<=ITEMS&&Number.isSafeInteger(b.folders)&&b.folders>=0&&b.folders<=ITEMS&&b.emptyWindows===0;}
 function valid(r,status){if(!r||r.schema!==1||r.preparationId!==id||!uuid(r.nonce)||r.helperToken!==token||!uuid(token)||r.status!==status||!Number.isSafeInteger(r.createdAt)||!Number.isSafeInteger(r.deadline)||r.deadline<=r.createdAt||r.deadline>r.createdAt+LIFE||!bounded(r.workspaceUri,4096)||!bounded(r.expectedWindowLabel,512)||!Number.isInteger(r.port)||r.port<=0||r.port>65535||typeof r.generatedWorkspace!=='boolean'||!r.main||!Number.isSafeInteger(r.main.pid)||r.main.pid<=0||!bounded(r.main.creationTime,128)||Number.isNaN(Date.parse(r.main.creationTime))||!bounded(r.userDataDir,4096)||!bounded(r.extensionsDir,4096)||!bounded(r.executablePath,4096)||!same(r.executablePath,r.main.executablePath))return false;if(r.helperArmedAt!==undefined&&(!Number.isSafeInteger(r.helperArmedAt)||r.helperArmedAt<r.createdAt||r.helperArmedAt>r.deadline))return false;if(r.quitDispatchApprovedAt!==undefined&&(!Number.isSafeInteger(r.quitDispatchApprovedAt)||r.quitDispatchApprovedAt<r.createdAt||r.quitDispatchApprovedAt>r.deadline))return false;if(r.preSpawnAt!==undefined&&(!Number.isSafeInteger(r.preSpawnAt)||r.preSpawnAt<r.createdAt||r.preSpawnAt>r.deadline))return false;if(r.restartMode!==undefined&&!restored(r))return false;if(restored(r))return r.restartRequired===true&&r.generatedWorkspace===false&&r.workspacePath===undefined&&r.folderPreparation===undefined&&r.installedCommit===COMMIT&&snapshot(r.restorationSnapshot)&&r.workspaceUri===r.restorationSnapshot.workspace.uri;return bounded(r.workspacePath,4096);}
 function fixed(v){const c={...v};for(const k of ['status','helperArmedAt','quitDispatchApprovedAt','preSpawnAt','launchedAt','launchPid','readyAt','failure'])delete c[k];return JSON.stringify(c);}
-function registry(v,keys){return Array.isArray(v)&&v.length<=ITEMS&&v.every(x=>x&&typeof x==='object'&&!Array.isArray(x)&&keys.every(k=>bounded(x[k],4096))&&(x.remoteAuthority===undefined||(typeof x.remoteAuthority==='string'&&x.remoteAuthority.length<=256)));}
+function registry(v,keys){return Array.isArray(v)&&v.length<=ITEMS&&v.every(x=>x&&typeof x==='object'&&!Array.isArray(x)&&keys.every(k=>bounded(x[k],4096))&&(x.remoteAuthority===undefined||(typeof x.remoteAuthority==='string'&&x.remoteAuthority.length<=4096)));}
 function saved(r){if(!restored(r))return true;const expected=r.restorationSnapshot.savedState;if(!expected||!Array.isArray(expected.untitledWorkspaces)||!expected.backupRegistry)return false;const root=path.join(r.userDataDir,'Workspaces');const entries=fs.readdirSync(root,{withFileTypes:true});if(entries.length>64)return false;const projected=entries.map(e=>{if(!e.name||e.name.length>255||(!e.isFile()&&!e.isDirectory()))throw Error('entry');return {name:e.name,kind:e.isDirectory()?'directory':'file'};}).sort((a,b)=>a.name.localeCompare(b.name));const file=path.join(r.userDataDir,'User','globalStorage','storage.json');const bytes=fs.readFileSync(file);if(!bytes.length||bytes.length>META)return false;const storage=JSON.parse(bytes.toString('utf8')),b=storage&&storage.backupWorkspaces;if(!b||!registry(b.workspaces,['id','configURIPath'])||!registry(b.folders,['folderUri'])||!registry(b.emptyWindows,['backupFolder'])||b.emptyWindows.length!==0)return false;const actual={untitledWorkspaces:projected,backupRegistry:{workspaces:b.workspaces.length,folders:b.folders.length,emptyWindows:0}};return JSON.stringify(actual)===JSON.stringify(expected);}
 let r,baseline;try{r=read();if(!valid(r,'arming_restart')||Date.now()>r.deadline||!saved(r))throw Error('receipt mismatch');baseline=fixed(r);r.status='restart_requested';r.helperArmedAt=Date.now();write(r);if(process.send)process.send({type:'armed',preparationId:id,token});}catch{fail('helper_receipt_invalid');}
 function current(v,status){return valid(v,status)&&(!restored(v)||fixed(v)===baseline);}

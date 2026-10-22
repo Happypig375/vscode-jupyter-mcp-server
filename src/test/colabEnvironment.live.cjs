@@ -2,7 +2,8 @@
 // It uses a fresh profile, empty extension directory, and a bundled development extension
 // whose manifest has no Jupyter dependency. It never opens Colab, authentication, or user data.
 // This does not test the missing-port restart/bootstrap path.
-// Usage: node src/test/colabEnvironment.live.cjs <absolute Code.exe> <new evidence directory>
+// Usage: node src/test/colabEnvironment.live.cjs <absolute Code.exe> <new evidence directory> [--cleanup-only]
+// Cleanup-only establishes the two owned development windows but opens no notebooks.
 'use strict';
 
 const assert = require('node:assert');
@@ -17,7 +18,9 @@ const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/client/streamableHttp.js');
 
 const ROOT = path.resolve(__dirname, '..', '..');
-const [codeArg, evidenceArg] = process.argv.slice(2);
+const [codeArg, evidenceArg, mode] = process.argv.slice(2);
+if (mode !== undefined && mode !== '--cleanup-only') throw new Error('Unknown fixture mode.');
+const cleanupOnly = mode === '--cleanup-only';
 if (!codeArg || !path.isAbsolute(codeArg) || !evidenceArg || !path.isAbsolute(evidenceArg)) {
     throw new Error('Explicit absolute Code executable and new evidence directory required.');
 }
@@ -34,6 +37,7 @@ const receipt = {
     authenticationUsed: false,
     userNotebookUsed: false
 };
+receipt.cleanupOnly = cleanupOnly;
 let child;
 let control;
 let client;
@@ -196,12 +200,13 @@ async function main() {
         "'use strict';",
         "const vscode = require('vscode');",
         "const fs = require('node:fs');",
+        "const crypto = require('node:crypto');",
         `const acknowledgementPath = ${JSON.stringify(cleanupAcknowledgementPath)};`,
         `const nonce = ${JSON.stringify(cleanupNonce)};`,
         'exports.activate = context => {',
         "  const command = 'jupyterMcp.colabEnvironmentLiveFixtureQuit';",
         "  context.subscriptions.push(vscode.commands.registerCommand(command, () => {",
-        "    const acknowledgement = { schema: 'colab-environment-live-cleanup-v1', nonce, sessionId: vscode.env.sessionId, extensionHostPid: process.pid, requestedAt: new Date().toISOString(), command: 'workbench.action.quit' };",
+        "    const acknowledgement = { schema: 'colab-environment-live-cleanup-v2', nonce, invocationId: crypto.randomUUID(), sessionId: vscode.env.sessionId, extensionHostPid: process.pid, requestedAt: new Date().toISOString(), command: 'workbench.action.quit' };",
         "    const temporary = acknowledgementPath + '.tmp-' + process.pid;",
         "    fs.writeFileSync(temporary, JSON.stringify(acknowledgement));",
         "    fs.renameSync(temporary, acknowledgementPath);",
@@ -230,7 +235,7 @@ async function main() {
     receipt.temporaryProfileSettings = { confirmSaveUntitledWorkspace: false };
 
     const diskNotebook = path.join(evidence, 'fixture-open.ipynb');
-    await fs.writeFile(diskNotebook, JSON.stringify({
+    if (!cleanupOnly) await fs.writeFile(diskNotebook, JSON.stringify({
         cells: [{ cell_type: 'markdown', metadata: {}, source: ['# Isolated fixture'] }],
         metadata: {},
         nbformat: 4,
@@ -358,6 +363,18 @@ async function main() {
     assert.strictEqual(ready.value.folderUri, prepareReceipt.folderUri);
     assert.strictEqual(ready.value.expectedWindowLabel, finalWindowLabel);
 
+    if (cleanupOnly) {
+        receipt.assertions = {
+            originalEmptyWindowRetained: true,
+            generatedWorkspaceReady: true,
+            notebooksOpened: false,
+            noJupyterDependency: true,
+            noSmokeDriver: true
+        };
+        receipt.passed = true;
+        return;
+    }
+
     const createText = await callText('create_notebook', { title: 'Environment fixture', windowId: ready.owner.windowId });
     receipt.createNotebookResponse = createText;
     const createdMatch = /^Created (file:\/\/\/.*?) and opened it in the editor\.$/.exec(createText);
@@ -421,12 +438,37 @@ main().catch(error => {
     if (control) control.close();
     if (child && initialTargetId) {
         try {
-            const targets = await fetch(`http://127.0.0.1:${receipt.debugPort}/json/list`).then(response => response.json());
-            const pages = targets.filter(item => item.type === 'page' && /workbench(?:\.html)?/.test(item.url));
-            if (pages.length < 1 || pages.filter(page => page.id === initialTargetId).length !== 1) throw new Error('owned workbench targets changed before close');
-            const quitPage = pages.find(page => page.id === initialTargetId);
-            const windowControl = await connectDebugger(quitPage.webSocketDebuggerUrl);
-            const quit = await windowControl.command('Runtime.evaluate', {
+            const listPages = async () => {
+                const targets = await fetch(`http://127.0.0.1:${receipt.debugPort}/json/list`).then(response => response.json());
+                return targets.filter(item => item.type === 'page' && /workbench(?:\.html)?/.test(item.url));
+            };
+            let pages = await listPages();
+            if (pages.length < 1 || pages.length > 2 || pages.filter(page => page.id === initialTargetId).length !== 1) throw new Error('owned workbench targets changed before close');
+            const ownedIds = new Set(pages.map(page => page.id));
+            if (ownedIds.size !== pages.length) throw new Error('duplicate fixture workbench target');
+            const acknowledgments = [];
+            receipt.quitStages = acknowledgments;
+            // NativeHostMainService.quit closes one last-active development window
+            // while more than one remains. At most two normal Quit stages are needed.
+            for (let stage = 0; stage < 2 && pages.length; stage++) {
+                if (pages.some(page => !ownedIds.has(page.id)) || (stage > 0 && pages.length !== 1)) throw new Error('unowned fixture window before quit');
+                for (const page of pages) {
+                    if (!page.webSocketDebuggerUrl.startsWith(`ws://127.0.0.1:${receipt.debugPort}/`)) throw new Error('unexpected fixture cleanup endpoint');
+                    const binding = await connectDebugger(page.webSocketDebuggerUrl);
+                    try {
+                        const proof = await binding.command('Runtime.evaluate', {
+                            expression: `[...document.querySelectorAll('.statusbar-item')].filter(e => e.textContent.trim() === ${JSON.stringify(closeMarker)}).length`,
+                            returnByValue: true
+                        });
+                        if (proof.result?.value !== 1) throw new Error('fixture cleanup marker not unique');
+                    } finally { binding.close(); }
+                }
+                const quitPage = pages.find(page => page.id === initialTargetId) ?? pages[0];
+                const previousCount = pages.length;
+                const dispatchTime = Date.now();
+                const windowControl = await connectDebugger(quitPage.webSocketDebuggerUrl);
+                try {
+                    const quit = await windowControl.command('Runtime.evaluate', {
                 expression: `(() => {
                     const marker = ${JSON.stringify(closeMarker)};
                     const visible = element => {
@@ -444,26 +486,51 @@ main().catch(error => {
                 })()`,
                 returnByValue: true
             });
-            if (!quit.result?.value?.ok) throw new Error(quit.result?.value?.reason ?? 'fixture quit command unavailable');
-            receipt.quitDomClick = { targetId: quitPage.id, returned: true };
-            const acknowledgement = await until(async () => {
+                    if (!quit.result?.value?.ok) throw new Error(quit.result?.value?.reason ?? 'fixture quit command unavailable');
+                    const acknowledgement = await until(async () => {
                 try {
-                    return JSON.parse(await fs.readFile(cleanupAcknowledgementPath, 'utf8'));
+                    const value = JSON.parse(await fs.readFile(cleanupAcknowledgementPath, 'utf8'));
+                    if (Date.parse(value.requestedAt) < dispatchTime || acknowledgments.some(item => item.acknowledgment.invocationId === value.invocationId)) return false;
+                    return value;
                 } catch {
                     return false;
                 }
             }, 'Fixture normal quit command was not acknowledged.', 5_000);
-            assert.deepStrictEqual(Object.keys(acknowledgement).sort(), ['command', 'extensionHostPid', 'nonce', 'requestedAt', 'schema', 'sessionId']);
-            assert.strictEqual(acknowledgement.schema, 'colab-environment-live-cleanup-v1');
+            assert.deepStrictEqual(Object.keys(acknowledgement).sort(), ['command', 'extensionHostPid', 'invocationId', 'nonce', 'requestedAt', 'schema', 'sessionId']);
+            assert.strictEqual(acknowledgement.schema, 'colab-environment-live-cleanup-v2');
             assert.strictEqual(acknowledgement.nonce, cleanupNonce);
+            assert.match(acknowledgement.invocationId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
             assert.strictEqual(acknowledgement.command, 'workbench.action.quit');
+            // With telemetry disabled sessionId can be a constant placeholder.
+            // Ownership is established by the isolated endpoint and fresh marker/nonce.
             assert.strictEqual(typeof acknowledgement.sessionId, 'string');
             assert.ok(acknowledgement.sessionId.length > 0, 'fixture cleanup acknowledgement must identify the exact VS Code session');
             assert.strictEqual(Number.isInteger(acknowledgement.extensionHostPid), true);
             assert.ok(acknowledgement.extensionHostPid > 0);
             assert.strictEqual(Number.isNaN(Date.parse(acknowledgement.requestedAt)), false);
-            receipt.quitDispatchAcknowledgement = acknowledgement;
-            windowControl.close();
+                    acknowledgments.push({ stage: stage + 1, targetId: quitPage.id, windowsBefore: previousCount, acknowledgment: acknowledgement });
+                } finally { windowControl.close(); }
+                const removalDeadline = Date.now() + 10_000;
+                let remainingPages;
+                while (Date.now() < removalDeadline) {
+                    if (child.exitCode !== null) { remainingPages = []; break; }
+                    let remaining;
+                    try {
+                        remaining = await listPages();
+                    } catch {
+                        await pause(250);
+                        continue;
+                    }
+                    if (remaining.some(page => !ownedIds.has(page.id)) || new Set(remaining.map(page => page.id)).size !== remaining.length) throw new Error('unowned fixture window during quit');
+                    if (remaining.length < previousCount) { remainingPages = remaining; break; }
+                    await pause(250);
+                }
+                if (!remainingPages) throw new Error('Owned fixture window did not disappear after normal quit.');
+                pages = remainingPages;
+                acknowledgments.at(-1).windowsAfter = pages.length;
+            }
+            if (pages.length) throw new Error('fixture windows remain after bounded normal quit');
+            receipt.quitDispatchAcknowledgement = 'all_stages_acknowledged';
         } catch {
             receipt.quitDispatchAcknowledgement = 'unconfirmed';
             receipt.passed = false;

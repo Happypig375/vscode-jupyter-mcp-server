@@ -18,7 +18,7 @@ const IDS = {
 } as const;
 const NAMES = new Map<string, string>([[IDS.a, 'window-a'], [IDS.b, 'window-b'], [IDS.c, 'window-c'], [IDS.d, 'window-d']]);
 const NATIVE_IDS = new Map<string, number>([[IDS.a, 1], [IDS.b, 2], [IDS.c, 3], [IDS.d, 4]]);
-const COMMIT = '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1';
+const COMMIT = '2d0b7506a36c1d6db9a466440131a8e01eab2289';
 
 function freePort(): Promise<number> {
     return new Promise((resolve, reject) => {
@@ -68,7 +68,7 @@ function localPreflight(windowId: string, options: {
             peerSecret: 'must-not-cross-boundary'
         },
         windowIdentity: {
-            source: 'extension_log_uri', status: identityStatus, sourceVersion: '1.142.0',
+            source: 'extension_log_uri', status: identityStatus, sourceVersion: '1.143.0',
             sourceCommit: options.identityCommit ?? COMMIT,
             nativeWindowId: identityStatus === 'verified' ? nativeWindowId : null,
             rendererProcessPid: identityStatus === 'verified' ? rendererProcessPid : null,
@@ -85,8 +85,8 @@ function localPreflight(windowId: string, options: {
             quitPolicy: { confirmBeforeClose: 'never', restoreWindows: 'all' }
         },
         application: {
-            status: options.applicationStatus ?? 'verified', version: options.version ?? '1.142.0',
-            supportedVersion: options.supportedVersion ?? '1.142.0', versionSupported: options.versionSupported ?? true,
+            status: options.applicationStatus ?? 'verified', version: options.version ?? '1.143.0',
+            supportedVersion: options.supportedVersion ?? '1.143.0', versionSupported: options.versionSupported ?? true,
             commit: COMMIT, mainProcessPid: options.pid ?? 1234,
             mainProcessIdentity: 'verified', defaultInstall: options.defaultInstall ?? 'verified', startupArguments: options.startupArguments ?? 'supported',
             actualWindowCount,
@@ -143,6 +143,19 @@ function testPreflightAggregationBoundaries(): void {
         assert.strictEqual(contradictory.peerWindowCorrespondence.reasonCode, reasonCode);
         assert.deepStrictEqual(contradictory.peerWindowCorrespondence.mappings, []);
         assert.strictEqual(contradictory.supportedNextOperation.status, 'available', 'correspondence correction must not change recommendation policy');
+    }
+
+    for (const [component, field, staleValue] of [
+        ['application', 'version', '1.142.0'],
+        ['application', 'commit', '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1'],
+        ['windowIdentity', 'sourceVersion', '1.142.0'],
+        ['windowIdentity', 'sourceCommit', '6d62b1d5dace93a33b3a6d3eca1317bd5e15bcb1']
+    ] as const) {
+        const staleBuild = JSON.parse(localPreflight(IDS.d, { actualWindowCount: 1, native: true, blockers: [] }));
+        staleBuild[component][field] = staleValue;
+        const result = aggregated([{ windowId: IDS.d, text: JSON.stringify(staleBuild) }]);
+        assert.strictEqual(result.peerWindowCorrespondence.availability, 'unavailable', `${component}.${field}`);
+        assert.deepStrictEqual(result.peerWindowCorrespondence.mappings, []);
     }
 
     const duplicatePeerUuid = aggregated([
@@ -212,7 +225,7 @@ function testPreflightAggregationBoundaries(): void {
         '{',
         'x'.repeat(65 * 1024),
         localPreflight(IDS.d, { schemaVersion: 2 }),
-        localPreflight(IDS.d, { version: '1.142.0 private' }),
+        localPreflight(IDS.d, { version: '1.143.0 private' }),
         (() => { const value = JSON.parse(localPreflight(IDS.d)); value.windowIdentity.nativeWindowId = -1; return JSON.stringify(value); })(),
         (() => { const value = JSON.parse(localPreflight(IDS.d)); value.windowIdentity.failureCode = 'contradictory_verified_state'; return JSON.stringify(value); })(),
         (() => { const value = JSON.parse(localPreflight(IDS.d)); value.application.nativeWindows = new Array(65).fill({ id: 1, rendererProcessPid: 2 }); return JSON.stringify(value); })()

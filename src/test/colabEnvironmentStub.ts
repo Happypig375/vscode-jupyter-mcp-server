@@ -50,12 +50,13 @@ export function reset(): void {
         terminals: [], visibleEditors: [], activeEditor: undefined, tabs: [], calls: [],
         tabGroups: undefined,
         configuredPort: 0, confirmBeforeClose: 'never', restoreWindows: 'all', activeDebugSession: undefined,
-        workspaceUpdates: [], workspaceUpdateResult: true, onWorkspaceUpdate: undefined
+        workspaceUpdates: [], workspaceUpdateResult: true, onWorkspaceUpdate: undefined,
+        tabCloseCalls: [], onTabClose: undefined
     });
 }
 reset();
 
-export const version = '1.142.0';
+export const version = '1.143.0';
 export const StatusBarAlignment = { Right: 2 };
 export const Uri = { parse: (value: string) => new TestUri(value), file: fileUri };
 export class TabInputText { constructor(readonly uri: any) {} }
@@ -110,7 +111,18 @@ export const window = {
     get activeTextEditor() { return state.activeEditor; },
     tabGroups: {
         get all() { return state.tabGroups ?? [{ tabs: state.tabs }]; },
-        close: async (tab: any) => { const index = state.tabs.indexOf(tab); if (index < 0) return false; state.tabs.splice(index, 1); return true; }
+        close: async (tab: any, preserveFocus?: boolean) => {
+            state.tabCloseCalls.push([tab, preserveFocus]);
+            if (state.onTabClose) {
+                const result = await state.onTabClose(tab, preserveFocus);
+                if (result !== undefined) return result;
+            }
+            for (const group of state.tabGroups ?? [{ tabs: state.tabs }]) {
+                const index = group.tabs.indexOf(tab);
+                if (index >= 0) { group.tabs.splice(index, 1); return true; }
+            }
+            return false;
+        }
     },
     createStatusBarItem: () => ({ text: '', show() {}, dispose() {} })
 };
